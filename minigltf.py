@@ -12,7 +12,7 @@ output = BytesIO()
 
 output.write(np.uint32(0x46546C67)) # magic == gLTF
 output.write(np.uint32(2))          # version == 2
-output.write(np.uint32(0x726e6769)) # legth == garbage, godot doesn't care
+output.write(np.uint32(0x726e6769)) # length == garbage, godot doesn't care
 
 json = BytesIO()
 json.write(b'{')
