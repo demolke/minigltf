@@ -1,5 +1,6 @@
 import bpy
 from io import BytesIO
+import json
 import numpy as np
 import struct
 import time
@@ -10,13 +11,13 @@ start = time.time()
 
 output = BytesIO()
 
-output.write(np.uint32(0x46546C67)) # magic == gLTF
-output.write(np.uint32(2))          # version == 2
-output.write(np.uint32(0x726e6769)) # length == garbage, godot doesn't care
+output.write(np.uint32(0x46546C67))  # magic == gLTF
+output.write(np.uint32(2))           # version == 2
+output.write(np.uint32(0x726e6769))  # length == garbage, godot doesn't care
 
-json = BytesIO()
-json.write(b'{')
-json.write(b'"asset":{"version":"2.0","generator":"minigltf"},\n')
+jsn = BytesIO()
+jsn.write(b'{')
+jsn.write(b'"asset":{"version":"2.0","generator":"minigltf"},\n')
 
 objs = [o for o in bpy.data.objects if o.type in ['MESH', 'ARMATURE']]
 for a in bpy.data.armatures:
@@ -24,15 +25,17 @@ for a in bpy.data.armatures:
 meshes = []
 armatures = []
 
+print(objs)
+
 # Nodes section
-json.write(b'"nodes":[')
+jsn.write(b'"nodes":[')
 for i in range(len(objs)):
     o = objs[i]
-    json.write(b'{"name":"')
-    json.write(o.name.encode())
-    json.write(b'"')
+    jsn.write(b'{"name":"')
+    jsn.write(o.name.encode())
+    jsn.write(b'"')
 
-    if type(o) == bpy.types.Bone:
+    if isinstance(o, bpy.types.Bone):
         translation = o.matrix_local.to_translation()
         quaternion = o.matrix_local.to_quaternion()
         scale = o.matrix_local.to_scale()
@@ -43,100 +46,109 @@ for i in range(len(objs)):
             quaternion = o.rotation_euler.to_quaternion()
         scale = o.scale
 
-    json.write(b',"translation": [')
-    json.write(str(translation.x).encode())
-    json.write(b',')
-    json.write(str(translation.z).encode())
-    json.write(b',')
-    json.write(str(-translation.y).encode())
-    json.write(b']')
+    jsn.write(b',"translation": [')
+    jsn.write(str(translation.x).encode())
+    jsn.write(b',')
+    jsn.write(str(translation.z).encode())
+    jsn.write(b',')
+    jsn.write(str(-translation.y).encode())
+    jsn.write(b']')
 
-    json.write(b',"rotation": [')
-    json.write(str(quaternion.x).encode())
-    json.write(b',')
-    json.write(str(quaternion.z).encode())
-    json.write(b',')
-    json.write(str(-quaternion.y).encode())
-    json.write(b',')
-    json.write(str(quaternion.w).encode())
-    json.write(b']')
+    jsn.write(b',"rotation": [')
+    jsn.write(str(quaternion.x).encode())
+    jsn.write(b',')
+    jsn.write(str(quaternion.z).encode())
+    jsn.write(b',')
+    jsn.write(str(-quaternion.y).encode())
+    jsn.write(b',')
+    jsn.write(str(quaternion.w).encode())
+    jsn.write(b']')
 
-    json.write(b',"scale": [')
-    json.write(str(scale.x).encode())
-    json.write(b',')
-    json.write(str(scale.z).encode())
-    json.write(b',')
-    json.write(str(scale.y).encode())
-    json.write(b']')
+    jsn.write(b',"scale": [')
+    jsn.write(str(scale.x).encode())
+    jsn.write(b',')
+    jsn.write(str(scale.z).encode())
+    jsn.write(b',')
+    jsn.write(str(scale.y).encode())
+    jsn.write(b']')
 
-    if type(o) == bpy.types.Object and o.type == 'MESH':
+    if isinstance(o, bpy.types.Object) and o.type == 'MESH':
         meshes.append(o.data)
-        json.write(b',"mesh": ')
-        json.write(str(meshes.index(o.data)).encode())
+        jsn.write(b',"mesh": ')
+        jsn.write(str(meshes.index(o.data)).encode())
 
+    # Bones are nodes in GLTF
+    print(o.name)
     children = [x for x in o.children]
-    if type(o) == bpy.types.Object and o.type == 'ARMATURE':
-        children += [b for b in o.data.bones if b.parent == None]
+    print(children)
+    if isinstance(o, bpy.types.Object) and o.type == 'ARMATURE':
+        children += [b for b in o.data.bones if b.parent is None]
+    print("Children + bones" + str(children))
 
-    # Child nodes   
-    if o.children:
-        json.write(b',"children":[')
-        for c in range(len(o.children)):
-            child = o.children[c]
-            json.write(str(objs.index(child)).encode())
-            if c < len(o.children) - 1:
-                json.write(b',')
-        json.write(b']')
+    # Child nodes
+    if children:
+        jsn.write(b',"children":[')
+        for c in range(len(children)):
+            child = children[c]
+            jsn.write(str(objs.index(child)).encode())
+            if c < len(children) - 1:
+                jsn.write(b',')
+        jsn.write(b']')
 
-    json.write(b'}')
+    jsn.write(b'}')
     if i < len(objs) - 1:
-        json.write(b',')
+        jsn.write(b',')
 
-json.write(b'],')
+jsn.write(b'],')
 
 # Meshes section
 if meshes:
-    json.write(b'"meshes":[')
+    jsn.write(b'"meshes":[')
     for i in range(len(meshes)):
         m = meshes[i]
-        json.write(b'{"name":"')
-        json.write(m.name.encode())
-        json.write(b'","primitives":[]}')
+        jsn.write(b'{"name":"')
+        jsn.write(m.name.encode())
+        jsn.write(b'","primitives":[')
+
+        jsn.write(b']}')
         if i < len(meshes) - 1:
-            json.write(b',')
-    json.write(b'],')
+            jsn.write(b',')
+    jsn.write(b'],')
 
 # Scene section
-json.write(b'"scene":0,\n')
-json.write(b'"scenes":[{"name":"Scene","nodes":[')
+jsn.write(b'"scene":0,\n')
+jsn.write(b'"scenes":[{"name":"Scene","nodes":[')
 
-root_objs = [o for o in objs if o.parent == None]
+root_objs = [o for o in objs if o.parent is None]
 for i in range(len(root_objs)):
     o = root_objs[i]
-    json.write(str(objs.index(o)).encode())
+    jsn.write(str(objs.index(o)).encode())
     if i < len(root_objs) - 1:
-        json.write(b',')
+        jsn.write(b',')
 
-json.write(b']}]\n')
-json.write(b'}')
+jsn.write(b']}]\n')
+jsn.write(b'}')
 
-# JSON must be aligned to 4-byte
-while json.tell() % 4 != 0:
-    json.write(str(" ").encode())
+# json must be aligned to 4-byte
+while jsn.tell() % 4 != 0:
+    jsn.write(str(" ").encode())
 
-json = json.getbuffer()
-output.write(np.uint32(len(json)))
+jsn = jsn.getbuffer()
+output.write(np.uint32(len(jsn)))
 output.write(np.uint32(0x4E4F534A))
-output.write(json)
+output.write(jsn)
 
+json_file = open('output.json', 'w')
+json_file.write(json.dumps(json.loads(jsn.tobytes()), indent=4))
+json_file.close()
 
 
 # for a in bpy.data.actions:
 #    output.write(f'{a.name}\n'.encode())
-#    
+#
 #    for f in a.fcurves:
 #        output.write(f'{f.data_path}\n'.encode())
-#    
+#
 #        for k in f.keyframe_points:
 #            output.write(struct.pack('!f', k.co[0]))
 #            output.write(struct.pack('!f', k.co[1]))
