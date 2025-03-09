@@ -110,7 +110,8 @@ if meshes:
         minv = mathutils.Vector([v.co.x, v.co.z, -v.co.y])
         maxv = mathutils.Vector([v.co.x, v.co.z, -v.co.y])
         offset = bchunk.tell()
-        for v in m.vertices:
+        for l in m.loops:
+            v = m.vertices[l.vertex_index]
             minv.x = min(minv.x, v.co.x)
             minv.y = min(minv.y, v.co.z)
             minv.z = min(minv.z, -v.co.y)
@@ -122,37 +123,56 @@ if meshes:
             bchunk.write(np.float32(v.co.z))
             bchunk.write(np.float32(-v.co.y))
 
-        accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': len(m.vertices), 'min':minv, 'max':maxv})
-        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.vertices) * 3 * 4, 'target': 34962})
+        accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': len(m.loops), 'min':minv, 'max':maxv})
+        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 3 * 4, 'target': 34962})
 
-        # Normals - only supports shade smooth blender mode, normal data is provided by normal maps
+        # Normals
         jsn.write(b',"NORMAL":')
         jsn.write(str(len(accessors)).encode())
         offset = bchunk.tell()
-        for v in m.vertices:
-            bchunk.write(np.float32(v.normal.x))
-            bchunk.write(np.float32(v.normal.z))
-            bchunk.write(np.float32(-v.normal.y))
-        accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': len(m.vertices)})
-        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.vertices) * 3 * 4, 'target': 34962})
+        for v in m.corner_normals:
+            bchunk.write(np.float32(v.vector.x))
+            bchunk.write(np.float32(v.vector.z))
+            bchunk.write(np.float32(-v.vector.y))
+        accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': len(m.corner_normals)})
+        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.corner_normals) * 3 * 4, 'target': 34962})
 
-        # jsn.write(str(len(accessors)).encode())
-        # jsn.write(b',"TEXCOORD_0":')
-        # jsn.write(str(len(accessors)).encode())
+        # UV1 coordinates
+        jsn.write(b',"TEXCOORD_0":')
+        jsn.write(str(len(accessors)).encode())
+        offset = bchunk.tell()
+        for u in m.uv_layers[0].uv:
+            bchunk.write(np.float32(u.vector.x))
+            bchunk.write(np.float32(u.vector.y))
+        accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': len(m.uv_layers[0].uv)})
+        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.uv_layers[0].uv) * 2 * 4, 'target': 34962})
+
+        # UV2 coordinates
+        if len(m.uv_layers) > 1:
+            jsn.write(b',"TEXCOORD_1":')
+            jsn.write(str(len(accessors)).encode())
+            offset = bchunk.tell()
+            for u in m.uv_layers[1].uv:
+                bchunk.write(np.float32(u.vector.x))
+                bchunk.write(np.float32(u.vector.y))
+            accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': len(m.uv_layers[1].uv)})
+            bufferViews.append({'byteOffset': offset, 'byteLength': len(m.uv_layers[1].uv) * 2 * 4, 'target': 34962})
+
+        # Face indices
         jsn.write(b'},"indices":')
         jsn.write(str(len(accessors)).encode())
         jsn.write(b'}]}')
-
         offset = bchunk.tell()
         for l in m.loop_triangles:
-            bchunk.write(np.uint32(l.vertices[0]))
-            bchunk.write(np.uint32(l.vertices[1]))
-            bchunk.write(np.uint32(l.vertices[2]))
+            bchunk.write(np.uint32(l.loops[0]))
+            bchunk.write(np.uint32(l.loops[1]))
+            bchunk.write(np.uint32(l.loops[2]))
         accessors.append({'type': '"SCALAR"', 'componentType': 5125, 'count': len(m.loop_triangles) * 3})
         bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loop_triangles) * 3 * 4, 'target': 34963})
 
         if i < len(meshes) - 1:
             jsn.write(b',')
+
     jsn.write(b'],')
 
 # Accessors section
