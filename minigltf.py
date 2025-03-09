@@ -197,7 +197,7 @@ if materials:
 
         tex = ''
         for link in m.node_tree.links:
-            if link.to_node.type == 'BSDF_PRINCIPLED' and link.from_node.type == 'TEX_IMAGE':
+            if link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name == 'Base Color' and link.from_node.type == 'TEX_IMAGE':
                 tex = link.from_node.image.filepath
 
         if not tex in images:
@@ -233,7 +233,7 @@ if images:
     jsn.write(b'"images":[')
     for i in range(len(images)):
         img = images[i]
-        jsn.write(b'{"uri":"')
+        jsn.write(b'{"uri":"')  # GLB does not support external images, but godot fortunately doesn't care
         jsn.write(img.encode())
         jsn.write(b'"}')
 
