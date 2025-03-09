@@ -194,7 +194,12 @@ if materials:
     jsn.write(b'"materials":[')
     for i in range(len(materials)):
         m = materials[i]
-        tex = 'data/texture.png'
+
+        tex = ''
+        for link in m.node_tree.links:
+            if link.to_node.type == 'BSDF_PRINCIPLED' and link.from_node.type == 'TEX_IMAGE':
+                tex = link.from_node.image.filepath
+
         if not tex in images:
             images.append(tex)
         jsn.write(b'{"name":"')
