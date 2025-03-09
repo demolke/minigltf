@@ -17,10 +17,22 @@ bchunk = BytesIO()
 objs = [o for o in bpy.data.objects if o.type in ['MESH', 'ARMATURE']]
 for a in bpy.data.armatures:
     objs += [b for b in a.bones]
-meshes = []
 
 accessors = []
 bufferViews = []
+meshes = []
+materials = []
+images = []
+for o in objs:
+    if not isinstance(o, bpy.types.Object):
+        continue
+    if o.type != 'MESH':
+        continue
+
+    for m in o.data.materials:
+        if m not in materials:
+            materials.append(m)
+    
 
 # Nodes section
 jsn.write(b'"nodes":[')
@@ -93,7 +105,6 @@ for i in range(len(objs)):
 
 jsn.write(b'],')
 
-
 # Meshes section
 if meshes:
     jsn.write(b'"meshes":[')
@@ -143,7 +154,7 @@ if meshes:
         offset = bchunk.tell()
         for u in m.uv_layers[0].uv:
             bchunk.write(np.float32(u.vector.x))
-            bchunk.write(np.float32(u.vector.y))
+            bchunk.write(np.float32(1-u.vector.y))
         accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': len(m.uv_layers[0].uv)})
         bufferViews.append({'byteOffset': offset, 'byteLength': len(m.uv_layers[0].uv) * 2 * 4, 'target': 34962})
 
@@ -161,7 +172,6 @@ if meshes:
         # Face indices
         jsn.write(b'},"indices":')
         jsn.write(str(len(accessors)).encode())
-        jsn.write(b'}]}')
         offset = bchunk.tell()
         for l in m.loop_triangles:
             bchunk.write(np.uint32(l.loops[0]))
@@ -170,10 +180,63 @@ if meshes:
         accessors.append({'type': '"SCALAR"', 'componentType': 5125, 'count': len(m.loop_triangles) * 3})
         bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loop_triangles) * 3 * 4, 'target': 34963})
 
+        jsn.write(b',"material":')
+        jsn.write(str(materials.index(m.materials[0])).encode())
+        jsn.write(b'}]}')
+
         if i < len(meshes) - 1:
             jsn.write(b',')
 
     jsn.write(b'],')
+
+# Materials
+if materials:
+    jsn.write(b'"materials":[')
+    for i in range(len(materials)):
+        m = materials[i]
+        tex = 'data/texture.png'
+        if not tex in images:
+            images.append(tex)
+        jsn.write(b'{"name":"')
+        jsn.write(m.name.encode())
+        jsn.write(b'","pbrMetallicRoughness":{"baseColorTexture":{"index":')
+        jsn.write(str(images.index(tex)).encode())
+        jsn.write(b'}}}')
+
+        if i < len(materials) - 1:
+            jsn.write(b',')
+
+    jsn.write(b'],')
+
+
+# Textures
+if images:
+    jsn.write(b'"textures":[')
+    for i in range(len(images)):
+        img = images[i]
+        jsn.write(b'{"source":')
+        jsn.write(str(i).encode())
+        jsn.write(b'}')
+
+        if i < len(images) - 1:
+            jsn.write(b',')
+
+    jsn.write(b'],')
+
+# Images
+if images:
+    jsn.write(b'"images":[')
+    for i in range(len(images)):
+        img = images[i]
+        jsn.write(b'{"uri":"')
+        jsn.write(img.encode())
+        jsn.write(b'"}')
+
+        if i < len(images) - 1:
+            jsn.write(b',')
+
+    jsn.write(b'],')
+
 
 # Accessors section
 if accessors:
