@@ -195,18 +195,55 @@ if materials:
     for i in range(len(materials)):
         m = materials[i]
 
-        tex = ''
+        baseColor = ''
+        normal = ''
+        metallicRoughness = ''
+
         for link in m.node_tree.links:
             if link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name == 'Base Color' and link.from_node.type == 'TEX_IMAGE':
-                tex = link.from_node.image.filepath
+                baseColor = link.from_node.image.filepath
 
-        if not tex in images:
-            images.append(tex)
+            if link.to_node.type == 'NORMAL_MAP' and link.to_socket.name == 'Color' and link.from_node.type == 'TEX_IMAGE':
+                normal = link.from_node.image.filepath
+
+            if link.from_node.type == 'SEPARATE_COLOR' and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name in ('Roughness', 'Metallic'):
+                for im in m.node_tree.links:
+                    if im.from_node.type == 'TEX_IMAGE' and im.to_node == link.from_node:
+                        metallicRoughness = im.from_node.image.filepath
+
+            if link.from_node.type == 'TEX_IMAGE' and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name in ('Roughness', 'Metallic'):
+                metallicRoughness = link.from_node.image.filepath
+
+
+
+
+        if not baseColor in images:
+            images.append(baseColor)
+
+        if not normal in images:
+            images.append(normal)
+
+        if not metallicRoughness in images:
+            images.append(metallicRoughness)
+
+
         jsn.write(b'{"name":"')
         jsn.write(m.name.encode())
         jsn.write(b'","pbrMetallicRoughness":{"baseColorTexture":{"index":')
-        jsn.write(str(images.index(tex)).encode())
-        jsn.write(b'}}}')
+        jsn.write(str(images.index(baseColor)).encode())
+
+        if metallicRoughness:
+            jsn.write(b'},"metallicRoughnessTexture":{"index":')
+            jsn.write(str(images.index(metallicRoughness)).encode())
+        jsn.write(b'}}')
+
+        if normal:
+            jsn.write(b',"normalTexture":{"index":')
+            jsn.write(str(images.index(normal)).encode())
+            jsn.write(b'}')
+
+        jsn.write(b'}')
+
 
         if i < len(materials) - 1:
             jsn.write(b',')
@@ -342,12 +379,12 @@ output.write(np.uint32(bchunk.tell()))
 output.write(np.uint32(0x004E4942))
 output.write(bchunk.getbuffer())
 
-f = open('output.glb', 'wb')
+f = open('data/output.glb', 'wb')
 f.write(output.getbuffer())
 output.close()
 f.close()
 
-json_file = open('output.json', 'w')
+json_file = open('data/output.json', 'w')
 json_file.write(json.dumps(json.loads(jsn.tobytes()), indent=4))
 json_file.close()
 
