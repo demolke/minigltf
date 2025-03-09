@@ -102,10 +102,10 @@ if meshes:
         jsn.write(b'{"name":"')
         jsn.write(m.name.encode())
         jsn.write(b'","primitives":[{"attributes":{')
-        jsn.write(b'"POSITION":')
-        jsn.write(str(len(accessors)).encode())
 
         # Vertex position
+        jsn.write(b'"POSITION":')
+        jsn.write(str(len(accessors)).encode())
         v = m.vertices[0]
         minv = mathutils.Vector([v.co.x, v.co.z, -v.co.y])
         maxv = mathutils.Vector([v.co.x, v.co.z, -v.co.y])
@@ -125,7 +125,17 @@ if meshes:
         accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': len(m.vertices), 'min':minv, 'max':maxv})
         bufferViews.append({'byteOffset': offset, 'byteLength': len(m.vertices) * 3 * 4, 'target': 34962})
 
-        # jsn.write(b',"NORMAL":')
+        # Normals - only supports shade smooth blender mode, normal data is provided by normal maps
+        jsn.write(b',"NORMAL":')
+        jsn.write(str(len(accessors)).encode())
+        offset = bchunk.tell()
+        for v in m.vertices:
+            bchunk.write(np.float32(v.normal.x))
+            bchunk.write(np.float32(v.normal.z))
+            bchunk.write(np.float32(-v.normal.y))
+        accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': len(m.vertices)})
+        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.vertices) * 3 * 4, 'target': 34962})
+
         # jsn.write(str(len(accessors)).encode())
         # jsn.write(b',"TEXCOORD_0":')
         # jsn.write(str(len(accessors)).encode())
