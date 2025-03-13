@@ -6,6 +6,8 @@ import numpy as np
 import struct
 import time
 
+axis_basis_change = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, -1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
+
 start = time.time()
 
 jsn = BytesIO()
@@ -18,11 +20,22 @@ objs = [o for o in bpy.data.objects if o.type in ['MESH', 'ARMATURE']]
 for a in bpy.data.armatures:
     objs += [b for b in a.bones]
 
+world_matrix = {}
+
+for a in bpy.data.objects:
+    if a.type != 'ARMATURE':
+        continue
+    armature = a.data
+    for b in armature.bones:
+        world_matrix[b] = (a.matrix_world @ b.matrix_local) @ axis_basis_change
+
 accessors = []
 bufferViews = []
 meshes = []
 materials = []
 images = []
+skins = []
+
 for o in objs:
     if not isinstance(o, bpy.types.Object):
         continue
@@ -43,9 +56,12 @@ for i in range(len(objs)):
     jsn.write(b'"')
 
     if isinstance(o, bpy.types.Bone):
-        translation = o.matrix_local.to_translation()
-        quaternion = o.matrix_local.to_quaternion()
-        scale = o.matrix_local.to_scale()
+        parent = mathutils.Matrix()
+        if o.parent and o.parent in world_matrix:
+            parent = world_matrix[o.parent]
+
+        result = parent.inverted_safe() @ world_matrix[o]
+        (translation, quaternion, scale) = result.decompose()
     else:
         translation = o.location
         quaternion = o.rotation_quaternion
@@ -81,8 +97,15 @@ for i in range(len(objs)):
 
     if isinstance(o, bpy.types.Object) and o.type == 'MESH':
         meshes.append(o.data)
-        jsn.write(b',"mesh": ')
+        jsn.write(b',"mesh":')
         jsn.write(str(meshes.index(o.data)).encode())
+
+        for m in o.modifiers:
+            if m.type == 'ARMATURE' and m.object:
+                if not m.object in skins:
+                    skins.append(m.object)
+                jsn.write(b',"skin":')
+                jsn.write(str(skins.index(m.object)).encode())
 
     # Bones are nodes in GLTF
     children = [x for x in o.children]
@@ -229,7 +252,7 @@ if materials:
 
         jsn.write(b'{"name":"')
         jsn.write(m.name.encode())
-        jsn.write(b'","pbrMetallicRoughness":{"baseColorTexture":{"index":')
+        jsn.write(b'","doubleSided":true,"pbrMetallicRoughness":{"baseColorTexture":{"index":')
         jsn.write(str(images.index(baseColor)).encode())
 
         if metallicRoughness:
@@ -271,7 +294,7 @@ if images:
     for i in range(len(images)):
         img = images[i]
         jsn.write(b'{"uri":"')  # GLB does not support external images, but godot fortunately doesn't care
-        jsn.write(img.encode())
+        jsn.write(img.lstrip('/').encode())
         jsn.write(b'"}')
 
         if i < len(images) - 1:
@@ -279,6 +302,38 @@ if images:
 
     jsn.write(b'],')
 
+# Skins
+if skins:
+    jsn.write(b'"skins":[')
+    for i in range(len(skins)):
+        inverse_bind_matrixes = []
+        skin = skins[i]
+
+        jsn.write(b'{"inverseBindMatrices":')
+        jsn.write(str(len(accessors)).encode())
+        offset = bchunk.tell()
+        accessors.append({'type': '"MAT4"', 'componentType': 5126, 'count': len(skin.data.bones)})
+        bufferViews.append({'byteOffset': offset, 'byteLength': len(skin.data.bones) * 4 * 4 * 4})
+
+        jsn.write(b',"joints":[')
+        for b in range(len(skin.data.bones)):
+            bone = skin.data.bones[b]
+            jsn.write(str(objs.index(bone)).encode())
+
+            matrix = (axis_basis_change @ (skin.matrix_world @ bone.matrix_local)).inverted_safe()
+            for column in range(0, 4):
+                for row in range(0, 4):
+                    bchunk.write(np.float32(matrix[row][column]))
+
+            if b < len(skin.data.bones) - 1:
+                jsn.write(b',')
+
+        jsn.write(b']}')
+
+        if i < len(skins) - 1:
+            jsn.write(b',')
+
+    jsn.write(b'],')
 
 # Accessors section
 if accessors:
@@ -334,8 +389,9 @@ if bufferViews:
         jsn.write(str(b['byteOffset']).encode())
         jsn.write(b',"byteLength":')
         jsn.write(str(b['byteLength']).encode())
-        jsn.write(b',"target":')
-        jsn.write(str(b['target']).encode())
+        if 'target' in b:
+            jsn.write(b',"target":')
+            jsn.write(str(b['target']).encode())
         jsn.write(b'}')
         if i < len(bufferViews) - 1:
             jsn.write(b',')
