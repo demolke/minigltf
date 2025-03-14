@@ -106,11 +106,11 @@ for i in range(len(objs)):
                 if not m.object in skins:
                     skins.append(m.object)
 
-                    joints = {}
-                    for b in m.object.data.bones:
-                        joints[b.name] = len(joints)
+                joints = {}
+                for b in m.object.data.bones:
+                    joints[b.name] = len(joints)
 
-                    joints_index[o] = joints
+                joints_index[o] = joints
 
                 jsn.write(b',"skin":')
                 jsn.write(str(skins.index(m.object)).encode())
@@ -205,7 +205,7 @@ if meshes:
         jsn.write(str(len(accessors)).encode())
         offset = bchunk.tell()
         accessors.append({'type': '"VEC4"', 'componentType': 5121, 'count': len(m.loops)})
-        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 4})
+        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 4, 'target': 34962})
 
         weights = BytesIO()
 
@@ -217,7 +217,8 @@ if meshes:
                 index = 0
                 if j < len(v.groups):
                     weight[j] = v.groups[j].weight
-                    index = joints_index[meshes[i]][meshes[i].vertex_groups[v.groups[j].group].name]
+                    if weight[j] > 0:
+                        index = joints_index[meshes[i]][meshes[i].vertex_groups[v.groups[j].group].name]
                 bchunk.write(np.uint8(index))
 
             # Normalize weights
@@ -230,7 +231,7 @@ if meshes:
         jsn.write(str(len(accessors)).encode())
         offset = bchunk.tell()
         accessors.append({'type': '"VEC4"', 'componentType': 5126, 'count': len(m.loops)})
-        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 4 * 4})
+        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 4 * 4, 'target': 34962})
         bchunk.write(weights.getbuffer())
 
         # Face indices
