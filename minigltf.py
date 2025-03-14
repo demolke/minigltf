@@ -35,6 +35,7 @@ meshes = []
 materials = []
 images = []
 skins = []
+joints_index = {}
 
 for o in objs:
     if not isinstance(o, bpy.types.Object):
@@ -96,14 +97,21 @@ for i in range(len(objs)):
     jsn.write(b']')
 
     if isinstance(o, bpy.types.Object) and o.type == 'MESH':
-        meshes.append(o.data)
+        meshes.append(o)
         jsn.write(b',"mesh":')
-        jsn.write(str(meshes.index(o.data)).encode())
+        jsn.write(str(meshes.index(o)).encode())
 
         for m in o.modifiers:
             if m.type == 'ARMATURE' and m.object:
                 if not m.object in skins:
                     skins.append(m.object)
+
+                    joints = {}
+                    for b in m.object.data.bones:
+                        joints[b.name] = len(joints)
+
+                    joints_index[o] = joints
+
                 jsn.write(b',"skin":')
                 jsn.write(str(skins.index(m.object)).encode())
 
@@ -132,7 +140,7 @@ jsn.write(b'],')
 if meshes:
     jsn.write(b'"meshes":[')
     for i in range(len(meshes)):
-        m = meshes[i]
+        m = meshes[i].data
         jsn.write(b'{"name":"')
         jsn.write(m.name.encode())
         jsn.write(b'","primitives":[{"attributes":{')
@@ -192,6 +200,39 @@ if meshes:
             accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': len(m.uv_layers[1].uv)})
             bufferViews.append({'byteOffset': offset, 'byteLength': len(m.uv_layers[1].uv) * 2 * 4, 'target': 34962})
 
+        # Joints and Weights
+        jsn.write(b',"JOINTS_0":')
+        jsn.write(str(len(accessors)).encode())
+        offset = bchunk.tell()
+        accessors.append({'type': '"VEC4"', 'componentType': 5121, 'count': len(m.loops)})
+        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 4})
+
+        weights = BytesIO()
+
+        for l in m.loops:
+            v = m.vertices[l.vertex_index]
+
+            weight = np.array([0.0, 0.0, 0.0, 0.0])
+            for j in range(4):
+                index = 0
+                if j < len(v.groups):
+                    weight[j] = v.groups[j].weight
+                    index = joints_index[meshes[i]][meshes[i].vertex_groups[v.groups[j].group].name]
+                bchunk.write(np.uint8(index))
+
+            # Normalize weights
+            weight /= weight.sum()
+
+            for j in range(4):
+                weights.write(np.float32(weight[j]))
+
+        jsn.write(b',"WEIGHTS_0":')
+        jsn.write(str(len(accessors)).encode())
+        offset = bchunk.tell()
+        accessors.append({'type': '"VEC4"', 'componentType': 5126, 'count': len(m.loops)})
+        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 4 * 4})
+        bchunk.write(weights.getbuffer())
+
         # Face indices
         jsn.write(b'},"indices":')
         jsn.write(str(len(accessors)).encode())
@@ -201,7 +242,7 @@ if meshes:
             bchunk.write(np.uint32(l.loops[1]))
             bchunk.write(np.uint32(l.loops[2]))
         accessors.append({'type': '"SCALAR"', 'componentType': 5125, 'count': len(m.loop_triangles) * 3})
-        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loop_triangles) * 3 * 4, 'target': 34963})
+        bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loop_triangles) * 4 * 4, 'target': 34963})
 
         jsn.write(b',"material":')
         jsn.write(str(materials.index(m.materials[0])).encode())
@@ -236,9 +277,6 @@ if materials:
 
             if link.from_node.type == 'TEX_IMAGE' and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name in ('Roughness', 'Metallic'):
                 metallicRoughness = link.from_node.image.filepath
-
-
-
 
         if not baseColor in images:
             images.append(baseColor)
