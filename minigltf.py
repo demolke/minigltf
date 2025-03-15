@@ -245,9 +245,59 @@ if meshes:
         accessors.append({'type': '"SCALAR"', 'componentType': 5125, 'count': len(m.loop_triangles) * 3})
         bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loop_triangles) * 4 * 4, 'target': 34963})
 
+        # Blendshapes
+        if m.shape_keys and len(m.shape_keys.key_blocks) > 1:
+            jsn.write(b',"targets":[')
+            for j in range(1, len(m.shape_keys.key_blocks)):
+                s = m.shape_keys.key_blocks[j].data
+
+                v = s[0].co - m.vertices[0].co
+                minv = mathutils.Vector([v.x, v.z, -v.y])
+                maxv = mathutils.Vector([v.x, v.z, -v.y])
+                jsn.write(b'{"POSITION":')
+                jsn.write(str(len(accessors)).encode())
+                offset = bchunk.tell()
+
+                for l in m.loops:
+                    v = s[l.vertex_index].co - m.vertices[l.vertex_index].co
+                    minv.x = min(minv.x, v.x)
+                    minv.y = min(minv.y, v.z)
+                    minv.z = min(minv.z, -v.y)
+                    maxv.x = max(maxv.x, v.x)
+                    maxv.y = max(maxv.y, v.z)
+                    maxv.z = max(maxv.z, -v.y)
+
+                    bchunk.write(np.float32(v.x))
+                    bchunk.write(np.float32(v.z))
+                    bchunk.write(np.float32(-v.y))
+
+                accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': len(m.loops), 'min':minv, 'max':maxv})
+                bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 3 * 4, 'target': 34962})
+                jsn.write(b'}')
+
+                if j < len(m.shape_keys.key_blocks) - 1:
+                    jsn.write(b',')
+
+            jsn.write(b']')
+
+        # Material
         jsn.write(b',"material":')
         jsn.write(str(materials.index(m.materials[0])).encode())
-        jsn.write(b'}]}')
+        jsn.write(b'}]')
+
+        # Blendshape names
+        if m.shape_keys and len(m.shape_keys.key_blocks) > 1:
+            jsn.write(b',"extras":{"targetNames":[')
+            for j in range(1, len(m.shape_keys.key_blocks)):
+                jsn.write(b'"')
+                jsn.write(m.shape_keys.key_blocks[j].name.encode())
+                jsn.write(b'"')
+                if j < len(m.shape_keys.key_blocks) - 1:
+                    jsn.write(b',')
+
+            jsn.write(b']}')
+
+        jsn.write(b'}')
 
         if i < len(meshes) - 1:
             jsn.write(b',')
