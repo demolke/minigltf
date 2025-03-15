@@ -46,7 +46,7 @@ for o in objs:
     for m in o.data.materials:
         if m not in materials:
             materials.append(m)
-    
+
 
 # Nodes section
 jsn.write(b'"nodes":[')
@@ -103,7 +103,7 @@ for i in range(len(objs)):
 
         for m in o.modifiers:
             if m.type == 'ARMATURE' and m.object:
-                if not m.object in skins:
+                if m.object not in skins:
                     skins.append(m.object)
 
                 joints = {}
@@ -185,7 +185,8 @@ if meshes:
         offset = bchunk.tell()
         for u in m.uv_layers[0].uv:
             bchunk.write(np.float32(u.vector.x))
-            bchunk.write(np.float32(1-u.vector.y))
+            bchunk.write(np.float32(1 - u.vector.y))
+
         accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': len(m.uv_layers[0].uv)})
         bufferViews.append({'byteOffset': offset, 'byteLength': len(m.uv_layers[0].uv) * 2 * 4, 'target': 34962})
 
@@ -338,7 +339,6 @@ if materials:
         if not metallicRoughness in images:
             images.append(metallicRoughness)
 
-
         jsn.write(b'{"name":"')
         jsn.write(m.name.encode())
         jsn.write(b'","doubleSided":true,"pbrMetallicRoughness":{"baseColorTexture":{"index":')
@@ -355,7 +355,6 @@ if materials:
             jsn.write(b'}')
 
         jsn.write(b'}')
-
 
         if i < len(materials) - 1:
             jsn.write(b',')
@@ -461,7 +460,6 @@ if accessors:
             jsn.write(str(a['max'].z).encode())
             jsn.write(b']')
 
-
         jsn.write(b'}')
         if i < len(accessors) - 1:
             jsn.write(b',')
@@ -495,7 +493,7 @@ jsn.write(b'}],')
 jsn.write(b'"scene":0,\n')
 jsn.write(b'"scenes":[{"name":"Scene","nodes":[')
 
-root_objs = [o for o in objs if type(o) == bpy.types.Object and o.parent is None]
+root_objs = [o for o in objs if isinstance(o, bpy.types.Object) and o.parent is None]
 for i in range(len(root_objs)):
     o = root_objs[i]
     jsn.write(str(objs.index(o)).encode())
@@ -511,7 +509,7 @@ while jsn.tell() % 4 != 0:
 
 totalLength = 28 + jsn.tell() + bchunk.tell()
 output = BytesIO()
-output.write(np.uint32(0x46546C67) )  # magic == gLTF
+output.write(np.uint32(0x46546C67))   # magic == gLTF
 output.write(np.uint32(2))            # version == 2
 output.write(np.uint32(totalLength))  # total length of the file
 
