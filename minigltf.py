@@ -651,15 +651,4 @@ json_file = open('data/output.json', 'w')
 json_file.write(json.dumps(json.loads(jsn.tobytes()), indent=4))
 json_file.close()
 
-# for a in bpy.data.actions:
-#    output.write(f'{a.name}\n'.encode())
-#
-#    for f in a.fcurves:
-#        output.write(f'{f.data_path}\n'.encode())
-#
-#        for k in f.keyframe_points:
-#            output.write(struct.pack('!f', k.co[0]))
-#            output.write(struct.pack('!f', k.co[1]))
-
-
 print(time.time() - start)
