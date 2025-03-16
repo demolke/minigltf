@@ -330,13 +330,13 @@ if materials:
             if link.from_node.type == 'TEX_IMAGE' and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name in ('Roughness', 'Metallic'):
                 metallicRoughness = link.from_node.image.filepath
 
-        if not baseColor in images:
+        if baseColor not in images:
             images.append(baseColor)
 
-        if not normal in images:
+        if normal not in images:
             images.append(normal)
 
-        if not metallicRoughness in images:
+        if metallicRoughness not in images:
             images.append(metallicRoughness)
 
         jsn.write(b'{"name":"')
@@ -422,6 +422,126 @@ if skins:
             jsn.write(b',')
 
     jsn.write(b'],')
+
+# Animations
+if bpy.data.actions:
+    CHANNEL_MAPPING = {'location': 'translation', 'rotation_quaternion': 'rotation', 'scale': 'scale'}
+    jsn.write(b'"animations":[')
+    for i in range(len(bpy.data.actions)):
+        a = bpy.data.actions[i]
+
+        # Group channels together
+        curves = {}
+        for f in a.fcurves:
+            if 'scale' in f.data_path:
+                continue
+
+            if f.data_path not in curves:
+                curves[f.data_path] = [None, None, None, None]
+            curves[f.data_path][f.array_index] = f
+
+        armature = bpy.data.armatures[0]
+        if 'armature' in a:
+            armature = a['armature'].data
+
+        jsn.write(b'{"name":"')
+        jsn.write(a.name.encode())
+        jsn.write(b'","channels":[')
+
+        # Expects all channel parts to have same keyframes
+        sampleridx = 0
+        curvekeys = sorted(curves.keys())
+        for c in range(len(curvekeys)):
+            name = curvekeys[c]
+
+            if not name.startswith('pose.bones'):
+                continue
+
+            name = name.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
+            bone_name, channel = name.split('.')
+            bone = armature.bones[bone_name]
+            node = objs.index(bone)
+
+            jsn.write(b'{"sampler":')
+            jsn.write(str(sampleridx).encode())
+            jsn.write(b',"target":{"node":')
+            jsn.write(str(objs.index(armature.bones[bone_name])).encode())
+            jsn.write(b',"path":"')
+            jsn.write(CHANNEL_MAPPING[channel].encode())
+            jsn.write(b'"}}')
+            sampleridx += 1
+
+            if c < len(curvekeys) - 1:
+                jsn.write(b',')
+
+        jsn.write(b'],"samplers":[')
+        for c in range(len(curvekeys)):
+            name = curvekeys[c]
+            curveset = curves[name]
+
+            if not name.startswith('pose.bones'):
+                continue
+
+            name = name.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
+            bone_name, channel = name.split('.')
+            bone = armature.bones[bone_name]
+            node = objs.index(bone)
+
+            if bone.parent:
+                correction = (bone.parent.matrix_local.inverted_safe() @ bone.matrix_local)
+            else:
+                correction = axis_basis_change @ bone.matrix_local
+
+            # timestamps
+            jsn.write(b'{"input":')
+            jsn.write(str(len(accessors)).encode())
+            offset = bchunk.tell()
+            accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': len(curveset[0].keyframe_points)})
+            bufferViews.append({'byteOffset': offset, 'byteLength': len(curveset[0].keyframe_points) * 4})
+            for k in curveset[0].keyframe_points:
+                bchunk.write(np.float32(k.co.x/(bpy.context.scene.render.fps * bpy.context.scene.render.fps_base)))
+
+            # Quaternion or Vector3
+            count = 4 if curveset[3] else 3
+
+            jsn.write(b',"output":')
+            jsn.write(str(len(accessors)).encode())
+            offset = bchunk.tell()
+            accessors.append({'type': f'"VEC{count}"', 'componentType': 5126, 'count': len(curveset[0].keyframe_points)})
+            bufferViews.append({'byteOffset': offset, 'byteLength': len(curveset[0].keyframe_points) * 4 * count})
+
+            for t in range(len(curveset[0].keyframe_points)):
+                if count == 4:
+                    q = mathutils.Quaternion((curveset[0].keyframe_points[t].co.y, curveset[1].keyframe_points[t].co.y, curveset[2].keyframe_points[t].co.y, curveset[3].keyframe_points[t].co.y))
+                    result = (correction @ q.to_matrix().to_4x4()).to_quaternion()
+                    bchunk.write(np.float32(result.x))
+                    bchunk.write(np.float32(result.y))
+                    bchunk.write(np.float32(result.z))
+                    bchunk.write(np.float32(result.w))
+                elif count == 3 and channel == 'scale':
+                    bchunk.write(np.float32(curveset[0].keyframe_points[t].co.y))
+                    bchunk.write(np.float32(curveset[1].keyframe_points[t].co.y))
+                    bchunk.write(np.float32(curveset[2].keyframe_points[t].co.y))
+                elif count == 3 and channel == 'location':
+                    v = mathutils.Vector((curveset[0].keyframe_points[t].co.y, curveset[1].keyframe_points[t].co.y, curveset[2].keyframe_points[t].co.y))
+                    location = (correction @ mathutils.Matrix.Translation(v).to_4x4()).to_translation()
+
+                    bchunk.write(np.float32(location.x))
+                    bchunk.write(np.float32(location.y))
+                    bchunk.write(np.float32(location.z))
+
+            jsn.write(b'}')
+
+            if c < len(curvekeys) - 1:
+                jsn.write(b',')
+
+        jsn.write(b']}')
+
+        if i < len(bpy.data.actions) - 1:
+            jsn.write(b',')
+
+    jsn.write(b'],')
+
 
 # Accessors section
 if accessors:
