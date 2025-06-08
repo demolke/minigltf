@@ -3,7 +3,6 @@ from io import BytesIO
 import json
 import mathutils
 import numpy as np
-import os
 import struct
 import time
 
@@ -14,7 +13,7 @@ def mini_export(output_file: str) -> None:
 
     jsn = BytesIO()
     jsn.write(b'{')
-    jsn.write(b'"asset":{"version":"2.0","generator":"minigltf"},')
+    jsn.write(b'"asset":{"version":"2.0","generator":"minigltf"},\n')
 
     bchunk = BytesIO()
 
@@ -319,18 +318,18 @@ def mini_export(output_file: str) -> None:
 
             for link in m.node_tree.links:
                 if link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name == 'Base Color' and link.from_node.type == 'TEX_IMAGE':
-                    baseColor = link.from_node.image.filepath_from_user()
+                    baseColor = link.from_node.image.filepath
 
                 if link.to_node.type == 'NORMAL_MAP' and link.to_socket.name == 'Color' and link.from_node.type == 'TEX_IMAGE':
-                    normal = link.from_node.image.filepath_from_user()
+                    normal = link.from_node.image.filepath
 
                 if link.from_node.type == 'SEPARATE_COLOR' and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name in ('Roughness', 'Metallic'):
                     for im in m.node_tree.links:
                         if im.from_node.type == 'TEX_IMAGE' and im.to_node == link.from_node:
-                            metallicRoughness = im.from_node.image.filepath_from_user()
+                            metallicRoughness = im.from_node.image.filepath
 
                 if link.from_node.type == 'TEX_IMAGE' and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name in ('Roughness', 'Metallic'):
-                    metallicRoughness = link.from_node.image.filepath_from_user()
+                    metallicRoughness = link.from_node.image.filepath
 
             if baseColor not in images:
                 images.append(baseColor)
@@ -384,11 +383,7 @@ def mini_export(output_file: str) -> None:
         for i in range(len(images)):
             img = images[i]
             jsn.write(b'{"uri":"')  # GLB does not support external images, but godot fortunately doesn't care
-            if img:
-                jsn.write(os.path.relpath(img, os.path.dirname(output_file)).replace('\\', '\\\\').encode())
-            else:
-                jsn.write(img.encode())
-
+            jsn.write(img.lstrip('/').encode())
             jsn.write(b'"}')
 
             if i < len(images) - 1:
@@ -435,7 +430,7 @@ def mini_export(output_file: str) -> None:
         jsn.write(b'"animations":[')
         for i in range(len(bpy.data.actions)):
             a = bpy.data.actions[i]
-            
+
             # Group channels together
             curves = {}
             for f in a.fcurves:
@@ -616,7 +611,7 @@ def mini_export(output_file: str) -> None:
     jsn.write(b'}],')
 
     # Scene section
-    jsn.write(b'"scene":0,')
+    jsn.write(b'"scene":0,\n')
     jsn.write(b'"scenes":[{"name":"Scene","nodes":[')
 
     root_objs = [o for o in objs if isinstance(o, bpy.types.Object) and o.parent is None]
@@ -626,7 +621,7 @@ def mini_export(output_file: str) -> None:
         if i < len(root_objs) - 1:
             jsn.write(b',')
 
-    jsn.write(b']}]')
+    jsn.write(b']}]\n')
     jsn.write(b'}')
 
     # json must be aligned to 4-byte
