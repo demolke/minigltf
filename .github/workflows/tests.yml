@@ -16,6 +16,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y blender
+          pip install numpy
           blender --version
 
       - name: Install glTF validator
