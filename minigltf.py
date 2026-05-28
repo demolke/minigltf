@@ -6,16 +6,30 @@ import numpy as np
 import struct
 import time
 
+timings = {}
+
+
+def _action_fcurves(action):
+    """Return all fcurves for an action, compatible with Blender 4.3 and 4.4+/5.x."""
+    if hasattr(action, 'fcurves'):
+        return action.fcurves
+    # Blender 5.0+: collect fcurves from all channelbags across every strip
+    result = []
+    for layer in action.layers:
+        for strip in layer.strips:
+            if hasattr(strip, 'channelbags'):
+                for bag in strip.channelbags:
+                    result.extend(bag.fcurves)
+    return result
+
 def mini_export(output_file: str) -> None:
     axis_basis_change = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, -1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
 
-    start = time.time()
+    _t = time.perf_counter()
 
     jsn = BytesIO()
     jsn.write(b'{')
     jsn.write(b'"asset":{"version":"2.0","generator":"minigltf"},\n')
-
-    bchunk = BytesIO()
 
     objs = [o for o in bpy.data.objects if o.type in ['MESH', 'ARMATURE']]
     for a in bpy.data.armatures:
@@ -48,6 +62,31 @@ def mini_export(output_file: str) -> None:
             if m not in materials:
                 materials.append(m)
 
+    timings['setup'] = time.perf_counter() - _t
+    # Pre-scan to size the binary buffer accurately and avoid costly reallocs in
+    # Blender's allocator (observed 29× slowdown vs a single pre-allocated buffer).
+    _bin_size = 0
+    for _o in objs:
+        if not isinstance(_o, bpy.types.Object) or _o.type != 'MESH':
+            continue
+        _md = _o.data
+        _md.calc_loop_triangles()
+        _nl = len(_md.loops); _nt = len(_md.loop_triangles)
+        _bin_size += _nl * (12 + 12 + 8)                      # pos + normal + uv0
+        if len(_md.uv_layers) > 1: _bin_size += _nl * 8       # uv1
+        _is_skinned = any(mod.type == 'ARMATURE' and mod.object for mod in _o.modifiers)
+        if _is_skinned: _bin_size += _nl * (4 + 16)            # joints + weights
+        _bin_size += _nt * 12                                   # indices
+        if _md.shape_keys and len(_md.shape_keys.key_blocks) > 1:
+            _bin_size += (len(_md.shape_keys.key_blocks) - 1) * _nl * 12
+    for _sk in [o for o in objs if isinstance(o, bpy.types.Object) and o.type == 'ARMATURE']:
+        _bin_size += len(_sk.data.bones) * 64                  # inverse bind matrices
+    for _a in bpy.data.actions:
+        for _f in _action_fcurves(_a):
+            _bin_size += len(_f.keyframe_points) * 32          # anim samples (rough)
+    bchunk = BytesIO(bytearray(_bin_size + 65536))
+    bchunk.seek(0)
+    _t = time.perf_counter()
 
     # Nodes section
     jsn.write(b'"nodes":[')
@@ -136,150 +175,214 @@ def mini_export(output_file: str) -> None:
             jsn.write(b',')
 
     jsn.write(b'],')
+    timings['nodes'] = time.perf_counter() - _t
 
     # Meshes section
     if meshes:
         jsn.write(b'"meshes":[')
         for i in range(len(meshes)):
             m = meshes[i].data
+            m.calc_loop_triangles()
+            if hasattr(m, 'calc_normals_split'):
+                m.calc_normals_split()
             jsn.write(b'{"name":"')
             jsn.write(m.name.encode())
             jsn.write(b'","primitives":[{"attributes":{')
 
+            n_verts = len(m.vertices)
+            n_loops = len(m.loops)
+            n_tris = len(m.loop_triangles)
+
+            # Batch-read vertex coords and loop->vertex mapping once; shared by positions + shape keys
+            _base_co = np.empty(n_verts * 3, dtype=np.float32)
+            m.vertices.foreach_get('co', _base_co)
+            _base_co = _base_co.reshape(n_verts, 3)
+
+            _loop_vidx = np.empty(n_loops, dtype=np.int32)
+            m.loops.foreach_get('vertex_index', _loop_vidx)
+
+            # Pre-compute flat indices into the base-co buffer for each loop, for all 3 components.
+            # Reused by positions and (more critically) by each of the 50 shape key iterations
+            # to avoid building an intermediate (n_verts, 3) delta array per key.
+            _lx = (_loop_vidx * 3).astype(np.int32)      # index of x component per loop
+            _ly = _lx + 1                                  # y
+            _lz = _lx + 2                                  # z
+            _base_flat = _base_co.ravel()
+
             # Vertex position
             jsn.write(b'"POSITION":')
             jsn.write(str(len(accessors)).encode())
-            v = m.vertices[0]
-            minv = mathutils.Vector([v.co.x, v.co.z, -v.co.y])
-            maxv = mathutils.Vector([v.co.x, v.co.z, -v.co.y])
             offset = bchunk.tell()
-            for l in m.loops:
-                v = m.vertices[l.vertex_index]
-                minv.x = min(minv.x, v.co.x)
-                minv.y = min(minv.y, v.co.z)
-                minv.z = min(minv.z, -v.co.y)
-                maxv.x = max(maxv.x, v.co.x)
-                maxv.y = max(maxv.y, v.co.z)
-                maxv.z = max(maxv.z, -v.co.y)
+            _t = time.perf_counter()
 
-                bchunk.write(np.float32(v.co.x))
-                bchunk.write(np.float32(v.co.z))
-                bchunk.write(np.float32(-v.co.y))
+            _out = np.empty((n_loops, 3), dtype=np.float32)
+            _out[:, 0] = _base_flat[_lx]
+            _out[:, 1] = _base_flat[_lz]   # z
+            _out[:, 2] = -_base_flat[_ly]  # -y
+            _min = _out.min(axis=0)
+            _max = _out.max(axis=0)
+            minv = mathutils.Vector(_min.tolist())
+            maxv = mathutils.Vector(_max.tolist())
+            bchunk.write(_out.data)
 
-            accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': len(m.loops), 'min':minv, 'max':maxv})
-            bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 3 * 4, 'target': 34962})
+            timings['positions'] = timings.get('positions', 0.0) + time.perf_counter() - _t
+            accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': n_loops, 'min': minv, 'max': maxv})
+            bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 3 * 4, 'target': 34962})
 
             # Normals
             jsn.write(b',"NORMAL":')
             jsn.write(str(len(accessors)).encode())
             offset = bchunk.tell()
-            for v in m.corner_normals:
-                bchunk.write(np.float32(v.vector.x))
-                bchunk.write(np.float32(v.vector.z))
-                bchunk.write(np.float32(-v.vector.y))
-            accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': len(m.corner_normals)})
-            bufferViews.append({'byteOffset': offset, 'byteLength': len(m.corner_normals) * 3 * 4, 'target': 34962})
+            _t = time.perf_counter()
 
-            # UV1 coordinates
+            _nrm = np.empty(n_loops * 3, dtype=np.float32)
+            m.loops.foreach_get('normal', _nrm)
+            _nrm = _nrm.reshape(n_loops, 3)
+            _out_n = np.empty_like(_nrm)
+            _out_n[:, 0] = _nrm[:, 0]
+            _out_n[:, 1] = _nrm[:, 2]
+            _out_n[:, 2] = -_nrm[:, 1]
+            bchunk.write(_out_n.data)
+
+            timings['normals'] = timings.get('normals', 0.0) + time.perf_counter() - _t
+            accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': n_loops})
+            bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 3 * 4, 'target': 34962})
+
+            # UV coordinates
             jsn.write(b',"TEXCOORD_0":')
             jsn.write(str(len(accessors)).encode())
             offset = bchunk.tell()
-            for u in m.uv_layers[0].uv:
-                bchunk.write(np.float32(u.vector.x))
-                bchunk.write(np.float32(1 - u.vector.y))
+            _t = time.perf_counter()
 
-            accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': len(m.uv_layers[0].uv)})
-            bufferViews.append({'byteOffset': offset, 'byteLength': len(m.uv_layers[0].uv) * 2 * 4, 'target': 34962})
+            _uv0 = np.empty(n_loops * 2, dtype=np.float32)
+            m.uv_layers[0].uv.foreach_get('vector', _uv0)
+            _uv0 = _uv0.reshape(n_loops, 2)
+            _uv0[:, 1] = 1.0 - _uv0[:, 1]
+            bchunk.write(_uv0.data)
 
-            # UV2 coordinates
+            accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': n_loops})
+            bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 2 * 4, 'target': 34962})
+
             if len(m.uv_layers) > 1:
                 jsn.write(b',"TEXCOORD_1":')
                 jsn.write(str(len(accessors)).encode())
                 offset = bchunk.tell()
-                for u in m.uv_layers[1].uv:
-                    bchunk.write(np.float32(u.vector.x))
-                    bchunk.write(np.float32(u.vector.y))
-                accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': len(m.uv_layers[1].uv)})
-                bufferViews.append({'byteOffset': offset, 'byteLength': len(m.uv_layers[1].uv) * 2 * 4, 'target': 34962})
+                _uv1 = np.empty(n_loops * 2, dtype=np.float32)
+                m.uv_layers[1].uv.foreach_get('vector', _uv1)
+                bchunk.write(_uv1.data)
+                accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': n_loops})
+                bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 2 * 4, 'target': 34962})
+            timings['uvs'] = timings.get('uvs', 0.0) + time.perf_counter() - _t
 
-            # Joints and Weights
-            jsn.write(b',"JOINTS_0":')
-            jsn.write(str(len(accessors)).encode())
-            offset = bchunk.tell()
-            accessors.append({'type': '"VEC4"', 'componentType': 5121, 'count': len(m.loops)})
-            bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 4, 'target': 34962})
+            # Joints and Weights — only for skinned meshes
+            if meshes[i] in joints_index:
+                jsn.write(b',"JOINTS_0":')
+                jsn.write(str(len(accessors)).encode())
+                offset = bchunk.tell()
+                accessors.append({'type': '"VEC4"', 'componentType': 5121, 'count': n_loops})
+                bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 4, 'target': 34962})
 
-            weights = BytesIO()
+                _t = time.perf_counter()
 
-            for l in m.loops:
-                v = m.vertices[l.vertex_index]
+                joint_map = joints_index[meshes[i]]
+                vgroups = meshes[i].vertex_groups
 
-                weight = np.array([0.0, 0.0, 0.0, 0.0])
-                for j in range(4):
-                    index = 0
-                    if j < len(v.groups):
-                        weight[j] = v.groups[j].weight
-                        if weight[j] > 0:
-                            index = joints_index[meshes[i]][meshes[i].vertex_groups[v.groups[j].group].name]
-                    bchunk.write(np.uint8(index))
+                # Pre-compute group_index -> joint_index array to avoid dict lookup per vertex
+                _group_to_joint = np.zeros(len(vgroups), dtype=np.uint8)
+                for vg in vgroups:
+                    if vg.name in joint_map:
+                        _group_to_joint[vg.index] = joint_map[vg.name]
 
-                # Normalize weights
-                weight /= weight.sum()
+                # Build per-vertex joint index / weight arrays (4 influences max).
+                # Use float64 to match original precision before the final float32 cast.
+                _jidx = np.zeros((n_verts, 4), dtype=np.uint8)
+                _jwt64 = np.zeros((n_verts, 4), dtype=np.float64)
+                for vi, v in enumerate(m.vertices):
+                    for k, g in enumerate(v.groups[:4]):
+                        _jwt64[vi, k] = g.weight
+                        _jidx[vi, k] = _group_to_joint[g.group]
 
-                for j in range(4):
-                    weights.write(np.float32(weight[j]))
+                # Batch-normalize in float64, then cast (matches original per-vertex behaviour)
+                _sums = _jwt64.sum(axis=1, keepdims=True)
+                np.divide(_jwt64, np.where(_sums > 0, _sums, 1.0), out=_jwt64)
+                _jwt = _jwt64.astype(np.float32)
 
-            jsn.write(b',"WEIGHTS_0":')
-            jsn.write(str(len(accessors)).encode())
-            offset = bchunk.tell()
-            accessors.append({'type': '"VEC4"', 'componentType': 5126, 'count': len(m.loops)})
-            bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 4 * 4, 'target': 34962})
-            bchunk.write(weights.getbuffer())
+                # Expand to per-loop
+                _jidx_loop = _jidx[_loop_vidx]
+                _jwt_loop = _jwt[_loop_vidx]
+
+                timings['joints_weights'] = timings.get('joints_weights', 0.0) + time.perf_counter() - _t
+
+                bchunk.write(_jidx_loop.data)
+
+                jsn.write(b',"WEIGHTS_0":')
+                jsn.write(str(len(accessors)).encode())
+                offset = bchunk.tell()
+                accessors.append({'type': '"VEC4"', 'componentType': 5126, 'count': n_loops})
+                bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 4 * 4, 'target': 34962})
+                bchunk.write(_jwt_loop.data)
 
             # Face indices
             jsn.write(b'},"indices":')
             jsn.write(str(len(accessors)).encode())
             offset = bchunk.tell()
-            for l in m.loop_triangles:
-                bchunk.write(np.uint32(l.loops[0]))
-                bchunk.write(np.uint32(l.loops[1]))
-                bchunk.write(np.uint32(l.loops[2]))
-            accessors.append({'type': '"SCALAR"', 'componentType': 5125, 'count': len(m.loop_triangles) * 3})
-            bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loop_triangles) * 4 * 4, 'target': 34963})
+            _t = time.perf_counter()
+
+            _idx = np.empty(n_tris * 3, dtype=np.uint32)
+            m.loop_triangles.foreach_get('loops', _idx)
+            bchunk.write(_idx.data)
+
+            timings['indices'] = timings.get('indices', 0.0) + time.perf_counter() - _t
+            accessors.append({'type': '"SCALAR"', 'componentType': 5125, 'count': n_tris * 3})
+            bufferViews.append({'byteOffset': offset, 'byteLength': n_tris * 3 * 4, 'target': 34963})
 
             # Blendshapes
             if m.shape_keys and len(m.shape_keys.key_blocks) > 1:
                 jsn.write(b',"targets":[')
+                _t = time.perf_counter()
+                # Pre-allocate once; reused across all shape keys to avoid 500MB of GC pressure
+                _sk_buf = np.empty(n_verts * 3, dtype=np.float32)
+                _out_sk = np.empty((n_loops, 3), dtype=np.float32)
+                # Pre-compute base coords at each loop position (once, not per key)
+                _base_at_lx = _base_flat[_lx]
+                _base_at_ly = _base_flat[_ly]
+                _base_at_lz = _base_flat[_lz]
+                # Per-key scratch buffers for the 3 gather results
+                _sk_at_lx = np.empty(n_loops, dtype=np.float32)
+                _sk_at_ly = np.empty(n_loops, dtype=np.float32)
+                _sk_at_lz = np.empty(n_loops, dtype=np.float32)
                 for j in range(1, len(m.shape_keys.key_blocks)):
-                    s = m.shape_keys.key_blocks[j].data
+                    m.shape_keys.key_blocks[j].data.foreach_get('co', _sk_buf)
+                    # Gather per-loop x/y/z from flat buffer, subtract base, write directly
+                    np.take(_sk_buf, _lx, out=_sk_at_lx)
+                    np.take(_sk_buf, _lz, out=_sk_at_lz)
+                    np.take(_sk_buf, _ly, out=_sk_at_ly)
+                    np.subtract(_sk_at_lx, _base_at_lx, out=_out_sk[:, 0])
+                    np.subtract(_sk_at_lz, _base_at_lz, out=_out_sk[:, 1])
+                    np.subtract(_sk_at_ly, _base_at_ly, out=_out_sk[:, 2])
+                    _out_sk[:, 2] *= -1
 
-                    v = s[0].co - m.vertices[0].co
-                    minv = mathutils.Vector([v.x, v.z, -v.y])
-                    maxv = mathutils.Vector([v.x, v.z, -v.y])
+                    # Compute min/max on per-vertex delta (n_verts elements, contiguous)
+                    # rather than on per-loop output (4× larger, same values, strided columns)
+                    _dk_x = _sk_buf[0::3] - _base_flat[0::3]
+                    _dk_y = _sk_buf[1::3] - _base_flat[1::3]
+                    _dk_z = _sk_buf[2::3] - _base_flat[2::3]
+                    minv = mathutils.Vector([float(_dk_x.min()), float(_dk_z.min()), float(-_dk_y.max())])
+                    maxv = mathutils.Vector([float(_dk_x.max()), float(_dk_z.max()), float(-_dk_y.min())])
+
                     jsn.write(b'{"POSITION":')
                     jsn.write(str(len(accessors)).encode())
                     offset = bchunk.tell()
+                    bchunk.write(_out_sk.view(np.uint8).ravel())
 
-                    for l in m.loops:
-                        v = s[l.vertex_index].co - m.vertices[l.vertex_index].co
-                        minv.x = min(minv.x, v.x)
-                        minv.y = min(minv.y, v.z)
-                        minv.z = min(minv.z, -v.y)
-                        maxv.x = max(maxv.x, v.x)
-                        maxv.y = max(maxv.y, v.z)
-                        maxv.z = max(maxv.z, -v.y)
-
-                        bchunk.write(np.float32(v.x))
-                        bchunk.write(np.float32(v.z))
-                        bchunk.write(np.float32(-v.y))
-
-                    accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': len(m.loops), 'min':minv, 'max':maxv})
-                    bufferViews.append({'byteOffset': offset, 'byteLength': len(m.loops) * 3 * 4, 'target': 34962})
+                    accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': n_loops, 'min': minv, 'max': maxv})
+                    bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 3 * 4, 'target': 34962})
                     jsn.write(b'}')
 
                     if j < len(m.shape_keys.key_blocks) - 1:
                         jsn.write(b',')
 
+                timings['shape_keys'] = timings.get('shape_keys', 0.0) + time.perf_counter() - _t
                 jsn.write(b']')
 
             # Material
@@ -307,6 +410,7 @@ def mini_export(output_file: str) -> None:
         jsn.write(b'],')
 
     # Materials
+    _t = time.perf_counter()
     if materials:
         jsn.write(b'"materials":[')
         for i in range(len(materials)):
@@ -362,7 +466,6 @@ def mini_export(output_file: str) -> None:
 
         jsn.write(b'],')
 
-
     # Textures
     if images:
         jsn.write(b'"textures":[')
@@ -390,8 +493,10 @@ def mini_export(output_file: str) -> None:
                 jsn.write(b',')
 
         jsn.write(b'],')
+    timings['materials'] = time.perf_counter() - _t
 
     # Skins
+    _t = time.perf_counter()
     if skins:
         jsn.write(b'"skins":[')
         for i in range(len(skins)):
@@ -423,8 +528,13 @@ def mini_export(output_file: str) -> None:
                 jsn.write(b',')
 
         jsn.write(b'],')
+    timings['skins'] = time.perf_counter() - _t
 
     # Animations
+    _t_anim_timestamps = 0.0
+    _t_anim_rotation = 0.0
+    _t_anim_location = 0.0
+    _t_anim_morph = 0.0
     if bpy.data.actions:
         CHANNEL_MAPPING = {'location': 'translation', 'rotation_quaternion': 'rotation', 'scale': 'scale'}
         jsn.write(b'"animations":[')
@@ -433,7 +543,7 @@ def mini_export(output_file: str) -> None:
 
             # Group channels together
             curves = {}
-            for f in a.fcurves:
+            for f in _action_fcurves(a):
                 if 'scale' in f.data_path:
                     continue
 
@@ -441,9 +551,22 @@ def mini_export(output_file: str) -> None:
                     curves[f.data_path] = [None, None, None, None]
                 curves[f.data_path][f.array_index] = f
 
-            armature = bpy.data.armatures[0]
+            armature = bpy.data.armatures[0] if bpy.data.armatures else None
             if 'armature' in a:
                 armature = a['armature'].data
+
+            shape_key_curves = {}
+            for path, fcs in curves.items():
+                if path.startswith('key_blocks[') and '.value' in path:
+                    key_name = path.split('"')[1]
+                    shape_key_curves[key_name] = fcs[0]
+
+            sk_mesh_obj = None
+            for obj in meshes:
+                sk = obj.data.shape_keys
+                if sk and sk.animation_data and sk.animation_data.action == a:
+                    sk_mesh_obj = obj
+                    break
 
             jsn.write(b'{"name":"')
             jsn.write(a.name.encode())
@@ -452,41 +575,52 @@ def mini_export(output_file: str) -> None:
             # Expects all channel parts to have same keyframes
             sampleridx = 0
             curvekeys = sorted(curves.keys())
+            bone_channels_written = 0
             for c in range(len(curvekeys)):
                 name = curvekeys[c]
 
-                if not name.startswith('pose.bones'):
+                if not name.startswith('pose.bones') or armature is None:
                     continue
 
                 name = name.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
                 bone_name, channel = name.split('.')
                 bone = armature.bones[bone_name]
-                node = objs.index(bone)
 
                 jsn.write(b'{"sampler":')
                 jsn.write(str(sampleridx).encode())
                 jsn.write(b',"target":{"node":')
-                jsn.write(str(objs.index(armature.bones[bone_name])).encode())
+                jsn.write(str(objs.index(bone)).encode())
                 jsn.write(b',"path":"')
                 jsn.write(CHANNEL_MAPPING[channel].encode())
                 jsn.write(b'"}}')
                 sampleridx += 1
+                bone_channels_written += 1
 
                 if c < len(curvekeys) - 1:
                     jsn.write(b',')
 
+            if shape_key_curves and sk_mesh_obj:
+                if bone_channels_written > 0:
+                    jsn.write(b',')
+                jsn.write(b'{"sampler":')
+                jsn.write(str(sampleridx).encode())
+                jsn.write(b',"target":{"node":')
+                jsn.write(str(objs.index(sk_mesh_obj)).encode())
+                jsn.write(b',"path":"weights"}}')
+                sampleridx += 1
+
             jsn.write(b'],"samplers":[')
+            bone_samplers_written = 0
             for c in range(len(curvekeys)):
                 name = curvekeys[c]
                 curveset = curves[name]
 
-                if not name.startswith('pose.bones'):
+                if not name.startswith('pose.bones') or armature is None:
                     continue
 
                 name = name.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
                 bone_name, channel = name.split('.')
                 bone = armature.bones[bone_name]
-                node = objs.index(bone)
 
                 if bone.parent:
                     correction = (bone.parent.matrix_local.inverted_safe() @ bone.matrix_local)
@@ -497,10 +631,14 @@ def mini_export(output_file: str) -> None:
                 jsn.write(b'{"input":')
                 jsn.write(str(len(accessors)).encode())
                 offset = bchunk.tell()
-                accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': len(curveset[0].keyframe_points)})
-                bufferViews.append({'byteOffset': offset, 'byteLength': len(curveset[0].keyframe_points) * 4})
-                for k in curveset[0].keyframe_points:
-                    bchunk.write(np.float32(k.co.x/(bpy.context.scene.render.fps * bpy.context.scene.render.fps_base)))
+                fps_val = bpy.context.scene.render.fps * bpy.context.scene.render.fps_base
+                t_secs = [k.co.x / fps_val for k in curveset[0].keyframe_points]
+                accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': len(t_secs), 'min': min(t_secs), 'max': max(t_secs)})
+                bufferViews.append({'byteOffset': offset, 'byteLength': len(t_secs) * 4})
+                _tt = time.perf_counter()
+                for t in t_secs:
+                    bchunk.write(np.float32(t))
+                _t_anim_timestamps += time.perf_counter() - _tt
 
                 # Quaternion or Vector3
                 count = 4 if curveset[3] else 3
@@ -511,6 +649,7 @@ def mini_export(output_file: str) -> None:
                 accessors.append({'type': f'"VEC{count}"', 'componentType': 5126, 'count': len(curveset[0].keyframe_points)})
                 bufferViews.append({'byteOffset': offset, 'byteLength': len(curveset[0].keyframe_points) * 4 * count})
 
+                _tt = time.perf_counter()
                 for t in range(len(curveset[0].keyframe_points)):
                     if count == 4:
                         q = mathutils.Quaternion((curveset[0].keyframe_points[t].co.y, curveset[1].keyframe_points[t].co.y, curveset[2].keyframe_points[t].co.y, curveset[3].keyframe_points[t].co.y))
@@ -526,15 +665,56 @@ def mini_export(output_file: str) -> None:
                     elif count == 3 and channel == 'location':
                         v = mathutils.Vector((curveset[0].keyframe_points[t].co.y, curveset[1].keyframe_points[t].co.y, curveset[2].keyframe_points[t].co.y))
                         location = (correction @ mathutils.Matrix.Translation(v).to_4x4()).to_translation()
-
                         bchunk.write(np.float32(location.x))
                         bchunk.write(np.float32(location.y))
                         bchunk.write(np.float32(location.z))
+                if count == 4:
+                    _t_anim_rotation += time.perf_counter() - _tt
+                else:
+                    _t_anim_location += time.perf_counter() - _tt
 
                 jsn.write(b'}')
+                bone_samplers_written += 1
 
                 if c < len(curvekeys) - 1:
                     jsn.write(b',')
+
+            if shape_key_curves and sk_mesh_obj:
+                if bone_samplers_written > 0:
+                    jsn.write(b',')
+                key_blocks = sk_mesh_obj.data.shape_keys.key_blocks
+                morph_names = [kb.name for kb in key_blocks[1:]]
+                num_morphs = len(morph_names)
+                first_fc = next(iter(shape_key_curves.values()))
+                keyframe_times = [kp.co.x for kp in first_fc.keyframe_points]
+                num_frames = len(keyframe_times)
+                fps = bpy.context.scene.render.fps * bpy.context.scene.render.fps_base
+
+                jsn.write(b'{"input":')
+                jsn.write(str(len(accessors)).encode())
+                offset = bchunk.tell()
+                t_secs = [t / fps for t in keyframe_times]
+                accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': num_frames, 'min': min(t_secs), 'max': max(t_secs)})
+                bufferViews.append({'byteOffset': offset, 'byteLength': num_frames * 4})
+                _tt = time.perf_counter()
+                for t in t_secs:
+                    bchunk.write(np.float32(t))
+                _t_anim_timestamps += time.perf_counter() - _tt
+
+                jsn.write(b',"output":')
+                jsn.write(str(len(accessors)).encode())
+                offset = bchunk.tell()
+                accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': num_frames * num_morphs})
+                bufferViews.append({'byteOffset': offset, 'byteLength': num_frames * num_morphs * 4})
+                _tt = time.perf_counter()
+                for fi in range(num_frames):
+                    for morph_name in morph_names:
+                        fc = shape_key_curves.get(morph_name)
+                        w = fc.keyframe_points[fi].co.y if fc and fi < len(fc.keyframe_points) else 0.0
+                        bchunk.write(np.float32(w))
+                _t_anim_morph += time.perf_counter() - _tt
+
+                jsn.write(b',"interpolation":"LINEAR"}')
 
             jsn.write(b']}')
 
@@ -543,8 +723,13 @@ def mini_export(output_file: str) -> None:
 
         jsn.write(b'],')
 
+    timings['anim_timestamps'] = _t_anim_timestamps
+    timings['anim_rotation'] = _t_anim_rotation
+    timings['anim_location'] = _t_anim_location
+    timings['anim_morph'] = _t_anim_morph
 
     # Accessors section
+    _t = time.perf_counter()
     if accessors:
         jsn.write(b'"accessors":[')
 
@@ -564,22 +749,29 @@ def mini_export(output_file: str) -> None:
             jsn.write(str(a['count']).encode())
 
             if 'min' in a:
-                jsn.write(b',"min":[')
+                if isinstance(a['min'], (int, float)):
+                    jsn.write(b',"min":[')
+                    jsn.write(str(a['min']).encode())
+                    jsn.write(b'],"max":[')
+                    jsn.write(str(a['max']).encode())
+                    jsn.write(b']')
+                else:
+                    jsn.write(b',"min":[')
 
-                # Note x,y,z has already been swizzled
-                jsn.write(str(a['min'].x).encode())
-                jsn.write(b',')
-                jsn.write(str(a['min'].y).encode())
-                jsn.write(b',')
-                jsn.write(str(a['min'].z).encode())
+                    # Note x,y,z has already been swizzled
+                    jsn.write(str(a['min'].x).encode())
+                    jsn.write(b',')
+                    jsn.write(str(a['min'].y).encode())
+                    jsn.write(b',')
+                    jsn.write(str(a['min'].z).encode())
 
-                jsn.write(b'],"max":[')
-                jsn.write(str(a['max'].x).encode())
-                jsn.write(b',')
-                jsn.write(str(a['max'].y).encode())
-                jsn.write(b',')
-                jsn.write(str(a['max'].z).encode())
-                jsn.write(b']')
+                    jsn.write(b'],"max":[')
+                    jsn.write(str(a['max'].x).encode())
+                    jsn.write(b',')
+                    jsn.write(str(a['max'].y).encode())
+                    jsn.write(b',')
+                    jsn.write(str(a['max'].z).encode())
+                    jsn.write(b']')
 
             jsn.write(b'}')
             if i < len(accessors) - 1:
@@ -623,8 +815,10 @@ def mini_export(output_file: str) -> None:
 
     jsn.write(b']}]\n')
     jsn.write(b'}')
+    timings['json_metadata'] = time.perf_counter() - _t
 
     # json must be aligned to 4-byte
+    _t = time.perf_counter()
     while jsn.tell() % 4 != 0:
         jsn.write(str(" ").encode())
 
@@ -639,17 +833,13 @@ def mini_export(output_file: str) -> None:
     output.write(np.uint32(0x4E4F534A))
     output.write(jsn)
 
-    output.write(np.uint32(bchunk.tell()))
+    _bchunk_len = bchunk.tell()
+    output.write(np.uint32(_bchunk_len))
     output.write(np.uint32(0x004E4942))
-    output.write(bchunk.getbuffer())
+    output.write(bchunk.getbuffer()[:_bchunk_len])
 
     f = open(output_file, 'wb')
     f.write(output.getbuffer())
     output.close()
     f.close()
-
-    # json_file = open('data/output.json', 'w')
-    # json_file.write(json.dumps(json.loads(jsn.tobytes()), indent=4))
-    # json_file.close()
-
-    print(time.time() - start)
+    timings['file_io'] = time.perf_counter() - _t

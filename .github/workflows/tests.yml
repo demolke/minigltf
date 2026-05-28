@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Blender
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y blender
+          blender --version
+
+      - name: Install glTF validator
+        run: |
+          curl -fsSL \
+            https://github.com/KhronosGroup/glTF-Validator/releases/download/2.0.0-dev.3.10/gltf_validator-2.0.0-dev.3.10-linux64.tar.xz \
+            -o /tmp/validator.tar.xz
+          tar -xJf /tmp/validator.tar.xz gltf_validator
+          chmod +x gltf_validator
+          mv gltf_validator validator
+
+      - name: Run tests
+        run: python tests/run_tests.py
