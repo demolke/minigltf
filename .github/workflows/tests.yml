@@ -9,7 +9,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - uses: actions/checkout@v4
 
@@ -34,3 +33,11 @@ jobs:
 
       - name: Run tests
         run: python tests/run_tests.py
+
+      - name: Benchmark
+        run: |
+          BLEND=$(ls -t test_runs/*/large_perf/scene.blend | head -1)
+          blender --background "$BLEND" \
+            --python tests/bench_compare.py -- \
+            --repo-dir $PWD --runs 5
+
