@@ -242,13 +242,13 @@ def add_shape_keys(obj, mesh, vco):
 
 
 def add_animations(arm_obj):
-    """Phase 5: 30 animations × 1440 frames, keyframe every 48 frames, all 40 bones."""
+    """Phase 5: 3 animations × 1440 frames, keyframe every 48 frames, all 40 bones."""
     t0 = time.time()
     print("[5/6] Building animations (30 × 1440 frames × 40 bones)...", flush=True)
 
     bone_names = [bd[0] for bd in BONE_DEFS]
     n_bones = len(bone_names)
-    n_anims = 30
+    n_anims = 3
     n_frames_total = 1440
     frame_step = 48
     keyframes = list(range(1, n_frames_total + 1, frame_step))

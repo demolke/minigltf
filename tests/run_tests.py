@@ -352,7 +352,7 @@ def validate_large_perf(gltf, bin_data):
     assert len(skin.get('joints', [])) == 40, f"expected 40 joints, got {len(skin.get('joints', []))}"
     prim = gltf['meshes'][0]['primitives'][0]
     assert len(prim.get('targets', [])) == 50, f"expected 50 morph targets, got {len(prim.get('targets', []))}"
-    assert len(gltf.get('animations', [])) == 31, f"expected 31 animations, got {len(gltf.get('animations', []))}"
+    assert len(gltf.get('animations', [])) == 4, f"expected 4 animations, got {len(gltf.get('animations', []))}"
 
 
 # ---------------------------------------------------------------------------

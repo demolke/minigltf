@@ -4,22 +4,22 @@ Prints a timing table to stdout and, when run inside GitHub Actions,
 appends a markdown summary to $GITHUB_STEP_SUMMARY.
 
 Usage:
-    blender --background scene.blend \\
-        --python tests/bench_compare.py -- \\
-        --repo-dir $PWD [--runs 5]
+    blender --background scene.blend --python tests/bench_compare.py -- [--runs 5]
 """
 
 import sys
 import os
+import tempfile
 import time
 import statistics
 import argparse
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def parse_args():
     argv = sys.argv[sys.argv.index('--') + 1:] if '--' in sys.argv else []
     p = argparse.ArgumentParser()
-    p.add_argument('--repo-dir', required=True)
     p.add_argument('--runs', type=int, default=5)
     return p.parse_args(argv)
 
@@ -38,7 +38,6 @@ def bench(label, fn, runs):
 
 def main():
     args = parse_args()
-    sys.path.insert(0, args.repo_dir)
 
     try:
         import minigltf
@@ -50,8 +49,9 @@ def main():
 
     import bpy
 
-    mini_out    = '/tmp/bench_mini.glb'
-    builtin_out = '/tmp/bench_builtin.glb'
+    tmp = tempfile.gettempdir()
+    mini_out    = os.path.join(tmp, 'bench_mini.glb')
+    builtin_out = os.path.join(tmp, 'bench_builtin.glb')
 
     mini_times    = bench('minigltf',      lambda: minigltf.mini_export(mini_out), args.runs)
     print(flush=True)

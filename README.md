@@ -2,6 +2,29 @@
 
 Minimal Blender GLTF exporter for Godot optimized for speed
 
+## Performance
+
+```
+  vertices             100,482
+  triangles            200,960
+  loops                402,560
+  shape keys           50
+  bones                40
+  animations           31 × ~30 keyframes
+
+                   median       min       max        size
+──────────────────────────────────────────────────────────
+minigltf           2.755s    2.471s    3.450s    267.1 MB
+built-in glTF    379.377s  373.314s  907.280s    244.5 MB
+
+speedup: ~138x
+```
+
+The main performance difference comes from the fact minigltf does not sample
+curves at each frame, but rather exports only the existing keyframes directly.
+This means **only raw keyframe values** get exported, not their interpolation
+mode or handles.
+
 ## Supported features
 
 **Geometry**

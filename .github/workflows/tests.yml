@@ -38,6 +38,5 @@ jobs:
         run: |
           BLEND=$(ls -t test_runs/*/large_perf/scene.blend | head -1)
           blender --background "$BLEND" \
-            --python tests/bench_compare.py -- \
-            --repo-dir $PWD --runs 5
+            --python tests/bench_compare.py -- --runs 5
 
