@@ -7,3 +7,4 @@ maintainer = "minigltf contributors"
 type = "add-on"
 blender_version_min = "4.2.0"
 license = ["SPDX:MIT"]
+website = "https://github.com/demolke/minigltf"
