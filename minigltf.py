@@ -30,6 +30,35 @@ def _action_fcurves(action):
                     result.extend(bag.fcurves)
     return result
 
+class _BinWriter:
+    """Append-only binary buffer backed by a single pre-allocated bytearray."""
+
+    def __init__(self, size):
+        self.buf = bytearray(size)
+        self.mv = memoryview(self.buf)
+        self.offset = 0
+
+    def tell(self):
+        return self.offset
+
+    def write(self, data):
+        src = memoryview(data).cast('B')
+        n = src.nbytes
+        self.mv[self.offset:self.offset + n] = src
+        self.offset += n
+
+    def view(self, n_elems, dtype=np.float32):
+        """Reserve n_elems of dtype at the current offset and return a writable
+        numpy view onto them. Advances the write position past the reservation."""
+        dt = np.dtype(dtype)
+        arr = np.frombuffer(self.mv, dtype=dt, count=n_elems, offset=self.offset)
+        self.offset += n_elems * dt.itemsize
+        return arr
+
+    def getbuffer(self):
+        return self.mv[:self.offset]
+
+
 def mini_export(output_file: str) -> None:
     axis_basis_change = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, -1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
 
@@ -92,8 +121,7 @@ def mini_export(output_file: str) -> None:
     for _a in bpy.data.actions:
         for _f in _action_fcurves(_a):
             _bin_size += len(_f.keyframe_points) * 32          # anim samples (rough)
-    bchunk = BytesIO(bytearray(_bin_size + 65536))
-    bchunk.seek(0)
+    bchunk = _BinWriter(_bin_size + 65536)
     _t = time.perf_counter()
 
     # Nodes section
@@ -223,15 +251,12 @@ def mini_export(output_file: str) -> None:
             offset = bchunk.tell()
             _t = time.perf_counter()
 
-            _out = np.empty((n_loops, 3), dtype=np.float32)
+            _out = bchunk.view(n_loops * 3).reshape(n_loops, 3)
             _out[:, 0] = _base_flat[_lx]
             _out[:, 1] = _base_flat[_lz]   # z
             _out[:, 2] = -_base_flat[_ly]  # -y
-            _min = _out.min(axis=0)
-            _max = _out.max(axis=0)
-            minv = mathutils.Vector(_min.tolist())
-            maxv = mathutils.Vector(_max.tolist())
-            bchunk.write(_out.data)
+            minv = mathutils.Vector(_out.min(axis=0).tolist())
+            maxv = mathutils.Vector(_out.max(axis=0).tolist())
 
             timings['positions'] = timings.get('positions', 0.0) + time.perf_counter() - _t
             accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': n_loops, 'min': minv, 'max': maxv})
@@ -246,11 +271,10 @@ def mini_export(output_file: str) -> None:
             _nrm = np.empty(n_loops * 3, dtype=np.float32)
             m.loops.foreach_get('normal', _nrm)
             _nrm = _nrm.reshape(n_loops, 3)
-            _out_n = np.empty_like(_nrm)
+            _out_n = bchunk.view(n_loops * 3).reshape(n_loops, 3)
             _out_n[:, 0] = _nrm[:, 0]
             _out_n[:, 1] = _nrm[:, 2]
             _out_n[:, 2] = -_nrm[:, 1]
-            bchunk.write(_out_n.data)
 
             timings['normals'] = timings.get('normals', 0.0) + time.perf_counter() - _t
             accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': n_loops})
@@ -262,11 +286,10 @@ def mini_export(output_file: str) -> None:
             offset = bchunk.tell()
             _t = time.perf_counter()
 
-            _uv0 = np.empty(n_loops * 2, dtype=np.float32)
+            _uv0 = bchunk.view(n_loops * 2)
             m.uv_layers[0].uv.foreach_get('vector', _uv0)
             _uv0 = _uv0.reshape(n_loops, 2)
             _uv0[:, 1] = 1.0 - _uv0[:, 1]
-            bchunk.write(_uv0.data)
 
             accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': n_loops})
             bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 2 * 4, 'target': 34962})
@@ -275,9 +298,8 @@ def mini_export(output_file: str) -> None:
                 jsn.write(b',"TEXCOORD_1":')
                 jsn.write(str(len(accessors)).encode())
                 offset = bchunk.tell()
-                _uv1 = np.empty(n_loops * 2, dtype=np.float32)
+                _uv1 = bchunk.view(n_loops * 2)
                 m.uv_layers[1].uv.foreach_get('vector', _uv1)
-                bchunk.write(_uv1.data)
                 accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': n_loops})
                 bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 2 * 4, 'target': 34962})
             timings['uvs'] = timings.get('uvs', 0.0) + time.perf_counter() - _t
@@ -287,8 +309,16 @@ def mini_export(output_file: str) -> None:
                 jsn.write(b',"JOINTS_0":')
                 jsn.write(str(len(accessors)).encode())
                 offset = bchunk.tell()
+                _jidx_loop = bchunk.view(n_loops * 4, dtype=np.uint8).reshape(n_loops, 4)
                 accessors.append({'type': '"VEC4"', 'componentType': 5121, 'count': n_loops})
                 bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 4, 'target': 34962})
+
+                jsn.write(b',"WEIGHTS_0":')
+                jsn.write(str(len(accessors)).encode())
+                offset = bchunk.tell()
+                _jwt_loop = bchunk.view(n_loops * 4, dtype=np.float32).reshape(n_loops, 4)
+                accessors.append({'type': '"VEC4"', 'componentType': 5126, 'count': n_loops})
+                bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 4 * 4, 'target': 34962})
 
                 _t = time.perf_counter()
 
@@ -315,20 +345,11 @@ def mini_export(output_file: str) -> None:
                 np.divide(_jwt64, np.where(_sums > 0, _sums, 1.0), out=_jwt64)
                 _jwt = _jwt64.astype(np.float32)
 
-                # Expand to per-loop
-                _jidx_loop = _jidx[_loop_vidx]
-                _jwt_loop = _jwt[_loop_vidx]
+                # Expand per-vertex arrays to per-loop straight into the GLB buffer
+                np.take(_jidx, _loop_vidx, axis=0, out=_jidx_loop)
+                np.take(_jwt, _loop_vidx, axis=0, out=_jwt_loop)
 
                 timings['joints_weights'] = timings.get('joints_weights', 0.0) + time.perf_counter() - _t
-
-                bchunk.write(_jidx_loop.data)
-
-                jsn.write(b',"WEIGHTS_0":')
-                jsn.write(str(len(accessors)).encode())
-                offset = bchunk.tell()
-                accessors.append({'type': '"VEC4"', 'componentType': 5126, 'count': n_loops})
-                bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 4 * 4, 'target': 34962})
-                bchunk.write(_jwt_loop.data)
 
             # Face indices
             jsn.write(b'},"indices":')
@@ -336,9 +357,8 @@ def mini_export(output_file: str) -> None:
             offset = bchunk.tell()
             _t = time.perf_counter()
 
-            _idx = np.empty(n_tris * 3, dtype=np.uint32)
+            _idx = bchunk.view(n_tris * 3, dtype=np.uint32)
             m.loop_triangles.foreach_get('loops', _idx)
-            bchunk.write(_idx.data)
 
             timings['indices'] = timings.get('indices', 0.0) + time.perf_counter() - _t
             accessors.append({'type': '"SCALAR"', 'componentType': 5125, 'count': n_tris * 3})
@@ -348,9 +368,8 @@ def mini_export(output_file: str) -> None:
             if m.shape_keys and len(m.shape_keys.key_blocks) > 1:
                 jsn.write(b',"targets":[')
                 _t = time.perf_counter()
-                # Pre-allocate once; reused across all shape keys to avoid 500MB of GC pressure
+                # Scratch buffers reused across keys to avoid allocation
                 _sk_buf = np.empty(n_verts * 3, dtype=np.float32)
-                _out_sk = np.empty((n_loops, 3), dtype=np.float32)
                 # Pre-compute base coords at each loop position (once, not per key)
                 _base_at_lx = _base_flat[_lx]
                 _base_at_ly = _base_flat[_ly]
@@ -361,7 +380,13 @@ def mini_export(output_file: str) -> None:
                 _sk_at_lz = np.empty(n_loops, dtype=np.float32)
                 for j in range(1, len(m.shape_keys.key_blocks)):
                     m.shape_keys.key_blocks[j].data.foreach_get('co', _sk_buf)
-                    # Gather per-loop x/y/z from flat buffer, subtract base, write directly
+
+                    jsn.write(b'{"POSITION":')
+                    jsn.write(str(len(accessors)).encode())
+                    offset = bchunk.tell()
+                    _out_sk = bchunk.view(n_loops * 3).reshape(n_loops, 3)
+
+                    # Gather per-loop x/y/z from flat buffer, subtract base, straight into buffer
                     np.take(_sk_buf, _lx, out=_sk_at_lx)
                     np.take(_sk_buf, _lz, out=_sk_at_lz)
                     np.take(_sk_buf, _ly, out=_sk_at_ly)
@@ -377,11 +402,6 @@ def mini_export(output_file: str) -> None:
                     _dk_z = _sk_buf[2::3] - _base_flat[2::3]
                     minv = mathutils.Vector([float(_dk_x.min()), float(_dk_z.min()), float(-_dk_y.max())])
                     maxv = mathutils.Vector([float(_dk_x.max()), float(_dk_z.max()), float(-_dk_y.min())])
-
-                    jsn.write(b'{"POSITION":')
-                    jsn.write(str(len(accessors)).encode())
-                    offset = bchunk.tell()
-                    bchunk.write(_out_sk.view(np.uint8).ravel())
 
                     accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': n_loops, 'min': minv, 'max': maxv})
                     bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 3 * 4, 'target': 34962})
@@ -508,7 +528,6 @@ def mini_export(output_file: str) -> None:
     if skins:
         jsn.write(b'"skins":[')
         for i in range(len(skins)):
-            inverse_bind_matrixes = []
             skin = skins[i]
 
             jsn.write(b'{"inverseBindMatrices":')
@@ -523,9 +542,8 @@ def mini_export(output_file: str) -> None:
                 jsn.write(str(objs.index(bone)).encode())
 
                 matrix = (axis_basis_change @ (skin.matrix_world @ bone.matrix_local)).inverted_safe()
-                for column in range(0, 4):
-                    for row in range(0, 4):
-                        bchunk.write(np.float32(matrix[row][column]))
+                # glTF stores MAT4 column-major; numpy sees the matrix row-major, so transpose.
+                bchunk.view(16).reshape(4, 4)[:] = np.array(matrix, dtype=np.float32).T
 
                 if b < len(skin.data.bones) - 1:
                     jsn.write(b',')
@@ -649,8 +667,7 @@ def mini_export(output_file: str) -> None:
                 accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': len(t_secs), 'min': min(t_secs), 'max': max(t_secs)})
                 bufferViews.append({'byteOffset': offset, 'byteLength': len(t_secs) * 4})
                 _tt = time.perf_counter()
-                for t in t_secs:
-                    bchunk.write(np.float32(t))
+                bchunk.write(np.asarray(t_secs, dtype=np.float32))
                 _t_anim_timestamps += time.perf_counter() - _tt
 
                 # Quaternion or Vector3
@@ -664,24 +681,19 @@ def mini_export(output_file: str) -> None:
                 bufferViews.append({'byteOffset': offset, 'byteLength': _n_kp * 4 * count})
 
                 _tt = time.perf_counter()
+                _vals = []
                 for t in range(_n_kp):
                     if count == 4:
                         q = mathutils.Quaternion((_fc_val(curveset[0], t), _fc_val(curveset[1], t), _fc_val(curveset[2], t), _fc_val(curveset[3], t)))
                         result = (correction @ q.to_matrix().to_4x4()).to_quaternion()
-                        bchunk.write(np.float32(result.x))
-                        bchunk.write(np.float32(result.y))
-                        bchunk.write(np.float32(result.z))
-                        bchunk.write(np.float32(result.w))
+                        _vals += (result.x, result.y, result.z, result.w)
                     elif count == 3 and channel == 'scale':
-                        bchunk.write(np.float32(_fc_val(curveset[0], t)))
-                        bchunk.write(np.float32(_fc_val(curveset[1], t)))
-                        bchunk.write(np.float32(_fc_val(curveset[2], t)))
+                        _vals += (_fc_val(curveset[0], t), _fc_val(curveset[1], t), _fc_val(curveset[2], t))
                     elif count == 3 and channel == 'location':
                         v = mathutils.Vector((_fc_val(curveset[0], t), _fc_val(curveset[1], t), _fc_val(curveset[2], t)))
                         location = (correction @ mathutils.Matrix.Translation(v).to_4x4()).to_translation()
-                        bchunk.write(np.float32(location.x))
-                        bchunk.write(np.float32(location.y))
-                        bchunk.write(np.float32(location.z))
+                        _vals += (location.x, location.y, location.z)
+                bchunk.write(np.asarray(_vals, dtype=np.float32))
                 if count == 4:
                     _t_anim_rotation += time.perf_counter() - _tt
                 else:
@@ -711,8 +723,7 @@ def mini_export(output_file: str) -> None:
                 accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': num_frames, 'min': min(t_secs), 'max': max(t_secs)})
                 bufferViews.append({'byteOffset': offset, 'byteLength': num_frames * 4})
                 _tt = time.perf_counter()
-                for t in t_secs:
-                    bchunk.write(np.float32(t))
+                bchunk.write(np.asarray(t_secs, dtype=np.float32))
                 _t_anim_timestamps += time.perf_counter() - _tt
 
                 jsn.write(b',"output":')
@@ -721,11 +732,12 @@ def mini_export(output_file: str) -> None:
                 accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': num_frames * num_morphs})
                 bufferViews.append({'byteOffset': offset, 'byteLength': num_frames * num_morphs * 4})
                 _tt = time.perf_counter()
+                _weights = []
                 for fi in range(num_frames):
                     for morph_name in morph_names:
                         fc = shape_key_curves.get(morph_name)
-                        w = fc.keyframe_points[fi].co.y if fc and fi < len(fc.keyframe_points) else 0.0
-                        bchunk.write(np.float32(w))
+                        _weights.append(fc.keyframe_points[fi].co.y if fc and fi < len(fc.keyframe_points) else 0.0)
+                bchunk.write(np.asarray(_weights, dtype=np.float32))
                 _t_anim_morph += time.perf_counter() - _tt
 
                 jsn.write(b',"interpolation":"LINEAR"}')
@@ -845,5 +857,5 @@ def mini_export(output_file: str) -> None:
         f.write(struct.pack('<II', len(_jsn_bytes), 0x4E4F534A))    # JSON chunk header
         f.write(_jsn_bytes)
         f.write(struct.pack('<II', _bchunk_len, 0x004E4942))        # BIN chunk header
-        f.write(bchunk.getbuffer()[:_bchunk_len])
+        f.write(bchunk.getbuffer())
     timings['file_io'] = time.perf_counter() - _t
