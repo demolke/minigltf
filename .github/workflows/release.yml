@@ -1,0 +1,34 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build addon zip
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/godot_minigltf_override
+          cp godot_minigltf_override/__init__.py           dist/godot_minigltf_override/
+          cp godot_minigltf_override/blender_manifest.toml dist/godot_minigltf_override/
+          cp minigltf.py                                   dist/godot_minigltf_override/
+          sed -i "s/^version = .*/version = \"$VERSION\"/" dist/godot_minigltf_override/blender_manifest.toml
+          cd dist && zip -r godot_minigltf_override.zip godot_minigltf_override/
+
+      - name: Create GitHub release
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/godot_minigltf_override.zip \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
