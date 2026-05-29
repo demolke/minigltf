@@ -831,29 +831,19 @@ def mini_export(output_file: str) -> None:
     jsn.write(b'}')
     timings['json_metadata'] = time.perf_counter() - _t
 
-    # json must be aligned to 4-byte
     _t = time.perf_counter()
-    while jsn.tell() % 4 != 0:
-        jsn.write(str(" ").encode())
-
-    totalLength = 28 + jsn.tell() + bchunk.tell()
-    output = BytesIO()
-    output.write(np.uint32(0x46546C67))   # magic == gLTF
-    output.write(np.uint32(2))            # version == 2
-    output.write(np.uint32(totalLength))  # total length of the file
-
-    jsn = jsn.getbuffer()
-    output.write(np.uint32(len(jsn)))
-    output.write(np.uint32(0x4E4F534A))
-    output.write(jsn)
+    _pad = (-jsn.tell()) % 4
+    if _pad:
+        jsn.write(b' ' * _pad)
 
     _bchunk_len = bchunk.tell()
-    output.write(np.uint32(_bchunk_len))
-    output.write(np.uint32(0x004E4942))
-    output.write(bchunk.getbuffer()[:_bchunk_len])
+    _jsn_bytes = jsn.getbuffer()
+    _total_length = 28 + len(_jsn_bytes) + _bchunk_len
 
-    f = open(output_file, 'wb')
-    f.write(output.getbuffer())
-    output.close()
-    f.close()
+    with open(output_file, 'wb') as f:
+        f.write(struct.pack('<III', 0x46546C67, 2, _total_length))  # GLB header
+        f.write(struct.pack('<II', len(_jsn_bytes), 0x4E4F534A))    # JSON chunk header
+        f.write(_jsn_bytes)
+        f.write(struct.pack('<II', _bchunk_len, 0x004E4942))        # BIN chunk header
+        f.write(bchunk.getbuffer()[:_bchunk_len])
     timings['file_io'] = time.perf_counter() - _t
