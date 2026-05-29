@@ -1,6 +1,6 @@
 # minigltf
 
-Minimal Blender to glTF 2.0 exporter, optimised for speed.
+Minimal Blender GLTF exporter for Godot optimized for speed
 
 ## Supported features
 
