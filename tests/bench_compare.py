@@ -80,14 +80,14 @@ def main():
     summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary_path:
         with open(summary_path, 'a') as f:
-            f.write('## Export benchmark\n\n')
+            f.write('\n\n\n## BENCHMARK RESULTS\n\n')
             f.write('| | median | min | max | output size |\n')
             f.write('|---|---|---|---|---|\n')
             f.write(f'| minigltf | {mini_med:.3f}s | {min(mini_times):.3f}s |'
                     f' {max(mini_times):.3f}s | {mini_size / 1e6:.1f} MB |\n')
             f.write(f'| built-in glTF | {builtin_med:.3f}s | {min(builtin_times):.3f}s |'
                     f' {max(builtin_times):.3f}s | {builtin_size / 1e6:.1f} MB |\n')
-            f.write(f'\n**Speedup: {speedup:.1f}x**\n')
+            f.write(f'\n**Speedup: {speedup:.1f}x**\n\n\n')
 
 
 
