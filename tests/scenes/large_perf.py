@@ -320,6 +320,17 @@ def add_animations(arm_obj):
             for fc in rot_fcs:
                 fc.update()
 
+    # Extra action with only a single location channel (X only on Root) to exercise
+    # the partial-channel export path.
+    partial_action = bpy.data.actions.new("Anim_PartialX")
+    assign_action(arm_obj.animation_data, partial_action)
+    fc_px = action_fcurves(partial_action).new(
+        data_path='pose.bones["Root"].location', index=0)
+    for frame in keyframes:
+        fc_px.keyframe_points.insert(frame=float(frame),
+                                     value=0.01 * math.sin(frame * 0.1))
+    fc_px.update()
+
     print(f"    done in {time.time() - t0:.2f}s", flush=True)
 
 

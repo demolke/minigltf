@@ -283,6 +283,30 @@ def validate_shape_key_anim(gltf, bin_data):
     assert names == ['Inflate', 'Squash'], f"unexpected targetNames: {names}"
 
 
+@test('partial_anim', 'partial_anim.py')
+def validate_partial_anim(gltf, bin_data):
+    assert 'animations' in gltf, "no animations"
+    assert len(gltf['animations']) == 1, f"expected 1 animation, got {len(gltf['animations'])}"
+    anim = gltf['animations'][0]
+    assert anim.get('name') == 'PartialLoc', f"expected 'PartialLoc', got '{anim.get('name')}'"
+    assert len(anim.get('channels', [])) >= 1, "animation has no channels"
+    samplers = anim.get('samplers', [])
+    assert len(samplers) >= 1, "animation has no samplers"
+    # The location sampler must produce VEC3 output even with only 1 of 3 channels present
+    s = samplers[0]
+    in_acc  = _acc(gltf, s['input'])
+    out_acc = _acc(gltf, s['output'])
+    assert in_acc['count'] == 2, f"expected 2 keyframes, got {in_acc['count']}"
+    assert out_acc['type'] == 'VEC3', f"location output must be VEC3, got {out_acc['type']}"
+    # Y and Z values should be zero (channels absent → default 0)
+    vals = read_accessor(gltf, bin_data, s['output'])
+    for fi in range(in_acc['count']):
+        y_val = vals[fi * 3 + 1]
+        z_val = vals[fi * 3 + 2]
+        assert abs(y_val) < 1e-5, f"frame {fi} Y should be 0, got {y_val}"
+        assert abs(z_val) < 1e-5, f"frame {fi} Z should be 0, got {z_val}"
+
+
 @test('multiple_meshes', 'multiple_meshes.py')
 def validate_multiple_meshes(gltf, bin_data):
     assert len(gltf.get('meshes', [])) == 3, f"expected 3 meshes, got {len(gltf.get('meshes', []))}"
@@ -328,7 +352,7 @@ def validate_large_perf(gltf, bin_data):
     assert len(skin.get('joints', [])) == 40, f"expected 40 joints, got {len(skin.get('joints', []))}"
     prim = gltf['meshes'][0]['primitives'][0]
     assert len(prim.get('targets', [])) == 50, f"expected 50 morph targets, got {len(prim.get('targets', []))}"
-    assert len(gltf.get('animations', [])) == 30, f"expected 30 animations, got {len(gltf.get('animations', []))}"
+    assert len(gltf.get('animations', [])) == 31, f"expected 31 animations, got {len(gltf.get('animations', []))}"
 
 
 # ---------------------------------------------------------------------------

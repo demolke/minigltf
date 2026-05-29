@@ -9,6 +9,14 @@ import time
 timings = {}
 
 
+def _fc_val(fc, t):
+    """Value of keyframe index t from fc; 0.0 when fc is absent or index out of range."""
+    if fc is None:
+        return 0.0
+    kps = fc.keyframe_points
+    return kps[t].co.y if t < len(kps) else 0.0
+
+
 def _action_fcurves(action):
     """Return all fcurves for an action, compatible with Blender 4.3 and 4.4+/5.x."""
     if hasattr(action, 'fcurves'):
@@ -627,12 +635,17 @@ def mini_export(output_file: str) -> None:
                 else:
                     correction = axis_basis_change @ bone.matrix_local
 
+                # Use the first present channel for timestamps; skip degenerate curves
+                _primary_fc = next((c for c in curveset if c is not None), None)
+                if _primary_fc is None:
+                    continue
+
                 # timestamps
                 jsn.write(b'{"input":')
                 jsn.write(str(len(accessors)).encode())
                 offset = bchunk.tell()
                 fps_val = bpy.context.scene.render.fps * bpy.context.scene.render.fps_base
-                t_secs = [k.co.x / fps_val for k in curveset[0].keyframe_points]
+                t_secs = [k.co.x / fps_val for k in _primary_fc.keyframe_points]
                 accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': len(t_secs), 'min': min(t_secs), 'max': max(t_secs)})
                 bufferViews.append({'byteOffset': offset, 'byteLength': len(t_secs) * 4})
                 _tt = time.perf_counter()
@@ -646,24 +659,25 @@ def mini_export(output_file: str) -> None:
                 jsn.write(b',"output":')
                 jsn.write(str(len(accessors)).encode())
                 offset = bchunk.tell()
-                accessors.append({'type': f'"VEC{count}"', 'componentType': 5126, 'count': len(curveset[0].keyframe_points)})
-                bufferViews.append({'byteOffset': offset, 'byteLength': len(curveset[0].keyframe_points) * 4 * count})
+                _n_kp = len(_primary_fc.keyframe_points)
+                accessors.append({'type': f'"VEC{count}"', 'componentType': 5126, 'count': _n_kp})
+                bufferViews.append({'byteOffset': offset, 'byteLength': _n_kp * 4 * count})
 
                 _tt = time.perf_counter()
-                for t in range(len(curveset[0].keyframe_points)):
+                for t in range(_n_kp):
                     if count == 4:
-                        q = mathutils.Quaternion((curveset[0].keyframe_points[t].co.y, curveset[1].keyframe_points[t].co.y, curveset[2].keyframe_points[t].co.y, curveset[3].keyframe_points[t].co.y))
+                        q = mathutils.Quaternion((_fc_val(curveset[0], t), _fc_val(curveset[1], t), _fc_val(curveset[2], t), _fc_val(curveset[3], t)))
                         result = (correction @ q.to_matrix().to_4x4()).to_quaternion()
                         bchunk.write(np.float32(result.x))
                         bchunk.write(np.float32(result.y))
                         bchunk.write(np.float32(result.z))
                         bchunk.write(np.float32(result.w))
                     elif count == 3 and channel == 'scale':
-                        bchunk.write(np.float32(curveset[0].keyframe_points[t].co.y))
-                        bchunk.write(np.float32(curveset[1].keyframe_points[t].co.y))
-                        bchunk.write(np.float32(curveset[2].keyframe_points[t].co.y))
+                        bchunk.write(np.float32(_fc_val(curveset[0], t)))
+                        bchunk.write(np.float32(_fc_val(curveset[1], t)))
+                        bchunk.write(np.float32(_fc_val(curveset[2], t)))
                     elif count == 3 and channel == 'location':
-                        v = mathutils.Vector((curveset[0].keyframe_points[t].co.y, curveset[1].keyframe_points[t].co.y, curveset[2].keyframe_points[t].co.y))
+                        v = mathutils.Vector((_fc_val(curveset[0], t), _fc_val(curveset[1], t), _fc_val(curveset[2], t)))
                         location = (correction @ mathutils.Matrix.Translation(v).to_4x4()).to_translation()
                         bchunk.write(np.float32(location.x))
                         bchunk.write(np.float32(location.y))
