@@ -258,6 +258,7 @@ def add_animations(arm_obj):
 
     for ai in range(n_anims):
         action = bpy.data.actions.new(f"Anim_{ai:02d}")
+        action.use_fake_user = True
         assign_action(arm_obj.animation_data, action)
 
         phase_a = ai * (2.0 * math.pi / n_anims)
@@ -323,6 +324,7 @@ def add_animations(arm_obj):
     # Extra action with only a single location channel (X only on Root) to exercise
     # the partial-channel export path.
     partial_action = bpy.data.actions.new("Anim_PartialX")
+    partial_action.use_fake_user = True
     assign_action(arm_obj.animation_data, partial_action)
     fc_px = action_fcurves(partial_action).new(
         data_path='pose.bones["Root"].location', index=0)
