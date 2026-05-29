@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 test_runs/
 bench_runs/
+dist/
