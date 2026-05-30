@@ -114,6 +114,9 @@ def _t15(out_dir, stdout, stderr): pass
 @test('rewire_links', 'test_rewire_links.py')
 def _t16(out_dir, stdout, stderr): pass
 
+@test('packed_texture', 'test_packed_texture.py')
+def _t17(out_dir, stdout, stderr): pass
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,

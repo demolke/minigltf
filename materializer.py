@@ -128,7 +128,7 @@ def _follow(
 
     if src_node.type == 'TEX_IMAGE':
         img = src_node.image
-        if img:
+        if img and img.packed_file is None and img.filepath:
             path = bpy.path.native_pathsep(bpy.path.abspath(img.filepath))
             if os.path.isabs(path) and not os.path.exists(path):
                 return None, f"image file not found: {path}"
@@ -357,18 +357,23 @@ def analyse(mat: bpy.types.Material, model: str) -> PBRMat | None:
 
 
 def _pixels(node: bpy.types.ShaderNodeTexImage) -> ndarray:
-    """Load node's image pixels as float32 (H, W, 4) RGBA. Always raw bytes/255."""
+    """Load node's image pixels as float32 (H, W, 4) RGBA."""
     img = node.image
     if not img:
         raise ValueError(f"node '{node.name}' has no image assigned")
-    path = os.path.abspath(img.filepath)
-    if not os.path.exists(path):
-        raise ValueError(f"node '{node.name}' image file not found: {path}")
-    img.reload()
+    if img.packed_file is not None:
+        # Packed image: pixels already in memory, no file reload needed
+        pass
+    else:
+        path = bpy.path.native_pathsep(bpy.path.abspath(img.filepath))
+        if os.path.isabs(path) and not os.path.exists(path):
+            raise ValueError(f"node '{node.name}' image file not found: {path}")
+        img.reload()
     w, h = img.size
-    print(f'\nloading {img.filepath}  ({w}×{h})')
+    label = img.name if img.packed_file is not None else (img.filepath or img.name)
+    print(f'\nloading {label}  ({w}×{h})')
     if w == 0 or h == 0:
-        raise ValueError(f"node '{node.name}' image '{img.filepath}' has zero size after reload - file missing or unreadable")
+        raise ValueError(f"node '{node.name}' image '{img.name}' has zero size")
     arr = np.empty(h * w * 4, dtype=np.float32)
     img.pixels.foreach_get(arr)
     return arr.reshape(h, w, 4)
@@ -396,7 +401,8 @@ def _max_size(*nodes: bpy.types.ShaderNodeTexImage | None) -> tuple[int, int]:
     sizes: list[tuple[int, int]] = []
     for n in nodes:
         if n and n.image:
-            n.image.reload()
+            if n.image.packed_file is None:
+                n.image.reload()
             w, h = n.image.size
             if w > 0 and h > 0:
                 sizes.append((h, w))
@@ -481,7 +487,6 @@ def composite(
         except OSError:
             d = tex_fallback
             os.makedirs(d, exist_ok=True)
-        os.makedirs(d, exist_ok=True)
         return d
 
     def skip(path: str) -> bool:
@@ -631,7 +636,7 @@ def rewire(pbr: PBRMat, paths: dict[str, str], dry_run: bool) -> None:
         img.colorspace_settings.name = 'sRGB'
         tn = _tex_node(tree, img, 'Base Color', x, y + 300)
         tree.links.new(tn.outputs['Color'], bsdf.inputs['Base Color'])
-        if pbr.alpha_mode in ('BLEND', 'MASK'):
+        if pbr.alpha_mode in ('BLEND', 'MASK') or pbr.needs_composite_alpha:
             tree.links.new(tn.outputs['Alpha'], bsdf.inputs['Alpha'])
 
     if 'orm' in paths:
