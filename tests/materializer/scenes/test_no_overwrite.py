@@ -26,12 +26,12 @@ def main():
     bpy.ops.wm.save_mainfile(filepath=blend_path)
 
     # First run
-    ok, _, _ = run_materializer(blend_path, out, repo)
+    ok, _, _ = run_materializer(blend_path, repo)
     if not ok:
         print('FAIL: first run failed')
         sys.exit(1)
 
-    bc_webp = os.path.join(out, 'NoOverwriteMat_albedo.webp')
+    bc_webp = os.path.join(texdir, 'NoOverwriteMat_albedo.webp')
     if not os.path.exists(bc_webp):
         print('FAIL: first run did not produce albedo.webp')
         sys.exit(1)
@@ -40,7 +40,7 @@ def main():
     time.sleep(1.1)
 
     # Second run without --force
-    ok, _, _ = run_materializer(blend_path, out, repo)
+    ok, _, _ = run_materializer(blend_path, repo)
     if not ok:
         print('FAIL: second run failed')
         sys.exit(1)

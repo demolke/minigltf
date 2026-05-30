@@ -31,7 +31,7 @@ def main():
     blend_path = os.path.join(out, 'scene.blend')
     bpy.ops.wm.save_mainfile(filepath=blend_path)
 
-    ok, _, _ = run_materializer(blend_path, out, repo)
+    ok, _, _ = run_materializer(blend_path, repo)
     if not ok:
         print('FAIL: materializer exited non-zero')
         sys.exit(1)

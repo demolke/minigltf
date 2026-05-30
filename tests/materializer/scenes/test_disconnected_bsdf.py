@@ -42,12 +42,12 @@ def main():
     blend_path = os.path.join(out, 'scene.blend')
     bpy.ops.wm.save_mainfile(filepath=blend_path)
 
-    ok, stdout, stderr = run_materializer(blend_path, out, repo)
+    ok, stdout, stderr = run_materializer(blend_path, repo)
     if not ok:
         print('FAIL: materializer exited non-zero')
         sys.exit(1)
 
-    bc_webp = os.path.join(out, 'DisconnectedMat_albedo.webp')
+    bc_webp = os.path.join(texdir, 'DisconnectedMat_albedo.webp')
     if os.path.exists(bc_webp):
         print('FAIL: disconnected BSDF should not produce output')
         sys.exit(1)

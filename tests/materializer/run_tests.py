@@ -111,6 +111,9 @@ def _t14(out_dir, stdout, stderr): pass
 @test('pixel_accuracy_orm', 'test_pixel_accuracy_orm.py')
 def _t15(out_dir, stdout, stderr): pass
 
+@test('rewire_links', 'test_rewire_links.py')
+def _t16(out_dir, stdout, stderr): pass
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,

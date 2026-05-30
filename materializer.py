@@ -12,7 +12,7 @@ Run from inside Blender:
 Options:
     --lossless        Lossless WebP for all outputs
     --quality N       Lossy quality 1-100 (default: 90)
-    --output-dir DIR  Where to write WebP files (default: alongside .blend)
+    --output-dir DIR  Where to write WebP files (default: alongside source textures)
     --force           Overwrite existing WebP files (default: skip)
     --dry-run         Report actions without writing or saving the .blend
     --yes             Skip confirmation prompt
@@ -24,6 +24,7 @@ import sys
 import os
 import argparse
 from argparse import Namespace
+from typing import Callable
 
 import numpy as np
 from numpy import ndarray
@@ -44,10 +45,7 @@ def _parse_args() -> Namespace:
     return p.parse_args(argv)
 
 
-# ---------------------------------------------------------------------------
 # Analysis
-# ---------------------------------------------------------------------------
-
 class TexSrc:
     def __init__(self, node: bpy.types.ShaderNodeTexImage, channel: str) -> None:
         self.node    = node
@@ -59,8 +57,9 @@ class TexSrc:
 
 
 class PBRMat:
-    def __init__(self, mat: bpy.types.Material) -> None:
+    def __init__(self, mat: bpy.types.Material, model: str) -> None:
         self.mat: bpy.types.Material = mat
+        self.model: str = model
 
         self.base_color: TexSrc | None = None
         self.alpha:      TexSrc | None = None
@@ -82,9 +81,25 @@ class PBRMat:
         self._old_nodes: list[bpy.types.ShaderNode] = []
         self.warnings:   list[str] = []
 
-    def warn(self, msg: str) -> None:
-        self.warnings.append(msg)
-        print(f'    [warn] {msg}')
+        # Current context
+        self._ctx_node: str = ''
+        self._ctx_path: str = ''
+
+    def _prefix(self, node: str = '', path: str = '') -> str:
+        parts: list[str] = [self.model or '?', self.mat.name]
+        n = node or self._ctx_node
+        p = path or self._ctx_path
+        if n: parts.append(n)
+        if p: parts.append(p)
+        return ' > '.join(parts)
+
+    def warn(self, msg: str, node: str = '', path: str = '') -> None:
+        line = f'[warn] {self._prefix(node, path)}: {msg}'
+        self.warnings.append(line)
+        print(f'{line}')
+
+    def error(self, msg: str, node: str = '', path: str = '') -> None:
+        print(f'[error] {self._prefix(node, path)}: {msg}')
 
     @property
     def needs_composite_alpha(self) -> bool:
@@ -112,6 +127,11 @@ def _follow(
     src_sock = link.from_socket.name
 
     if src_node.type == 'TEX_IMAGE':
+        img = src_node.image
+        if img:
+            path = bpy.path.native_pathsep(bpy.path.abspath(img.filepath))
+            if os.path.isabs(path) and not os.path.exists(path):
+                return None, f"image file not found: {path}"
         if src_node not in old_nodes:
             old_nodes.append(src_node)
         return TexSrc(src_node, src_sock), None
@@ -125,7 +145,7 @@ def _follow(
                     if n not in old_nodes:
                         old_nodes.append(n)
                 return TexSrc(up, src_sock), None
-        return None, f"SEPARATE_COLOR on '{socket.name}' has no TEX_IMAGE source"
+        return None, f"SEPARATE_COLOR node '{src_node.name}' on '{socket.name}' has no TEX_IMAGE source"
 
     if src_node.type == 'NORMAL_MAP':
         color_in = src_node.inputs.get('Color')
@@ -136,12 +156,15 @@ def _follow(
                     if n not in old_nodes:
                         old_nodes.append(n)
                 return TexSrc(up, 'Color'), None
-        return None, "NORMAL_MAP has no TEX_IMAGE source"
+        return None, f"NORMAL_MAP node '{src_node.name}' on '{socket.name}' has no TEX_IMAGE source"
 
-    return None, f"unsupported node '{src_node.type}' on slot '{socket.name}'"
+    return None, f"unsupported node '{src_node.name}' ({src_node.type}) on slot '{socket.name}'"
 
 
-def find_principled_bsdf(mat: bpy.types.Material) -> bpy.types.ShaderNode | None:
+def find_principled_bsdf(
+    mat: bpy.types.Material,
+    warn_fn: Callable[[str], None] | None = None,
+) -> bpy.types.ShaderNode | None:
     """Walk upstream from Material Output to find the connected Principled BSDF."""
     if not mat.use_nodes:
         return None
@@ -165,34 +188,46 @@ def find_principled_bsdf(mat: bpy.types.Material) -> bpy.types.ShaderNode | None
     if not principled:
         return None
     if len(principled) > 1:
-        print('    [warn] multiple Principled BSDF nodes; using first found')
+        msg = f"multiple Principled BSDF nodes connected to Material Output; using '{principled[0].name}'"
+        if warn_fn:
+            warn_fn(msg)
+        else:
+            print(f'    [warn] {msg}')
     return principled[0]
 
 
-def collect_used_materials() -> set[bpy.types.Material]:
-    """Return materials assigned to at least one mesh object's slot."""
-    used: set[bpy.types.Material] = set()
+def collect_used_materials() -> tuple[set[bpy.types.Material], dict[bpy.types.Material, str]]:
+    """Return (used_set, mat_to_first_model).
+
+    mat_to_first_model maps each material to the alphabetically first mesh
+    object name that references it.
+    """
+    mat_to_objs: dict[bpy.types.Material, list[str]] = {}
     for obj in bpy.data.objects:
         if obj.type == 'MESH':
             for slot in obj.material_slots:
                 if slot.material is not None:
-                    used.add(slot.material)
-    return used
+                    mat_to_objs.setdefault(slot.material, []).append(obj.name)
+    used = set(mat_to_objs.keys())
+    mat_to_model = {mat: sorted(names)[0] for mat, names in mat_to_objs.items()}
+    return used, mat_to_model
 
 
-def analyse(mat: bpy.types.Material) -> PBRMat | None:
+def analyse(mat: bpy.types.Material, model: str) -> PBRMat | None:
     """Return a PBRMat for mat, or None if no Principled BSDF found."""
     if not mat.use_nodes:
         return None
-    bsdf = find_principled_bsdf(mat)
+
+    pbr = PBRMat(mat, model)
+    bsdf = find_principled_bsdf(mat, warn_fn=pbr.warn)
     if bsdf is None:
         return None
 
-    pbr = PBRMat(mat)
     old = pbr._old_nodes
 
-    def get(name: str) -> tuple[TexSrc | None, str | None]:
-        s = bsdf.inputs.get(name)
+    def get(slot_name: str) -> tuple[TexSrc | None, str | None]:
+        pbr._ctx_node = slot_name
+        s = bsdf.inputs.get(slot_name)
         return _follow(s, old) if s else (None, None)
 
     # Base color
@@ -202,8 +237,12 @@ def analyse(mat: bpy.types.Material) -> PBRMat | None:
     if bc is None:
         c = bsdf.inputs['Base Color'].default_value
         pbr.base_color_factor = tuple(round(float(c[i]), 4) for i in range(4))
+    else:
+        pbr._ctx_path = bc.path
 
     # Separate alpha
+    pbr._ctx_node = 'Alpha'
+    pbr._ctx_path = ''
     alpha_sock = bsdf.inputs.get('Alpha')
     if alpha_sock and alpha_sock.is_linked:
         src = alpha_sock.links[0].from_node
@@ -212,24 +251,33 @@ def analyse(mat: bpy.types.Material) -> PBRMat | None:
                 if src not in old:
                     old.append(src)
                 pbr.alpha = TexSrc(src, alpha_sock.links[0].from_socket.name)
+                pbr._ctx_path = pbr.alpha.path
         else:
-            pbr.warn(f"unsupported node '{src.type}' on slot 'Alpha'")
+            pbr.warn(f"unsupported node '{src.name}' ({src.type})")
 
     # Metallic
+    pbr._ctx_path = ''
     metallic, w = get('Metallic')
     if w: pbr.warn(w)
     pbr.metallic = metallic
     if metallic is None:
         pbr.metallic_factor = round(float(bsdf.inputs['Metallic'].default_value), 4)
+    else:
+        pbr._ctx_path = metallic.path
 
     # Roughness
+    pbr._ctx_path = ''
     roughness, w = get('Roughness')
     if w: pbr.warn(w)
     pbr.roughness = roughness
     if roughness is None:
         pbr.roughness_factor = round(float(bsdf.inputs['Roughness'].default_value), 4)
+    else:
+        pbr._ctx_path = roughness.path
 
     # AO: look for a TEX_IMAGE feeding a Multiply MixRGB into Base Color
+    pbr._ctx_node = 'Base Color (AO multiply)'
+    pbr._ctx_path = ''
     bc_sock = bsdf.inputs.get('Base Color')
     if bc_sock and bc_sock.is_linked:
         mix = bc_sock.links[0].from_node
@@ -244,9 +292,12 @@ def analyse(mat: bpy.types.Material) -> PBRMat | None:
                             if n not in old:
                                 old.append(n)
                         pbr.ao = TexSrc(cand, 'Color')
+                        pbr._ctx_path = pbr.ao.path
                         break
 
     # Normal
+    pbr._ctx_node = 'Normal'
+    pbr._ctx_path = ''
     normal_sock = bsdf.inputs.get('Normal')
     if normal_sock and normal_sock.is_linked:
         nm = normal_sock.links[0].from_node
@@ -259,22 +310,27 @@ def analyse(mat: bpy.types.Material) -> PBRMat | None:
                         if n not in old:
                             old.append(n)
                     pbr.normal = TexSrc(img_node, 'Color')
+                    pbr._ctx_path = pbr.normal.path
                     pbr.normal_strength = round(float(nm.inputs['Strength'].default_value), 4)
                 else:
-                    pbr.warn(f"NORMAL_MAP Color fed by '{img_node.type}', expected TEX_IMAGE")
+                    pbr.warn(f"NORMAL_MAP node '{nm.name}' Color fed by '{img_node.name}' ({img_node.type}), expected TEX_IMAGE")
             else:
-                pbr.warn("NORMAL_MAP Color socket not connected")
+                pbr.warn(f"NORMAL_MAP node '{nm.name}' Color socket not connected")
         else:
-            pbr.warn(f"Normal slot fed by '{nm.type}', expected NORMAL_MAP")
+            pbr.warn(f"Normal slot fed by '{nm.name}' ({nm.type}), expected NORMAL_MAP node")
 
     # Emission
+    pbr._ctx_node = 'Emission'
+    pbr._ctx_path = ''
     for slot in ('Emission Color', 'Emission'):
         s = bsdf.inputs.get(slot)
         if s:
             src, w = _follow(s, old)
             if w: pbr.warn(w)
             pbr.emission = src
-            if src is None and not s.is_linked:
+            if src is not None:
+                pbr._ctx_path = src.path
+            elif not s.is_linked:
                 strength_s = bsdf.inputs.get('Emission Strength')
                 ev = s.default_value
                 strength = float(strength_s.default_value) if strength_s else 1.0
@@ -284,6 +340,9 @@ def analyse(mat: bpy.types.Material) -> PBRMat | None:
                 if r or g or b:
                     pbr.emission_factor = (r, g, b)
             break
+
+    pbr._ctx_node = ''
+    pbr._ctx_path = ''
 
     # Alpha mode
     srm   = getattr(mat, 'surface_render_method', None)
@@ -301,11 +360,15 @@ def _pixels(node: bpy.types.ShaderNodeTexImage) -> ndarray:
     """Load node's image pixels as float32 (H, W, 4) RGBA. Always raw bytes/255."""
     img = node.image
     if not img:
-        raise ValueError(f"TEX_IMAGE node '{node.name}' has no image")
+        raise ValueError(f"node '{node.name}' has no image assigned")
+    path = os.path.abspath(img.filepath)
+    if not os.path.exists(path):
+        raise ValueError(f"node '{node.name}' image file not found: {path}")
     img.reload()
     w, h = img.size
+    print(f'\nloading {img.filepath}  ({w}×{h})')
     if w == 0 or h == 0:
-        raise ValueError(f"image '{img.filepath}' has zero size after reload - file missing or unreadable")
+        raise ValueError(f"node '{node.name}' image '{img.filepath}' has zero size after reload - file missing or unreadable")
     arr = np.empty(h * w * 4, dtype=np.float32)
     img.pixels.foreach_get(arr)
     return arr.reshape(h, w, 4)
@@ -344,31 +407,51 @@ def _bpy_image(name: str, arr: ndarray, alpha: bool, colorspace: str) -> bpy.typ
     """Create a bpy Image from float32 (H, W, 3 or 4)."""
     h, w = arr.shape[:2]
     img = bpy.data.images.new(name, width=w, height=h, alpha=alpha, float_buffer=False)
+    img.colorspace_settings.name = colorspace
     if arr.shape[2] == 3:
         rgba = np.ones((h, w, 4), dtype=np.float32)
         rgba[:, :, :3] = arr
     else:
         rgba = arr.astype(np.float32)
     img.pixels.foreach_set(rgba.ravel())
-    img.colorspace_settings.name = colorspace
+    img.update()
     return img
 
 
 def _save(bpy_img: bpy.types.Image, path: str, lossless: bool, quality: int, dry_run: bool) -> None:
-    print(f'    -> {path}' + (' [dry-run]' if dry_run else ''))
+    print(f'saving {path}' + (' [dry-run]' if dry_run else ''))
     if dry_run:
         return
-    scene = bpy.context.scene
-    old_fmt = scene.render.image_settings.file_format
-    old_q   = scene.render.image_settings.quality
-    old_vt  = scene.view_settings.view_transform
-    scene.render.image_settings.file_format = 'WEBP'
-    scene.render.image_settings.quality     = 100 if lossless else quality
-    scene.view_settings.view_transform      = 'Standard'
-    bpy_img.save_render(path, scene=scene)
-    scene.render.image_settings.file_format = old_fmt
-    scene.render.image_settings.quality     = old_q
-    scene.view_settings.view_transform      = old_vt
+    bpy_img.pack()
+    bpy_img.filepath_raw = path
+    bpy_img.file_format = 'WEBP'
+    bpy_img.save(filepath=path, quality = 100 if lossless else quality)
+
+
+def _load_slot(tex: TexSrc, h: int, w: int, pbr: PBRMat, slot_name: str) -> ndarray | None:
+    """Load and resize a texture slot, reporting errors with full context."""
+    try:
+        arr = _pixels(tex.node)
+        if h > 0 and w > 0:
+            arr = _resize(arr, h, w)
+        return arr
+    except ValueError as e:
+        pbr.error(str(e), node=tex.node.name, path=tex.path)
+        return None
+
+
+def _tex_dir(*sources: TexSrc | None, fallback: str) -> str:
+    """Return the directory of the first source texture with a real filepath.
+
+    Falls back to *fallback* (typically the .blend directory or the explicit
+    --output-dir) when none of the sources have a usable path.
+    """
+    for src in sources:
+        if src and src.path:
+            d = os.path.dirname(bpy.path.abspath(src.path))
+            if d:
+                return d
+    return fallback
 
 
 def composite(
@@ -379,9 +462,27 @@ def composite(
     force: bool,
     dry_run: bool,
 ) -> dict[str, str]:
-    """Composite and save WebP textures. Returns dict of slot to path."""
+    """Composite and save WebP textures. Returns dict of slot to path.
+
+    When *output_dir* is non-empty it is used for every slot.  When it is
+    empty each slot's WebP is saved next to the source texture(s) for that
+    slot, falling back to the .blend directory when no source has a usable
+    filepath.
+    """
     name = pbr.mat.name.replace(' ', '_')
+    blend_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ''
+    tex_fallback = os.path.join(blend_dir, 'textures')
     out: dict[str, str] = {}
+
+    def slot_dir(*sources: TexSrc | None) -> str:
+        d = output_dir or _tex_dir(*sources, fallback=tex_fallback)
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            d = tex_fallback
+            os.makedirs(d, exist_ok=True)
+        os.makedirs(d, exist_ok=True)
+        return d
 
     def skip(path: str) -> bool:
         if not force and os.path.exists(path):
@@ -391,7 +492,7 @@ def composite(
 
     # Base color
     if pbr.base_color or pbr.needs_composite_alpha:
-        path = os.path.join(output_dir, f'{name}_albedo.webp')
+        path = os.path.join(slot_dir(pbr.base_color, pbr.alpha), f'{name}_albedo.webp')
         if not skip(path):
             nodes = [n for n in (
                 pbr.base_color.node if pbr.base_color else None,
@@ -400,30 +501,33 @@ def composite(
             h, w = _max_size(*nodes)
 
             if pbr.base_color:
-                arr = _resize(_pixels(pbr.base_color.node), h, w)
+                arr = _load_slot(pbr.base_color, h, w, pbr, 'Base Color')
+                if arr is None:
+                    arr = np.ones((h, w, 4), dtype=np.float32)
             else:
                 arr = np.ones((h, w, 4), dtype=np.float32)
                 for i, v in enumerate(pbr.base_color_factor):
                     arr[:, :, i] = v
 
             if pbr.needs_composite_alpha:
-                alpha_arr = _resize(_pixels(pbr.alpha.node), h, w)
-                ch = _channel(alpha_arr, pbr.alpha.channel)
-                if ch.ndim == 3 and ch.shape[2] > 1:
-                    ch = ch[:, :, 0:1]
-                arr = arr.copy()
-                arr[:, :, 3:4] = ch
-                print('    composited separate alpha into base color A channel')
+                alpha_arr = _load_slot(pbr.alpha, h, w, pbr, 'Alpha')
+                if alpha_arr is not None:
+                    ch = _channel(alpha_arr, pbr.alpha.channel)
+                    if ch.ndim == 3 and ch.shape[2] > 1:
+                        ch = ch[:, :, 0:1]
+                    arr = arr.copy()
+                    arr[:, :, 3:4] = ch
+                    print('composited separate alpha into base color A channel')
 
             img = _bpy_image(f'{name}_albedo', arr, alpha=True, colorspace='sRGB')
             _save(img, path, lossless, quality, dry_run)
             if not dry_run:
-                img.filepath_raw = path
+                img.source = 'FILE'
             out['base_color'] = path
 
     # ORM
     if pbr.needs_orm:
-        path = os.path.join(output_dir, f'{name}_orm.webp')
+        path = os.path.join(slot_dir(pbr.ao, pbr.roughness, pbr.metallic), f'{name}_orm.webp')
         if not skip(path):
             nodes = [n for n in (
                 pbr.ao.node        if pbr.ao        else None,
@@ -437,51 +541,56 @@ def composite(
             orm[:, :, 2] = pbr.metallic_factor
 
             if pbr.ao:
-                a = _resize(_pixels(pbr.ao.node), h, w)
-                ch = _channel(a, pbr.ao.channel)
-                orm[:, :, 0:1] = ch[:, :, 0:1]
+                a = _load_slot(pbr.ao, h, w, pbr, 'AO')
+                if a is not None:
+                    ch = _channel(a, pbr.ao.channel)
+                    orm[:, :, 0:1] = ch[:, :, 0:1]
 
             if pbr.roughness:
-                a = _resize(_pixels(pbr.roughness.node), h, w)
-                ch = _channel(a, pbr.roughness.channel)
-                if ch.shape[2] > 1:
-                    ch = ch[:, :, 0:1]
-                orm[:, :, 1:2] = ch
+                a = _load_slot(pbr.roughness, h, w, pbr, 'Roughness')
+                if a is not None:
+                    ch = _channel(a, pbr.roughness.channel)
+                    if ch.shape[2] > 1:
+                        ch = ch[:, :, 0:1]
+                    orm[:, :, 1:2] = ch
 
             if pbr.metallic:
-                a = _resize(_pixels(pbr.metallic.node), h, w)
-                ch = _channel(a, pbr.metallic.channel)
-                if ch.shape[2] > 1:
-                    ch = ch[:, :, 0:1]
-                orm[:, :, 2:3] = ch
+                a = _load_slot(pbr.metallic, h, w, pbr, 'Metallic')
+                if a is not None:
+                    ch = _channel(a, pbr.metallic.channel)
+                    if ch.shape[2] > 1:
+                        ch = ch[:, :, 0:1]
+                    orm[:, :, 2:3] = ch
 
             img = _bpy_image(f'{name}_orm', orm, alpha=False, colorspace='Non-Color')
             _save(img, path, lossless, quality, dry_run)
             if not dry_run:
-                img.filepath_raw = path
+                img.source = 'FILE'
             out['orm'] = path
 
     # Normal
     if pbr.normal:
-        path = os.path.join(output_dir, f'{name}_normal.webp')
+        path = os.path.join(slot_dir(pbr.normal), f'{name}_normal.webp')
         if not skip(path):
-            arr = _pixels(pbr.normal.node)
-            img = _bpy_image(f'{name}_normal', arr[:, :, :3], alpha=False, colorspace='Non-Color')
-            _save(img, path, lossless, quality, dry_run)
-            if not dry_run:
-                img.filepath_raw = path
-            out['normal'] = path
+            arr = _load_slot(pbr.normal, 0, 0, pbr, 'Normal')
+            if arr is not None:
+                img = _bpy_image(f'{name}_normal', arr[:, :, :3], alpha=False, colorspace='Non-Color')
+                _save(img, path, lossless, quality, dry_run)
+                if not dry_run:
+                    img.source = 'FILE'
+                out['normal'] = path
 
     # Emission
     if pbr.emission:
-        path = os.path.join(output_dir, f'{name}_emission.webp')
+        path = os.path.join(slot_dir(pbr.emission), f'{name}_emission.webp')
         if not skip(path):
-            arr = _pixels(pbr.emission.node)
-            img = _bpy_image(f'{name}_emission', arr[:, :, :3], alpha=False, colorspace='sRGB')
-            _save(img, path, lossless, quality, dry_run)
-            if not dry_run:
-                img.filepath_raw = path
-            out['emission'] = path
+            arr = _load_slot(pbr.emission, 0, 0, pbr, 'Emission')
+            if arr is not None:
+                img = _bpy_image(f'{name}_emission', arr[:, :, :3], alpha=False, colorspace='sRGB')
+                _save(img, path, lossless, quality, dry_run)
+                if not dry_run:
+                    img.source = 'FILE'
+                out['emission'] = path
 
     return out
 
@@ -563,15 +672,17 @@ def main() -> None:
         print('ERROR: no .blend file loaded')
         sys.exit(1)
 
-    output_dir = os.path.abspath(args.output_dir) if args.output_dir else os.path.dirname(blend_path)
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir = os.path.abspath(args.output_dir) if args.output_dir else ''
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
-    mode = 'lossless' if args.lossless else f'lossy q={args.quality}'
-    print(f'\nmaterializer  blend={blend_path}  out={output_dir}  {mode}'
+    mode   = 'lossless' if args.lossless else f'lossy q={args.quality}'
+    outstr = output_dir if output_dir else '(alongside source textures)'
+    print(f'\nmaterializer  blend={blend_path}  out={outstr}  {mode}'
           + ('  [dry-run]' if args.dry_run else '') + '\n')
 
     # Sweep phase
-    used = collect_used_materials()
+    used, mat_to_model = collect_used_materials()
     all_mats = [m for m in bpy.data.materials if m.use_nodes]
     orphaned = [m for m in all_mats if m not in used]
     process_mats = [m for m in all_mats if m in used]
@@ -584,10 +695,11 @@ def main() -> None:
     total_textures = 0
     total_warnings = 0
     for mat in process_mats:
+        model = mat_to_model.get(mat, '?')
         print(f'  {mat.name}')
-        pbr = analyse(mat)
+        pbr = analyse(mat, model)
         if pbr is None:
-            print('    no Principled BSDF — skipped')
+            print(f'[skip] {model} > {mat.name}: no Principled BSDF connected to Material Output')
             pairs.append((mat, None))
             continue
         pairs.append((mat, pbr))
@@ -602,7 +714,7 @@ def main() -> None:
         if pbr.emission:
             total_textures += 1
         if not (pbr.base_color or pbr.needs_composite_alpha or pbr.needs_orm or pbr.normal or pbr.emission):
-            print('    no textures to process')
+            print('no textures to process')
         print()
 
     print(f'{total_textures} output texture(s), {total_warnings} warning(s)\n')

@@ -76,8 +76,8 @@ def circle(w, h, fg=(1.0, 1.0, 1.0, 1.0), bg=(0.0, 0.0, 0.0, 1.0)):
 def save_image(name, w, h, pixels_flat_rgba, filepath, colorspace='sRGB'):
     """Create a bpy image from flat RGBA float array and save as PNG."""
     img = bpy.data.images.new(name, width=w, height=h, alpha=True, float_buffer=False)
-    img.pixels.foreach_set(pixels_flat_rgba)
     img.colorspace_settings.name = colorspace
+    img.pixels.foreach_set(pixels_flat_rgba)
     img.filepath_raw = filepath
     img.file_format = 'PNG'
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -110,14 +110,14 @@ def assert_near(a, b, tol=0.05, msg=''):
         raise AssertionError(f'{msg}: expected ~{b:.3f}, got {a:.3f} (tol={tol})')
 
 
-def run_materializer(blend_path, output_dir, repo_dir, extra_args=None):
+def run_materializer(blend_path, repo_dir, extra_args=None):
     """Run materializer on a .blend file using subprocess (within Blender scene)."""
     import subprocess
     import shutil
     blender = shutil.which('blender') or os.environ.get('BLENDER', 'blender')
-    mat_script = os.path.join(repo_dir, 'tools', 'materializer.py')
+    mat_script = os.path.join(repo_dir, 'materializer.py')
     cmd = [blender, '--background', blend_path, '--python', mat_script,
-           '--', '--output-dir', output_dir, '--yes']
+           '--', '--yes']
     if extra_args:
         cmd.extend(extra_args)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)

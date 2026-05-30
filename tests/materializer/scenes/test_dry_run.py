@@ -26,12 +26,12 @@ def main():
     bpy.ops.wm.save_mainfile(filepath=blend_path)
     blend_mtime = os.path.getmtime(blend_path)
 
-    ok, stdout, stderr = run_materializer(blend_path, out, repo, extra_args=['--dry-run'])
+    ok, stdout, stderr = run_materializer(blend_path, repo, extra_args=['--dry-run'])
     if not ok:
         print('FAIL: dry-run exited non-zero')
         sys.exit(1)
 
-    bc_webp = os.path.join(out, 'DryMat_albedo.webp')
+    bc_webp = os.path.join(texdir, 'DryMat_albedo.webp')
     if os.path.exists(bc_webp):
         print('FAIL: dry-run wrote output file')
         sys.exit(1)

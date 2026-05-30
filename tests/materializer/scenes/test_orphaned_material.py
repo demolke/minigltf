@@ -28,13 +28,13 @@ def main():
     blend_path = os.path.join(out, 'scene.blend')
     bpy.ops.wm.save_mainfile(filepath=blend_path)
 
-    ok, stdout, stderr = run_materializer(blend_path, out, repo)
+    ok, stdout, stderr = run_materializer(blend_path, repo)
     if not ok:
         print('FAIL: materializer exited non-zero')
         sys.exit(1)
 
     # Orphaned material should not produce any output
-    bc_webp = os.path.join(out, 'OrphanMat_albedo.webp')
+    bc_webp = os.path.join(texdir, 'OrphanMat_albedo.webp')
     if os.path.exists(bc_webp):
         print('FAIL: orphaned material produced output (should be skipped)')
         sys.exit(1)

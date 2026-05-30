@@ -39,17 +39,22 @@ def main():
     blend_path = os.path.join(out, 'scene.blend')
     bpy.ops.wm.save_mainfile(filepath=blend_path)
 
-    ok, _, _ = run_materializer(blend_path, out, repo)
+    ok, _, _ = run_materializer(blend_path, repo)
     if not ok:
         print('FAIL: materializer exited non-zero')
         sys.exit(1)
 
-    orm_webp = os.path.join(out, 'OrmPixMat_orm.webp')
+    orm_webp = os.path.join(texdir, 'OrmPixMat_orm.webp')
     if not os.path.exists(orm_webp):
         print('FAIL: missing orm.webp')
         sys.exit(1)
 
     pixels, w, h = load_webp_pixels(orm_webp)
+
+    if pixels.max() < 0.05:
+        print(f'FAIL: orm.webp is all black (max pixel={pixels.max():.4f}) — likely a save pipeline bug')
+        sys.exit(1)
+
     mid_y = h // 2
 
     # G channel (roughness): left ~0.0, right ~1.0

@@ -26,12 +26,12 @@ def main():
     bpy.ops.wm.save_mainfile(filepath=blend_path)
 
     # First run (no force)
-    ok, _, _ = run_materializer(blend_path, out, repo)
+    ok, _, _ = run_materializer(blend_path, repo)
     if not ok:
         print('FAIL: first run failed')
         sys.exit(1)
 
-    bc_webp = os.path.join(out, 'ForceMat_albedo.webp')
+    bc_webp = os.path.join(texdir, 'ForceMat_albedo.webp')
     if not os.path.exists(bc_webp):
         print('FAIL: first run did not produce albedo.webp')
         sys.exit(1)
@@ -40,7 +40,7 @@ def main():
     time.sleep(1.1)  # ensure mtime would differ
 
     # Second run with --force
-    ok, _, _ = run_materializer(blend_path, out, repo, extra_args=['--force'])
+    ok, _, _ = run_materializer(blend_path, repo, extra_args=['--force'])
     if not ok:
         print('FAIL: second run (--force) failed')
         sys.exit(1)

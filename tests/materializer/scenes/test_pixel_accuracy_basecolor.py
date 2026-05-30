@@ -30,17 +30,22 @@ def main():
     blend_path = os.path.join(out, 'scene.blend')
     bpy.ops.wm.save_mainfile(filepath=blend_path)
 
-    ok, _, _ = run_materializer(blend_path, out, repo)
+    ok, _, _ = run_materializer(blend_path, repo)
     if not ok:
         print('FAIL: materializer exited non-zero')
         sys.exit(1)
 
-    bc_webp = os.path.join(out, 'PixelMat_albedo.webp')
+    bc_webp = os.path.join(texdir, 'PixelMat_albedo.webp')
     if not os.path.exists(bc_webp):
         print('FAIL: missing albedo.webp')
         sys.exit(1)
 
     pixels, w, h = load_webp_pixels(bc_webp)
+
+    # Sanity: output must not be all-black
+    if pixels[:, :, :3].max() < 0.05:
+        print(f'FAIL: albedo.webp is all black (max pixel={pixels.max():.4f}) — likely a save pipeline bug')
+        sys.exit(1)
 
     # Top-left tile center (tile 0,0 -> red)
     tl_r = pixels[4, 4, 0]
