@@ -37,9 +37,9 @@ def main():
         sys.exit(1)
 
     for name in ('MatA', 'MatB'):
-        path = os.path.join(out, f'{name}_albedo.webp')
+        path = os.path.join(texdir, f'{name}_albedo.webp')
         if not os.path.exists(path):
-            print(f'FAIL: missing {name}_albedo.webp')
+            print(f'FAIL: missing {name}_albedo.webp at {path}')
             sys.exit(1)
 
     print('PASS')

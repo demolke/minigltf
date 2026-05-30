@@ -431,7 +431,22 @@ def _save(bpy_img: bpy.types.Image, path: str, lossless: bool, quality: int, dry
     bpy_img.pack()
     bpy_img.filepath_raw = path
     bpy_img.file_format = 'WEBP'
-    bpy_img.save(filepath=path, quality = 100 if lossless else quality)
+    # Force RGBA WebP via save_render with Raw view transform (no color management).
+    scene = bpy.context.scene
+    vs = scene.view_settings
+    rs = scene.render.image_settings
+    prev = (rs.file_format, rs.color_mode, rs.quality,
+            vs.view_transform, vs.look, vs.exposure, vs.gamma)
+    rs.file_format = 'WEBP'
+    rs.color_mode = 'RGBA'
+    rs.quality = 100 if lossless else quality
+    vs.view_transform = 'Raw'
+    vs.look = 'None'
+    vs.exposure = 0.0
+    vs.gamma = 1.0
+    bpy_img.save_render(filepath=path, scene=scene)
+    rs.file_format, rs.color_mode, rs.quality = prev[0], prev[1], prev[2]
+    vs.view_transform, vs.look, vs.exposure, vs.gamma = prev[3], prev[4], prev[5], prev[6]
 
 
 def _load_slot(tex: TexSrc, h: int, w: int, pbr: PBRMat, slot_name: str) -> ndarray | None:

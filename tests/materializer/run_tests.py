@@ -35,7 +35,18 @@ def run_blender(scene_script, output_dir, timeout=60):
         '--', '--output-dir', output_dir, '--repo-dir', REPO_DIR,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    return result.returncode == 0, result.stdout, result.stderr
+    combined = result.stdout + result.stderr
+    # Blender always exits 0; detect real failures via output content.
+    if result.returncode != 0:
+        ok = False
+    elif 'PASS' in combined:
+        ok = True
+    elif 'FAIL' in combined or 'Traceback' in combined or 'Error' in combined:
+        ok = False
+    else:
+        # No PASS printed and no obvious error — treat as failure.
+        ok = False
+    return ok, result.stdout, result.stderr
 
 
 def run_one(name, scene, validator, output_base, timeout=60):
@@ -46,13 +57,12 @@ def run_one(name, scene, validator, output_base, timeout=60):
     ok, stdout, stderr = run_blender(scene, out_dir, timeout=timeout)
     elapsed = time.perf_counter() - t0
 
+    combined = stdout + stderr
     if not ok:
-        lines = (stdout + stderr).strip().splitlines()
+        lines = combined.strip().splitlines()
         snippet = '\n'.join(lines[-40:])
-        return False, f"Blender exited non-zero:\n{snippet}", elapsed
+        return False, f"Scene failed:\n{snippet}", elapsed
 
-    # Scene scripts self-validate; if they exit 0 they passed.
-    # Some tests also write result.json for extra detail.
     result_file = os.path.join(out_dir, 'result.txt')
     detail = ''
     if os.path.exists(result_file):
@@ -116,6 +126,9 @@ def _t16(out_dir, stdout, stderr): pass
 
 @test('packed_texture', 'test_packed_texture.py')
 def _t17(out_dir, stdout, stderr): pass
+
+@test('alpha_only', 'test_alpha_only.py')
+def _t18(out_dir, stdout, stderr): pass
 
 
 def main():
