@@ -3,7 +3,7 @@
 Usage (from repo root):
     blender --background /path/to/scene.blend \\
         --python tests/bench_export.py -- \\
-        --repo-dir $PWD --runs 5 [--output /tmp/bench.glb]
+        --runs 5 [--output /tmp/bench.glb]
 """
 
 import sys
@@ -11,12 +11,12 @@ import os
 import argparse
 import statistics
 import time
+from pathlib import Path
 
 
 def parse_args():
     argv = sys.argv[sys.argv.index('--') + 1:] if '--' in sys.argv else []
     p = argparse.ArgumentParser()
-    p.add_argument('--repo-dir', required=True)
     p.add_argument('--runs', type=int, default=5)
     p.add_argument('--output', default='/tmp/bench_export.glb')
     return p.parse_args(argv)
@@ -24,7 +24,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    sys.path.insert(0, args.repo_dir)
+    sys.path.insert(0, str(Path(__file__).parent.parent))
 
     try:
         import minigltf
