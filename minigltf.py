@@ -447,6 +447,10 @@ def mini_export(output_file: str) -> None:
             baseColor = ''
             normal = ''
             metallicRoughness = ''
+            emissive = ''
+            normalStrength = 1.0
+
+            bsdf = next((n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
 
             for link in m.node_tree.links:
                 if link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name == 'Base Color' and link.from_node.type == 'TEX_IMAGE':
@@ -454,6 +458,7 @@ def mini_export(output_file: str) -> None:
 
                 if link.to_node.type == 'NORMAL_MAP' and link.to_socket.name == 'Color' and link.from_node.type == 'TEX_IMAGE':
                     normal = link.from_node.image.filepath
+                    normalStrength = link.to_node.inputs['Strength'].default_value
 
                 if link.from_node.type == 'SEPARATE_COLOR' and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name in ('Roughness', 'Metallic'):
                     for im in m.node_tree.links:
@@ -463,29 +468,171 @@ def mini_export(output_file: str) -> None:
                 if link.from_node.type == 'TEX_IMAGE' and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name in ('Roughness', 'Metallic'):
                     metallicRoughness = link.from_node.image.filepath
 
-            if baseColor not in images:
+                # Emission Color socket name changed between Blender 3.x and 4.x
+                if (link.from_node.type == 'TEX_IMAGE' and link.to_node.type == 'BSDF_PRINCIPLED'
+                        and link.to_socket.name in ('Emission', 'Emission Color')):
+                    emissive = link.from_node.image.filepath
+
+            # Warn about node patterns that cannot be fully expressed in glTF.
+            # Export continues regardless — scalars fill missing texture slots.
+            if bsdf:
+                def _direct_src(socket_name):
+                    s = bsdf.inputs.get(socket_name)
+                    if s and s.is_linked:
+                        lk = s.links[0]
+                        return lk.from_node, lk.from_socket.name
+                    return None, None
+
+                # Separate alpha texture (different image from base color)
+                alpha_node, _ = _direct_src('Alpha')
+                if alpha_node and alpha_node.type == 'TEX_IMAGE':
+                    bc_node, _ = _direct_src('Base Color')
+                    if alpha_node is not bc_node:
+                        print(f'[minigltf] WARNING material "{m.name}": separate alpha texture '
+                              f'cannot be expressed in glTF — alpha channel will not be exported')
+
+                # Separate metallic and roughness (different images)
+                m_node, _ = _direct_src('Metallic')
+                r_node, _ = _direct_src('Roughness')
+                if (m_node and m_node.type == 'TEX_IMAGE' and
+                        r_node and r_node.type == 'TEX_IMAGE' and
+                        m_node is not r_node):
+                    print(f'[minigltf] WARNING material "{m.name}": metallic and roughness use '
+                          f'separate textures — glTF requires a single packed texture; '
+                          f'only one channel will be exported')
+
+                # One of metallic/roughness is a texture, the other is a scalar —
+                # the scalar will be read from whatever value is in the unpacked channel
+                if (m_node and m_node.type == 'TEX_IMAGE') != (r_node and r_node.type == 'TEX_IMAGE'):
+                    have  = 'metallic' if (m_node and m_node.type == 'TEX_IMAGE') else 'roughness'
+                    other = 'roughness' if have == 'metallic' else 'metallic'
+                    print(f'[minigltf] WARNING material "{m.name}": {have} has a texture but '
+                          f'{other} is a scalar — the {other} scalar cannot be preserved alongside '
+                          f'a packed texture; {other} will be read from the unpacked channel')
+
+                # Intermediate nodes on any PBR slot
+                for slot in ('Base Color', 'Metallic', 'Roughness', 'Emission', 'Emission Color'):
+                    s = bsdf.inputs.get(slot)
+                    if s and s.is_linked:
+                        src = s.links[0].from_node
+                        if src.type not in ('TEX_IMAGE', 'NORMAL_MAP', 'SEPARATE_COLOR'):
+                            print(f'[minigltf] WARNING material "{m.name}": slot "{slot}" '
+                                  f'has unsupported node "{src.type}" — '
+                                  f'texture will not be exported for this slot')
+
+
+            # (R=occlusion, G=roughness, B=metallic). Emit occlusionTexture for the same image.
+            isORM = False
+            if metallicRoughness:
+                for link in m.node_tree.links:
+                    if (link.from_node.type == 'TEX_IMAGE' and link.to_node.type == 'SEPARATE_COLOR'
+                            and link.from_node.image.filepath == metallicRoughness):
+                        isORM = True
+                        break
+
+            if baseColor and baseColor not in images:
                 images.append(baseColor)
-
-            if normal not in images:
+            if normal and normal not in images:
                 images.append(normal)
-
-            if metallicRoughness not in images:
+            if metallicRoughness and metallicRoughness not in images:
                 images.append(metallicRoughness)
+            if emissive and emissive not in images:
+                images.append(emissive)
+
+            # Scalar fallbacks from BSDF inputs when no texture is connected
+            baseColorFactor = None
+            metallicFactor = None
+            roughnessFactor = None
+            emissiveFactor = None
+            if bsdf:
+                if not baseColor:
+                    c = bsdf.inputs['Base Color'].default_value
+                    baseColorFactor = [round(c[0], 4), round(c[1], 4), round(c[2], 4), round(c[3], 4)]
+                if not metallicRoughness:
+                    metallicFactor = round(float(bsdf.inputs['Metallic'].default_value), 4)
+                    roughnessFactor = round(float(bsdf.inputs['Roughness'].default_value), 4)
+                if not emissive:
+                    emit_socket = bsdf.inputs.get('Emission Color') or bsdf.inputs.get('Emission')
+                    strength_socket = bsdf.inputs.get('Emission Strength')
+                    if emit_socket and not emit_socket.is_linked:
+                        ev = emit_socket.default_value
+                        strength = float(strength_socket.default_value) if strength_socket else 1.0
+                        r = round(ev[0] * strength, 4)
+                        g = round(ev[1] * strength, 4)
+                        b = round(ev[2] * strength, 4)
+                        if r or g or b:
+                            emissiveFactor = [r, g, b]
+
+            doubleSided = not m.use_backface_culling
+
+            # Alpha mode from Blender material transparency settings.
+            # Blender 5.x uses surface_render_method (BLENDED/DITHERED).
+            # Blender 4.x uses blend_method (BLEND/CLIP/OPAQUE/HASHED).
+            alphaMode = None
+            alphaCutoff = None
+            srm = getattr(m, 'surface_render_method', None)
+            blend = getattr(m, 'blend_method', 'OPAQUE')
+            if srm == 'BLENDED' or blend == 'BLEND':
+                alphaMode = 'BLEND'
+            elif blend == 'CLIP':
+                alphaMode = 'MASK'
+                alphaCutoff = round(float(getattr(m, 'alpha_threshold', 0.5)), 4)
 
             jsn.write(b'{"name":"')
             jsn.write(m.name.encode())
-            jsn.write(b'","doubleSided":true,"pbrMetallicRoughness":{"baseColorTexture":{"index":')
-            jsn.write(str(images.index(baseColor)).encode())
+            jsn.write(b'"')
+            if doubleSided:
+                jsn.write(b',"doubleSided":true')
 
+            if alphaMode:
+                jsn.write(b',"alphaMode":"')
+                jsn.write(alphaMode.encode())
+                jsn.write(b'"')
+                if alphaCutoff is not None:
+                    jsn.write(b',"alphaCutoff":')
+                    jsn.write(str(alphaCutoff).encode())
+
+            jsn.write(b',"pbrMetallicRoughness":{')
+
+            sep_b = b''
+            if baseColor:
+                jsn.write(sep_b + b'"baseColorTexture":{"index":' + str(images.index(baseColor)).encode() + b'}')
+                sep_b = b','
+            if baseColorFactor is not None:
+                jsn.write(sep_b + b'"baseColorFactor":[' + b','.join(str(v).encode() for v in baseColorFactor) + b']')
+                sep_b = b','
             if metallicRoughness:
-                jsn.write(b'},"metallicRoughnessTexture":{"index":')
-                jsn.write(str(images.index(metallicRoughness)).encode())
-            jsn.write(b'}}')
+                jsn.write(sep_b + b'"metallicRoughnessTexture":{"index":' + str(images.index(metallicRoughness)).encode() + b'}')
+                sep_b = b','
+            if metallicFactor is not None:
+                jsn.write(sep_b + b'"metallicFactor":' + str(metallicFactor).encode())
+                sep_b = b','
+            if roughnessFactor is not None:
+                jsn.write(sep_b + b'"roughnessFactor":' + str(roughnessFactor).encode())
+
+            jsn.write(b'}')  # close pbrMetallicRoughness
 
             if normal:
                 jsn.write(b',"normalTexture":{"index":')
                 jsn.write(str(images.index(normal)).encode())
+                if abs(normalStrength - 1.0) > 1e-6:
+                    jsn.write(b',"scale":')
+                    jsn.write(str(round(float(normalStrength), 4)).encode())
                 jsn.write(b'}')
+
+            if isORM:
+                jsn.write(b',"occlusionTexture":{"index":')
+                jsn.write(str(images.index(metallicRoughness)).encode())
+                jsn.write(b'}')
+
+            if emissive:
+                jsn.write(b',"emissiveTexture":{"index":')
+                jsn.write(str(images.index(emissive)).encode())
+                jsn.write(b'}')
+            elif emissiveFactor is not None:
+                jsn.write(b',"emissiveFactor":[')
+                jsn.write(b','.join(str(v).encode() for v in emissiveFactor))
+                jsn.write(b']')
 
             jsn.write(b'}')
 

@@ -1,4 +1,4 @@
-"""Blender scene: cube with animated blend shapes (Inflate 0→1, Squash 0→0.5 over 24 frames)."""
+"""Blender scene: cube with animated blend shapes (Inflate 0->1, Squash 0->0.5 over 24 frames)."""
 
 import sys
 import os

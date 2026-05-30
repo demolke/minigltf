@@ -31,8 +31,11 @@ jobs:
           chmod +x gltf_validator
           mv gltf_validator validator
 
-      - name: Run tests
-        run: python tests/run_tests.py
+      - name: Run minigltf tests
+        run: python tests/minigltf/run_tests.py
+
+      - name: Run materializer tests
+        run: python tests/materializer/run_tests.py
 
       - name: Benchmark
         run: |

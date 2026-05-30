@@ -28,7 +28,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-REPO_DIR = str(Path(__file__).parent.parent.resolve())
+REPO_DIR = str(Path(__file__).parent.parent.parent.resolve())  # 3 levels up now
 SCENES_DIR = str(Path(__file__).parent / 'scenes')
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -122,12 +122,88 @@ def validate_full_material(gltf, bin_data):
     assert 'baseColorTexture' in pbr, "missing baseColorTexture"
     assert 'metallicRoughnessTexture' in pbr, "missing metallicRoughnessTexture"
     assert 'normalTexture' in mat, "missing normalTexture"
+    # SEPARATE_COLOR ORM setup: occlusionTexture must share the same index as metallicRoughnessTexture
+    assert 'occlusionTexture' in mat, "missing occlusionTexture (expected for ORM texture)"
+    assert mat['occlusionTexture']['index'] == pbr['metallicRoughnessTexture']['index'], \
+        "occlusionTexture must reference the same image as metallicRoughnessTexture for ORM"
 
     # The three texture indices must be distinct
     bc_idx = pbr['baseColorTexture']['index']
     mr_idx = pbr['metallicRoughnessTexture']['index']
     nm_idx = mat['normalTexture']['index']
     assert len({bc_idx, mr_idx, nm_idx}) == 3, "texture indices are not all distinct"
+
+
+@test('scalar_material', 'scalar_material.py')
+def validate_scalar_material(gltf, bin_data):
+    assert len(gltf.get('materials', [])) == 1, "expected 1 material"
+    # No textures: images and textures arrays should be absent or empty
+    assert len(gltf.get('images', [])) == 0, "expected no images for texture-free material"
+    assert len(gltf.get('textures', [])) == 0, "expected no textures for texture-free material"
+
+    mat = gltf['materials'][0]
+    pbr = mat.get('pbrMetallicRoughness', {})
+    assert 'baseColorTexture' not in pbr, "should not have baseColorTexture when no texture connected"
+    assert 'baseColorFactor' in pbr, "missing baseColorFactor scalar fallback"
+    assert 'metallicFactor' in pbr, "missing metallicFactor scalar fallback"
+    assert 'roughnessFactor' in pbr, "missing roughnessFactor scalar fallback"
+
+    bc = pbr['baseColorFactor']
+    assert len(bc) == 4, "baseColorFactor must be a 4-element array"
+    assert abs(bc[0] - 0.8) < 0.01, f"baseColorFactor R expected ~0.8, got {bc[0]}"
+    assert abs(bc[1] - 0.2) < 0.01, f"baseColorFactor G expected ~0.2, got {bc[1]}"
+    assert abs(bc[2] - 0.4) < 0.01, f"baseColorFactor B expected ~0.4, got {bc[2]}"
+    assert abs(pbr['metallicFactor'] - 0.75) < 0.01, f"metallicFactor expected ~0.75, got {pbr['metallicFactor']}"
+    assert abs(pbr['roughnessFactor'] - 0.3) < 0.01, f"roughnessFactor expected ~0.3, got {pbr['roughnessFactor']}"
+
+
+@test('alpha_material', 'alpha_material.py')
+def validate_alpha_material(gltf, bin_data):
+    assert len(gltf.get('materials', [])) == 2, "expected 2 materials (BLEND + MASK)"
+
+    blend_mat = next((m for m in gltf['materials'] if m.get('name') == 'BlendMat'), None)
+    mask_mat  = next((m for m in gltf['materials'] if m.get('name') == 'MaskMat'), None)
+    assert blend_mat is not None, "BlendMat not found"
+    assert mask_mat is not None, "MaskMat not found"
+
+    assert blend_mat.get('alphaMode') == 'BLEND', \
+        f"BlendMat alphaMode expected BLEND, got {blend_mat.get('alphaMode')}"
+
+    # Blender 5.x removed CLIP as a distinct mode (maps to HASHED/DITHERED), so
+    # MaskMat may export as MASK (Blender 4.x) or have no alphaMode (Blender 5.x).
+    mask_alpha = mask_mat.get('alphaMode')
+    assert mask_alpha in ('MASK', None), \
+        f"MaskMat alphaMode expected MASK or None, got {mask_alpha}"
+    if mask_alpha == 'MASK':
+        assert 'alphaCutoff' in mask_mat, "MaskMat missing alphaCutoff"
+        assert abs(mask_mat['alphaCutoff'] - 0.25) < 0.01, \
+            f"alphaCutoff expected ~0.25, got {mask_mat['alphaCutoff']}"
+
+
+@test('emission_material', 'emission_material.py')
+def validate_emission_material(gltf, bin_data):
+    assert len(gltf.get('materials', [])) == 3, "expected 3 materials"
+
+    emit_mat = next((m for m in gltf['materials'] if m.get('name') == 'EmitScalarMat'), None)
+    ds_mat   = next((m for m in gltf['materials'] if m.get('name') == 'DoubleSidedMat'), None)
+    ss_mat   = next((m for m in gltf['materials'] if m.get('name') == 'SingleSidedMat'), None)
+    assert emit_mat is not None, "EmitScalarMat not found"
+    assert ds_mat is not None, "DoubleSidedMat not found"
+    assert ss_mat is not None, "SingleSidedMat not found"
+
+    # Emission: scalar factor with strength applied (color (1,0.5,0) * strength 2.0)
+    assert 'emissiveFactor' in emit_mat, "EmitScalarMat missing emissiveFactor"
+    ef = emit_mat['emissiveFactor']
+    assert len(ef) == 3, "emissiveFactor must be a 3-element array"
+    assert abs(ef[0] - 2.0) < 0.01, f"emissiveFactor R expected ~2.0, got {ef[0]}"
+    assert abs(ef[1] - 1.0) < 0.01, f"emissiveFactor G expected ~1.0, got {ef[1]}"
+    assert abs(ef[2] - 0.0) < 0.01, f"emissiveFactor B expected ~0.0, got {ef[2]}"
+
+    # Double-sided: use_backface_culling=False means doubleSided:true
+    assert ds_mat.get('doubleSided') is True, "DoubleSidedMat should have doubleSided:true"
+
+    # Single-sided: use_backface_culling=True, doubleSided absent (defaults to false in glTF)
+    assert 'doubleSided' not in ss_mat, "SingleSidedMat should not have doubleSided field"
 
 
 @test('armature', 'armature.py')
@@ -298,7 +374,7 @@ def validate_partial_anim(gltf, bin_data):
     out_acc = _acc(gltf, s['output'])
     assert in_acc['count'] == 2, f"expected 2 keyframes, got {in_acc['count']}"
     assert out_acc['type'] == 'VEC3', f"location output must be VEC3, got {out_acc['type']}"
-    # Y and Z values should be zero (channels absent → default 0)
+    # Y and Z values should be zero (channels absent default to 0)
     vals = read_accessor(gltf, bin_data, s['output'])
     for fi in range(in_acc['count']):
         y_val = vals[fi * 3 + 1]
@@ -311,8 +387,7 @@ def validate_partial_anim(gltf, bin_data):
 def validate_multiple_meshes(gltf, bin_data):
     assert len(gltf.get('meshes', [])) == 3, f"expected 3 meshes, got {len(gltf.get('meshes', []))}"
     assert len(gltf.get('materials', [])) == 2, f"expected 2 materials, got {len(gltf.get('materials', []))}"
-    # minigltf adds one empty-string placeholder for materials without all three texture slots;
-    # 2 real images + 1 empty-string entry = 3 total.
+    assert len(gltf.get('images', [])) == 2, f"expected 2 images, got {len(gltf.get('images', []))}"
     non_empty_images = [img for img in gltf.get('images', []) if img.get('uri', '')]
     assert len(non_empty_images) == 2, f"expected 2 non-empty images, got {non_empty_images}"
 
@@ -353,6 +428,44 @@ def validate_large_perf(gltf, bin_data):
     prim = gltf['meshes'][0]['primitives'][0]
     assert len(prim.get('targets', [])) == 50, f"expected 50 morph targets, got {len(prim.get('targets', []))}"
     assert len(gltf.get('animations', [])) == 4, f"expected 4 animations, got {len(gltf.get('animations', []))}"
+
+
+@test('warn_separate_channels', 'warn_separate_channels.py')
+def validate_warn_separate_channels(gltf, bin_data):
+    """Export should succeed; material has metallicRoughnessTexture (or at least one texture slot)."""
+    assert len(gltf.get('materials', [])) == 1, "expected 1 material"
+    mat = gltf['materials'][0]
+    pbr = mat.get('pbrMetallicRoughness', {})
+    # Separate channels, minigltf can't pack them, so one texture wins
+    assert 'metallicRoughnessTexture' in pbr, "expected metallicRoughnessTexture even for separate channels"
+
+
+@test('warn_mixed_channels', 'warn_mixed_channels.py')
+def validate_warn_mixed_channels(gltf, bin_data):
+    """Export should succeed with metallicRoughnessTexture."""
+    assert len(gltf.get('materials', [])) == 1, "expected 1 material"
+    mat = gltf['materials'][0]
+    pbr = mat.get('pbrMetallicRoughness', {})
+    assert 'metallicRoughnessTexture' in pbr, "expected metallicRoughnessTexture"
+
+
+@test('multi_material_mesh', 'multi_material_mesh.py')
+def validate_multi_material_mesh(gltf, bin_data):
+    """One mesh with two material slots - at least 1 mesh exported with materials present."""
+    assert len(gltf.get('materials', [])) >= 1, f"expected at least 1 material, got {len(gltf.get('materials', []))}"
+    assert len(gltf.get('meshes', [])) >= 1, "expected at least 1 mesh"
+    mesh = gltf['meshes'][0]
+    assert len(mesh['primitives']) >= 1, "expected at least 1 primitive"
+
+
+@test('shared_material_meshes', 'shared_material_meshes.py')
+def validate_shared_material_meshes(gltf, bin_data):
+    """Two meshes sharing one material - 2 meshes, 1 material."""
+    assert len(gltf.get('meshes', [])) == 2, f"expected 2 meshes, got {len(gltf.get('meshes', []))}"
+    assert len(gltf.get('materials', [])) == 1, f"expected 1 shared material, got {len(gltf.get('materials', []))}"
+    mat_idx_a = gltf['meshes'][0]['primitives'][0]['material']
+    mat_idx_b = gltf['meshes'][1]['primitives'][0]['material']
+    assert mat_idx_a == mat_idx_b, "both meshes should reference the same material"
 
 
 # ---------------------------------------------------------------------------

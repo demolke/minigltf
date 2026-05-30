@@ -34,6 +34,11 @@ mode or handles.
 
 **Materials**
 - PBR metallic-roughness: base color texture, metallic/roughness texture, normal map
+- ORM combined texture (R=occlusion, G=roughness, B=metallic) exported with `occlusionTexture`
+- Scalar fallbacks for base color, metallic, roughness when no texture is connected
+- Emission: `emissiveFactor` (color × strength) or `emissiveTexture`
+- Alpha modes: `BLEND` and `MASK` (with `alphaCutoff`)
+- Double-sided: derived from Blender's backface culling setting
 - Textures referenced by relative path
 
 **Armature**
@@ -57,7 +62,7 @@ mode or handles.
 - **Scale animation** channels are not exported
 - **Textures** are not embedded in the GLB; they must sit alongside the file at the relative paths stored in the material nodes
 - **4 joint influences** maximum; excess groups are dropped
-- **No vertex colours, tangents, emission, transparency, IOR, lights, cameras, or particles**
+- **No vertex colours, tangents, IOR, lights, cameras, or particles**
 - Requires **Blender 4.0+**; the Blender addon requires **4.2+**
 
 ## Usage
