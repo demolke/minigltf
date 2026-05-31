@@ -648,11 +648,6 @@ def mini_export(output_file: str) -> None:
                     jsn.write(str(round(float(normalStrength), 4)).encode())
                 jsn.write(b'}')
 
-            if isORM:
-                jsn.write(b',"occlusionTexture":{"index":')
-                jsn.write(str(images.index(metallicRoughness)).encode())
-                jsn.write(b'}')
-
             if emissive:
                 jsn.write(b',"emissiveTexture":{"index":')
                 jsn.write(str(images.index(emissive)).encode())

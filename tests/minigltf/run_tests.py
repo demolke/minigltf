@@ -122,10 +122,6 @@ def validate_full_material(gltf, bin_data):
     assert 'baseColorTexture' in pbr, "missing baseColorTexture"
     assert 'metallicRoughnessTexture' in pbr, "missing metallicRoughnessTexture"
     assert 'normalTexture' in mat, "missing normalTexture"
-    # SEPARATE_COLOR ORM setup: occlusionTexture must share the same index as metallicRoughnessTexture
-    assert 'occlusionTexture' in mat, "missing occlusionTexture (expected for ORM texture)"
-    assert mat['occlusionTexture']['index'] == pbr['metallicRoughnessTexture']['index'], \
-        "occlusionTexture must reference the same image as metallicRoughnessTexture for ORM"
 
     # The three texture indices must be distinct
     bc_idx = pbr['baseColorTexture']['index']
