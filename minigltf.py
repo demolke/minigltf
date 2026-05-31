@@ -3,6 +3,7 @@ from io import BytesIO
 import json
 import mathutils
 import numpy as np
+import os
 import struct
 import time
 
@@ -58,6 +59,29 @@ class _BinWriter:
     def getbuffer(self):
         return self.mv[:self.offset]
 
+
+def _je(s: str) -> bytes:
+    """JSON-encode a string value (with surrounding quotes, properly escaped)."""
+    return json.dumps(s).encode()
+
+
+def _image_uri(blender_filepath: str, output_file: str) -> str:
+    """Return a URI for a texture, relative to the output GLB location.
+
+    Blender stores image paths relative to the .blend file (// prefix).
+    The GLB may be written to a completely different directory (e.g.
+    .godot/imported/), so we resolve to an absolute path first, then
+    compute a new relative path anchored to the GLB output directory.
+    """
+    abs_tex = bpy.path.abspath(blender_filepath)
+    glb_dir = os.path.dirname(os.path.abspath(output_file))
+    try:
+        rel = os.path.relpath(abs_tex, glb_dir)
+    except ValueError:
+        # os.path.relpath raises ValueError on Windows when paths are on
+        # different drives — fall back to the absolute path.
+        rel = abs_tex
+    return rel.replace('\\', '/')
 
 def mini_export(output_file: str) -> None:
     axis_basis_change = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, -1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
@@ -128,9 +152,8 @@ def mini_export(output_file: str) -> None:
     jsn.write(b'"nodes":[')
     for i in range(len(objs)):
         o = objs[i]
-        jsn.write(b'{"name":"')
-        jsn.write(o.name.encode())
-        jsn.write(b'"')
+        jsn.write(b'{"name":')
+        jsn.write(_je(o.name))
 
         if isinstance(o, bpy.types.Bone):
             parent = mathutils.Matrix()
@@ -221,9 +244,9 @@ def mini_export(output_file: str) -> None:
             m.calc_loop_triangles()
             if hasattr(m, 'calc_normals_split'):
                 m.calc_normals_split()
-            jsn.write(b'{"name":"')
-            jsn.write(m.name.encode())
-            jsn.write(b'","primitives":[{"attributes":{')
+            jsn.write(b'{"name":')
+            jsn.write(_je(m.name))
+            jsn.write(b',"primitives":[{"attributes":{')
 
             n_verts = len(m.vertices)
             n_loops = len(m.loops)
@@ -422,9 +445,7 @@ def mini_export(output_file: str) -> None:
             if m.shape_keys and len(m.shape_keys.key_blocks) > 1:
                 jsn.write(b',"extras":{"targetNames":[')
                 for j in range(1, len(m.shape_keys.key_blocks)):
-                    jsn.write(b'"')
-                    jsn.write(m.shape_keys.key_blocks[j].name.encode())
-                    jsn.write(b'"')
+                    jsn.write(_je(m.shape_keys.key_blocks[j].name))
                     if j < len(m.shape_keys.key_blocks) - 1:
                         jsn.write(b',')
 
@@ -578,9 +599,8 @@ def mini_export(output_file: str) -> None:
                 alphaMode = 'MASK'
                 alphaCutoff = round(float(getattr(m, 'alpha_threshold', 0.5)), 4)
 
-            jsn.write(b'{"name":"')
-            jsn.write(m.name.encode())
-            jsn.write(b'"')
+            jsn.write(b'{"name":')
+            jsn.write(_je(m.name))
             if doubleSided:
                 jsn.write(b',"doubleSided":true')
 
@@ -660,9 +680,9 @@ def mini_export(output_file: str) -> None:
         jsn.write(b'"images":[')
         for i in range(len(images)):
             img = images[i]
-            jsn.write(b'{"uri":"')  # GLB does not support external images, but godot fortunately doesn't care
-            jsn.write(img.lstrip('/').encode())
-            jsn.write(b'"}')
+            jsn.write(b'{"uri":')  # GLB does not support external images, but godot fortunately doesn't care
+            jsn.write(_je(_image_uri(img, output_file)))
+            jsn.write(b'}')
 
             if i < len(images) - 1:
                 jsn.write(b',')
@@ -741,9 +761,9 @@ def mini_export(output_file: str) -> None:
                     sk_mesh_obj = obj
                     break
 
-            jsn.write(b'{"name":"')
-            jsn.write(a.name.encode())
-            jsn.write(b'","channels":[')
+            jsn.write(b'{"name":')
+            jsn.write(_je(a.name))
+            jsn.write(b',"channels":[')
 
             # Expects all channel parts to have same keyframes
             sampleridx = 0
