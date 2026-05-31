@@ -84,6 +84,14 @@ def _image_uri(blender_filepath: str, output_file: str) -> str:
     return rel.replace('\\', '/')
 
 def mini_export(output_file: str) -> None:
+    # If we're in Edit Mode, we have to switch to object mode first.
+    edited = []
+    for o in bpy.data.objects:
+        if o.mode == 'EDIT':
+            edited.append(o)
+            bpy.context.view_layer.objects.active = o
+            bpy.ops.object.mode_set(mode='OBJECT')
+
     axis_basis_change = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, -1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
 
     _t = time.perf_counter()
@@ -1026,3 +1034,7 @@ def mini_export(output_file: str) -> None:
         f.write(struct.pack('<II', _bchunk_len, 0x004E4942))        # BIN chunk header
         f.write(bchunk.getbuffer())
     timings['file_io'] = time.perf_counter() - _t
+
+    for o in edited:
+        bpy.context.view_layer.objects.active = o
+        bpy.ops.object.mode_set(mode='EDIT')
