@@ -16,6 +16,7 @@ Test artifacts are kept after the run - check <output_dir>/<test_name>/.
 
 import argparse
 import datetime
+import inspect
 import json
 import os
 import struct
@@ -458,6 +459,28 @@ def validate_multi_material_mesh(gltf, bin_data):
     assert len(mesh['primitives']) >= 1, "expected at least 1 primitive"
 
 
+@test('animation_split', 'animation_split.py')
+def validate_animation_split(gltf, bin_data, out_dir):
+    # output.glb = full file: meshes + materials + skins, no animations
+    assert len(gltf.get('meshes', [])) == 1, "full GLB should have 1 mesh"
+    assert len(gltf.get('materials', [])) >= 1, "full GLB should have materials"
+    assert 'skins' in gltf, "full GLB should have skins"
+    assert 'animations' not in gltf, "full GLB must not contain animations"
+
+    # output_anim.glb = anim file: skins + animations, no meshes/materials
+    skel_path = os.path.join(out_dir, 'output_anim.glb')
+    assert os.path.exists(skel_path), "output_anim.glb was not created"
+    skel_gltf, skel_bin = parse_glb(skel_path)
+    assert 'meshes' not in skel_gltf, "skel GLB must not contain meshes"
+    assert 'materials' not in skel_gltf, "skel GLB must not contain materials"
+    assert 'skins' in skel_gltf, "skel GLB should have skins"
+    assert 'animations' in skel_gltf, "skel GLB should have animations"
+    assert len(skel_gltf['animations']) == 1, \
+        f"expected 1 animation in skel GLB, got {len(skel_gltf['animations'])}"
+    assert skel_gltf['animations'][0].get('name') == 'Walk', \
+        f"expected animation 'Walk' in skel GLB"
+
+
 @test('shared_material_meshes', 'shared_material_meshes.py')
 def validate_shared_material_meshes(gltf, bin_data):
     """Two meshes sharing one material - 2 meshes, 1 material."""
@@ -537,13 +560,17 @@ def run_one(name, scene, validator, output_base, timeout=120):
 
     try:
         gltf, bin_data = parse_glb(glb)
-        validator(gltf, bin_data)
+        if len(inspect.signature(validator).parameters) >= 3:
+            validator(gltf, bin_data, out_dir)
+        else:
+            validator(gltf, bin_data)
     except Exception as e:
         return False, f"{type(e).__name__}: {e}\n{traceback.format_exc()}", blender_elapsed
 
-    ok, msg = run_khronos_validator(glb)
-    if not ok:
-        return False, msg, blender_elapsed
+    for glb_path in sorted(Path(out_dir).glob('*.glb')):
+        ok, msg = run_khronos_validator(str(glb_path))
+        if not ok:
+            return False, f"{glb_path.name}: {msg}", blender_elapsed
 
     return True, "OK", blender_elapsed
 
