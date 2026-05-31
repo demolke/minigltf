@@ -93,7 +93,7 @@ def export_scene(args):
         sys.exit(1)
     os.makedirs(args.output_dir, exist_ok=True)
     try:
-        mini_export(os.path.join(args.output_dir, 'output.glb'), split=False)
+        mini_export(os.path.join(args.output_dir, 'output.glb'))
     except Exception:
         print("ERROR: mini_export() raised an exception:", file=sys.stderr)
         traceback.print_exc()

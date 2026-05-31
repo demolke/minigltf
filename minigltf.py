@@ -3,7 +3,6 @@ from io import BytesIO
 import json
 import mathutils
 import numpy as np
-import os
 import struct
 import time
 
@@ -60,55 +59,7 @@ class _BinWriter:
         return self.mv[:self.offset]
 
 
-def _je(s: str) -> bytes:
-    """JSON-encode a string value (with surrounding quotes, properly escaped)."""
-    return json.dumps(s).encode()
-
-
-def _image_uri(blender_filepath: str, output_file: str) -> str:
-    """Return a URI for a texture, relative to the output GLB location.
-
-    Blender stores image paths relative to the .blend file (// prefix).
-    The GLB may be written to a completely different directory (e.g.
-    .godot/imported/), so we resolve to an absolute path first, then
-    compute a new relative path anchored to the GLB output directory.
-    """
-    abs_tex = bpy.path.abspath(blender_filepath)
-    glb_dir = os.path.dirname(os.path.abspath(output_file))
-    try:
-        rel = os.path.relpath(abs_tex, glb_dir)
-    except ValueError:
-        # os.path.relpath raises ValueError on Windows when paths are on
-        # different drives — fall back to the absolute path.
-        rel = abs_tex
-    return rel.replace('\\', '/')
-
-
-def _write_if_changed(path: str, data: bytes) -> bool:
-    try:
-        with open(path, 'rb') as f:
-            if f.read() == data:
-                return False
-    except OSError:
-        pass
-    with open(path, 'wb') as f:
-        f.write(data)
-    return True
-
-
-def mini_export(output_file: str, split: bool = True, anim_file: str = None) -> None:
-    if split:
-        # Write animations to a separate file
-        if anim_file is None:
-            base, ext = os.path.splitext(output_file)
-            anim_file = f'{base}_anim{ext}'
-        _mini_export_inner(anim_file, skeleton_only=True, include_animations=True)
-        _mini_export_inner(output_file, skeleton_only=False, include_animations=False)
-    else:
-        _mini_export_inner(output_file, skeleton_only=False, include_animations=True)
-
-
-def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_animations: bool = True) -> None:
+def mini_export(output_file: str) -> None:
     axis_basis_change = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, -1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
 
     _t = time.perf_counter()
@@ -117,8 +68,7 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
     jsn.write(b'{')
     jsn.write(b'"asset":{"version":"2.0","generator":"minigltf"},\n')
 
-    _obj_types = ['ARMATURE'] if skeleton_only else ['MESH', 'ARMATURE']
-    objs = [o for o in bpy.data.objects if o.type in _obj_types]
+    objs = [o for o in bpy.data.objects if o.type in ['MESH', 'ARMATURE']]
     for a in bpy.data.armatures:
         objs += [b for b in a.bones]
 
@@ -168,10 +118,9 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
             _bin_size += (len(_md.shape_keys.key_blocks) - 1) * _nl * 12
     for _sk in [o for o in objs if isinstance(o, bpy.types.Object) and o.type == 'ARMATURE']:
         _bin_size += len(_sk.data.bones) * 64                  # inverse bind matrices
-    if include_animations:
-        for _a in bpy.data.actions:
-            for _f in _action_fcurves(_a):
-                _bin_size += len(_f.keyframe_points) * 32      # anim samples (rough)
+    for _a in bpy.data.actions:
+        for _f in _action_fcurves(_a):
+            _bin_size += len(_f.keyframe_points) * 32          # anim samples (rough)
     bchunk = _BinWriter(_bin_size + 65536)
     _t = time.perf_counter()
 
@@ -179,8 +128,9 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
     jsn.write(b'"nodes":[')
     for i in range(len(objs)):
         o = objs[i]
-        jsn.write(b'{"name":')
-        jsn.write(_je(o.name))
+        jsn.write(b'{"name":"')
+        jsn.write(o.name.encode())
+        jsn.write(b'"')
 
         if isinstance(o, bpy.types.Bone):
             parent = mathutils.Matrix()
@@ -242,7 +192,7 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
                     jsn.write(str(skins.index(m.object)).encode())
 
         # Bones are nodes in GLTF
-        children = [x for x in o.children if x in objs]
+        children = [x for x in o.children]
         if isinstance(o, bpy.types.Object) and o.type == 'ARMATURE':
             children += [b for b in o.data.bones if b.parent is None]
 
@@ -263,12 +213,6 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
     jsn.write(b'],')
     timings['nodes'] = time.perf_counter() - _t
 
-    # When exporting skeleton-only, collect skins from armature objects directly
-    if skeleton_only:
-        for o in objs:
-            if isinstance(o, bpy.types.Object) and o.type == 'ARMATURE' and o not in skins:
-                skins.append(o)
-
     # Meshes section
     if meshes:
         jsn.write(b'"meshes":[')
@@ -277,9 +221,9 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
             m.calc_loop_triangles()
             if hasattr(m, 'calc_normals_split'):
                 m.calc_normals_split()
-            jsn.write(b'{"name":')
-            jsn.write(_je(m.name))
-            jsn.write(b',"primitives":[{"attributes":{')
+            jsn.write(b'{"name":"')
+            jsn.write(m.name.encode())
+            jsn.write(b'","primitives":[{"attributes":{')
 
             n_verts = len(m.vertices)
             n_loops = len(m.loops)
@@ -478,7 +422,9 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
             if m.shape_keys and len(m.shape_keys.key_blocks) > 1:
                 jsn.write(b',"extras":{"targetNames":[')
                 for j in range(1, len(m.shape_keys.key_blocks)):
-                    jsn.write(_je(m.shape_keys.key_blocks[j].name))
+                    jsn.write(b'"')
+                    jsn.write(m.shape_keys.key_blocks[j].name.encode())
+                    jsn.write(b'"')
                     if j < len(m.shape_keys.key_blocks) - 1:
                         jsn.write(b',')
 
@@ -632,8 +578,9 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
                 alphaMode = 'MASK'
                 alphaCutoff = round(float(getattr(m, 'alpha_threshold', 0.5)), 4)
 
-            jsn.write(b'{"name":')
-            jsn.write(_je(m.name))
+            jsn.write(b'{"name":"')
+            jsn.write(m.name.encode())
+            jsn.write(b'"')
             if doubleSided:
                 jsn.write(b',"doubleSided":true')
 
@@ -713,9 +660,9 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
         jsn.write(b'"images":[')
         for i in range(len(images)):
             img = images[i]
-            jsn.write(b'{"uri":')  # GLB does not support external images, but godot fortunately doesn't care
-            jsn.write(_je(_image_uri(img, output_file)))
-            jsn.write(b'}')
+            jsn.write(b'{"uri":"')  # GLB does not support external images, but godot fortunately doesn't care
+            jsn.write(img.lstrip('/').encode())
+            jsn.write(b'"}')
 
             if i < len(images) - 1:
                 jsn.write(b',')
@@ -761,7 +708,7 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
     _t_anim_rotation = 0.0
     _t_anim_location = 0.0
     _t_anim_morph = 0.0
-    if include_animations and bpy.data.actions:
+    if bpy.data.actions:
         CHANNEL_MAPPING = {'location': 'translation', 'rotation_quaternion': 'rotation', 'scale': 'scale'}
         jsn.write(b'"animations":[')
         for i in range(len(bpy.data.actions)):
@@ -794,9 +741,9 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
                     sk_mesh_obj = obj
                     break
 
-            jsn.write(b'{"name":')
-            jsn.write(_je(a.name))
-            jsn.write(b',"channels":[')
+            jsn.write(b'{"name":"')
+            jsn.write(a.name.encode())
+            jsn.write(b'","channels":[')
 
             # Expects all channel parts to have same keyframes
             sampleridx = 0
@@ -1052,11 +999,10 @@ def _mini_export_inner(output_file: str, skeleton_only: bool = False, include_an
     _jsn_bytes = jsn.getbuffer()
     _total_length = 28 + len(_jsn_bytes) + _bchunk_len
 
-    _glb = BytesIO()
-    _glb.write(struct.pack('<III', 0x46546C67, 2, _total_length))  # GLB header
-    _glb.write(struct.pack('<II', len(_jsn_bytes), 0x4E4F534A))    # JSON chunk header
-    _glb.write(_jsn_bytes)
-    _glb.write(struct.pack('<II', _bchunk_len, 0x004E4942))        # BIN chunk header
-    _glb.write(bchunk.getbuffer())
-    _write_if_changed(output_file, _glb.getvalue())
+    with open(output_file, 'wb') as f:
+        f.write(struct.pack('<III', 0x46546C67, 2, _total_length))  # GLB header
+        f.write(struct.pack('<II', len(_jsn_bytes), 0x4E4F534A))    # JSON chunk header
+        f.write(_jsn_bytes)
+        f.write(struct.pack('<II', _bchunk_len, 0x004E4942))        # BIN chunk header
+        f.write(bchunk.getbuffer())
     timings['file_io'] = time.perf_counter() - _t

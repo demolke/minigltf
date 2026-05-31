@@ -387,7 +387,7 @@ def main():
     glb_path = os.path.join(args.output_dir, 'output.glb')
     blend_path = os.path.join(args.output_dir, 'scene.blend')
 
-    mini_export(glb_path, split=False)
+    mini_export(glb_path)
     export_time = time.time() - t0
 
     glb_size = os.path.getsize(glb_path)
