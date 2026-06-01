@@ -16,7 +16,7 @@ def main():
     alpha_path = os.path.join(texdir, 'alpha.png')
     save_image('base', 64, 64, solid_color(64, 64, (1.0, 0.0, 0.0, 1.0)), bc_path)
     # Alpha image: left half black (0), right half white (1)
-    save_image('alpha', 64, 64, gradient_h(64, 64, (0.0,0.0,0.0,1.0), (1.0,1.0,1.0,1.0)), alpha_path)
+    save_image('alpha', 64, 64, gradient_h(64, 64, (0.0,0.0,0.0,1.0), (1.0,1.0,1.0,1.0)), alpha_path, colorspace='Non-Color')
 
     obj = make_mesh_object()
     mat, nodes, links, bsdf = new_material('AlphaMat')
@@ -28,6 +28,7 @@ def main():
 
     a_tex = nodes.new('ShaderNodeTexImage')
     a_tex.image = bpy.data.images.load(alpha_path)
+    a_tex.image.colorspace_settings.name = 'Non-Color'
     links.new(a_tex.outputs['Color'], bsdf.inputs['Alpha'])
 
     obj.data.materials.append(mat)

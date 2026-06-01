@@ -16,7 +16,7 @@ def main():
     os.makedirs(texdir, exist_ok=True)
     alpha_path = os.path.join(texdir, 'alpha.png')
     # Left half transparent (0), right half opaque (1)
-    save_image('alpha', 64, 64, gradient_h(64, 64, (0,0,0,1), (1,1,1,1)), alpha_path)
+    save_image('alpha', 64, 64, gradient_h(64, 64, (0,0,0,1), (1,1,1,1)), alpha_path, colorspace='Non-Color')
 
     obj = make_mesh_object()
     mat, nodes, links, bsdf = new_material('AlphaOnlyMat')
@@ -25,6 +25,7 @@ def main():
     # Only alpha texture — no base color texture, BSDF Base Color stays at default (0.8)
     a_tex = nodes.new('ShaderNodeTexImage')
     a_tex.image = bpy.data.images.load(alpha_path)
+    a_tex.image.colorspace_settings.name = 'Non-Color'
     links.new(a_tex.outputs['Color'], bsdf.inputs['Alpha'])
     obj.data.materials.append(mat)
 
