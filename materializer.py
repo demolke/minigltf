@@ -166,8 +166,6 @@ def find_principled_bsdf(
     warn_fn: Callable[[str], None] | None = None,
 ) -> bpy.types.ShaderNode | None:
     """Walk upstream from Material Output to find the connected Principled BSDF."""
-    if not mat.use_nodes:
-        return None
     nodes = mat.node_tree.nodes
     output_node = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
     if output_node is None:
@@ -215,9 +213,6 @@ def collect_used_materials() -> tuple[set[bpy.types.Material], dict[bpy.types.Ma
 
 def analyse(mat: bpy.types.Material, model: str) -> PBRMat | None:
     """Return a PBRMat for mat, or None if no Principled BSDF found."""
-    if not mat.use_nodes:
-        return None
-
     pbr = PBRMat(mat, model)
     bsdf = find_principled_bsdf(mat, warn_fn=pbr.warn)
     if bsdf is None:
@@ -409,8 +404,37 @@ def _max_size(*nodes: bpy.types.ShaderNodeTexImage | None) -> tuple[int, int]:
     return (max(s[0] for s in sizes), max(s[1] for s in sizes)) if sizes else (1024, 1024)
 
 
+# IEC 61966-2-1 sRGB transfer function constants
+_SRGB_LINEAR_CUTOFF  = 0.0031308   # linear values below this use the linear segment
+_SRGB_ENCODE_CUTOFF  = 0.04045     # sRGB values below this use the linear segment (decode)
+_SRGB_LINEAR_SLOPE   = 12.92       # slope of the linear segment
+_SRGB_GAMMA_SCALE    = 1.055       # scale factor of the power segment
+_SRGB_GAMMA_OFFSET   = 0.055       # offset of the power segment
+_SRGB_GAMMA_EXPONENT = 1.0 / 2.4  # exponent of the power segment
+
+
+def _linear_to_srgb(v: float) -> float:
+    """Scalar linear to sRGB (IEC 61966-2-1)"""
+    if v <= _SRGB_LINEAR_CUTOFF:
+        return v * _SRGB_LINEAR_SLOPE
+    return _SRGB_GAMMA_SCALE * (v ** _SRGB_GAMMA_EXPONENT) - _SRGB_GAMMA_OFFSET
+
+
+def _srgb_to_linear_arr(arr: ndarray) -> ndarray:
+    """Vectorised sRGB to linear (IEC 61966-2-1) for float32 arrays."""
+    v = np.clip(arr, 0.0, 1.0)
+    return np.where(v <= _SRGB_ENCODE_CUTOFF,
+                    v / _SRGB_LINEAR_SLOPE,
+                    ((v + _SRGB_GAMMA_OFFSET) / _SRGB_GAMMA_SCALE) ** (1.0 / _SRGB_GAMMA_EXPONENT))
+
+
 def _bpy_image(name: str, arr: ndarray, alpha: bool, colorspace: str) -> bpy.types.Image:
-    """Create a bpy Image from float32 (H, W, 3 or 4)."""
+    """Create a bpy Image from float32 (H, W, 3 or 4).
+
+    arr must already be in the target colorspace:
+      - sRGB images: pass sRGB-encoded values (matching what foreach_get returns).
+      - Non-Color images: pass raw/linear values.
+    """
     h, w = arr.shape[:2]
     img = bpy.data.images.new(name, width=w, height=h, alpha=alpha, float_buffer=False)
     img.colorspace_settings.name = colorspace
@@ -429,24 +453,21 @@ def _save(bpy_img: bpy.types.Image, path: str, lossless: bool, quality: int, dry
     if dry_run:
         return
     bpy_img.pack()
-    bpy_img.filepath_raw = path
-    bpy_img.file_format = 'WEBP'
-    # Force RGBA WebP via save_render with Raw view transform (no color management).
+    # save_render forces RGBA output; img.save() defaults to RGB.
+    # 'Standard' view transform does sRGB->linear->sRGB (identity for stored sRGB values).
+    # 'Raw' passes non-colour data (ORM, normals) through unchanged.
+    is_color = bpy_img.colorspace_settings.name == 'sRGB'
     scene = bpy.context.scene
-    vs = scene.view_settings
-    rs = scene.render.image_settings
-    prev = (rs.file_format, rs.color_mode, rs.quality,
-            vs.view_transform, vs.look, vs.exposure, vs.gamma)
-    rs.file_format = 'WEBP'
-    rs.color_mode = 'RGBA'
-    rs.quality = 100 if lossless else quality
-    vs.view_transform = 'Raw'
-    vs.look = 'None'
-    vs.exposure = 0.0
-    vs.gamma = 1.0
-    bpy_img.save_render(filepath=path, scene=scene)
-    rs.file_format, rs.color_mode, rs.quality = prev[0], prev[1], prev[2]
-    vs.view_transform, vs.look, vs.exposure, vs.gamma = prev[3], prev[4], prev[5], prev[6]
+    rs, vs = scene.render.image_settings, scene.view_settings
+    saved = (rs.file_format, rs.color_mode, rs.quality,
+             vs.view_transform, vs.look, vs.exposure, vs.gamma)
+    try:
+        rs.file_format, rs.color_mode, rs.quality = 'WEBP', 'RGBA', 100 if lossless else quality
+        vs.view_transform, vs.look, vs.exposure, vs.gamma = ('Standard' if is_color else 'Raw'), 'None', 0.0, 1.0
+        bpy_img.save_render(filepath=path, scene=scene)
+    finally:
+        rs.file_format, rs.color_mode, rs.quality       = saved[0], saved[1], saved[2]
+        vs.view_transform, vs.look, vs.exposure, vs.gamma = saved[3], saved[4], saved[5], saved[6]
 
 
 def _load_slot(tex: TexSrc, h: int, w: int, pbr: PBRMat, slot_name: str) -> ndarray | None:
@@ -527,7 +548,9 @@ def composite(
             else:
                 arr = np.ones((h, w, 4), dtype=np.float32)
                 for i, v in enumerate(pbr.base_color_factor):
-                    arr[:, :, i] = v
+                    # base_color_factor is linear; convert RGB to sRGB to match
+                    # the sRGB-encoded values that foreach_get returns for textures.
+                    arr[:, :, i] = _linear_to_srgb(v) if i < 3 else v
 
             if pbr.needs_composite_alpha:
                 alpha_arr = _load_slot(pbr.alpha, h, w, pbr, 'Alpha')
@@ -535,6 +558,10 @@ def composite(
                     ch = _channel(alpha_arr, pbr.alpha.channel)
                     if ch.ndim == 3 and ch.shape[2] > 1:
                         ch = ch[:, :, 0:1]
+                    # foreach_get returns raw sRGB-encoded bytes; Blender's shader
+                    # decodes them to linear before feeding any socket, including Alpha.
+                    if pbr.alpha.node.image.colorspace_settings.name == 'sRGB':
+                        ch = _srgb_to_linear_arr(ch)
                     arr = arr.copy()
                     arr[:, :, 3:4] = ch
                     print('composited separate alpha into base color A channel')
@@ -703,7 +730,7 @@ def main() -> None:
 
     # Sweep phase
     used, mat_to_model = collect_used_materials()
-    all_mats = [m for m in bpy.data.materials if m.use_nodes]
+    all_mats = [m for m in bpy.data.materials]
     orphaned = [m for m in all_mats if m not in used]
     process_mats = [m for m in all_mats if m in used]
 
