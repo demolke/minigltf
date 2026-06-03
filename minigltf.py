@@ -144,7 +144,7 @@ def mini_export(output_file: str) -> None:
         _bin_size += _nl * (12 + 12 + 8)                      # pos + normal + uv0
         if len(_md.uv_layers) > 1: _bin_size += _nl * 8       # uv1
         _is_skinned = any(mod.type == 'ARMATURE' and mod.object for mod in _o.modifiers)
-        if _is_skinned: _bin_size += _nl * (4 + 16)            # joints + weights
+        if _is_skinned: _bin_size += _nl * (8 + 16)            # joints (uint16) + weights
         _bin_size += _nt * 12                                   # indices
         if _md.shape_keys and len(_md.shape_keys.key_blocks) > 1:
             _bin_size += (len(_md.shape_keys.key_blocks) - 1) * _nl * 12
@@ -340,9 +340,9 @@ def mini_export(output_file: str) -> None:
                 jsn.write(b',"JOINTS_0":')
                 jsn.write(str(len(accessors)).encode())
                 offset = bchunk.tell()
-                _jidx_loop = bchunk.view(n_loops * 4, dtype=np.uint8).reshape(n_loops, 4)
-                accessors.append({'type': '"VEC4"', 'componentType': 5121, 'count': n_loops})
-                bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 4, 'target': 34962})
+                _jidx_loop = bchunk.view(n_loops * 4, dtype=np.uint16).reshape(n_loops, 4)
+                accessors.append({'type': '"VEC4"', 'componentType': 5123, 'count': n_loops})
+                bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 8, 'target': 34962})
 
                 jsn.write(b',"WEIGHTS_0":')
                 jsn.write(str(len(accessors)).encode())
@@ -357,14 +357,14 @@ def mini_export(output_file: str) -> None:
                 vgroups = meshes[i].vertex_groups
 
                 # Pre-compute group_index -> joint_index array to avoid dict lookup per vertex
-                _group_to_joint = np.zeros(len(vgroups), dtype=np.uint8)
+                _group_to_joint = np.zeros(len(vgroups), dtype=np.uint16)
                 for vg in vgroups:
                     if vg.name in joint_map:
                         _group_to_joint[vg.index] = joint_map[vg.name]
 
                 # Build per-vertex joint index / weight arrays (4 influences max).
                 # Use float64 to match original precision before the final float32 cast.
-                _jidx = np.zeros((n_verts, 4), dtype=np.uint8)
+                _jidx = np.zeros((n_verts, 4), dtype=np.uint16)
                 _jwt64 = np.zeros((n_verts, 4), dtype=np.float64)
                 for vi, v in enumerate(m.vertices):
                     for k, g in enumerate(v.groups[:4]):
