@@ -451,8 +451,9 @@ def mini_export(output_file: str) -> None:
                 jsn.write(b']')
 
             # Material
-            jsn.write(b',"material":')
-            jsn.write(str(materials.index(m.materials[0])).encode())
+            if m.materials and m.materials[0] is not None:
+                jsn.write(b',"material":')
+                jsn.write(str(materials.index(m.materials[0])).encode())
             jsn.write(b'}]')
 
             # Blendshape names
@@ -785,8 +786,20 @@ def mini_export(output_file: str) -> None:
                     continue
 
                 name = name.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
-                bone_name, channel = name.split('.')
-                bone = armature.bones[bone_name]
+                parts = name.rsplit('.', 1)
+                if len(parts) != 2:
+                    continue
+                bone_name, channel = parts
+                bone = None
+                for _arm in bpy.data.armatures:
+                    if bone_name in _arm.bones:
+                        bone = _arm.bones[bone_name]
+                        break
+                if bone is None or bone not in objs:
+                    continue
+                if channel not in CHANNEL_MAPPING:
+                    print(f"[minigltf] WARNING: bone '{bone_name}' uses unsupported channel '{channel}' — skipping (convert to quaternion)")
+                    continue
 
                 jsn.write(b'{"sampler":')
                 jsn.write(str(sampleridx).encode())
@@ -821,8 +834,19 @@ def mini_export(output_file: str) -> None:
                     continue
 
                 name = name.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
-                bone_name, channel = name.split('.')
-                bone = armature.bones[bone_name]
+                parts = name.rsplit('.', 1)
+                if len(parts) != 2:
+                    continue
+                bone_name, channel = parts
+                bone = None
+                for _arm in bpy.data.armatures:
+                    if bone_name in _arm.bones:
+                        bone = _arm.bones[bone_name]
+                        break
+                if bone is None or bone not in objs:
+                    continue
+                if channel not in CHANNEL_MAPPING:
+                    continue
 
                 if bone.parent:
                     correction = (bone.parent.matrix_local.inverted_safe() @ bone.matrix_local)

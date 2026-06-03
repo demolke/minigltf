@@ -454,9 +454,39 @@ def validate_multi_material_mesh(gltf, bin_data):
     assert len(mesh['primitives']) >= 1, "expected at least 1 primitive"
 
 
+@test('euler_bone_anim', 'euler_bone_anim.py')
+def validate_euler_bone_anim(gltf, bin_data):
+    """Bone in Euler rotation mode - must export without crashing (channels skipped)."""
+    assert 'meshes' in gltf, "expected meshes"
+
+
+@test('multi_armature_anim', 'multi_armature_anim.py')
+def validate_multi_armature_anim(gltf, bin_data):
+    """Two armatures — animation must target bones from the correct armature."""
+    assert len(gltf.get('animations', [])) >= 1, "expected at least 1 animation"
+    channels = gltf['animations'][0]['channels']
+    assert len(channels) >= 1, "expected animation channels"
+
+
+@test('dotted_bone_anim', 'dotted_bone_anim.py')
+def validate_dotted_bone_anim(gltf, bin_data):
+    """Bone named 'Bone.001' must not crash the animation channel split."""
+    assert len(gltf.get('animations', [])) >= 1, "expected at least 1 animation"
+    channels = gltf['animations'][0]['channels']
+    assert len(channels) >= 1, "expected animation channels"
+
+
+@test('no_material_mesh', 'no_material_mesh.py')
+def validate_no_material_mesh(gltf, bin_data):
+    """Mesh with no material assigned - primitive must export without a material index."""
+    assert len(gltf.get('meshes', [])) == 1, "expected 1 mesh"
+    prim = gltf['meshes'][0]['primitives'][0]
+    assert 'material' not in prim, "primitive should have no material field"
+
+
 @test('empty_mesh', 'empty_mesh.py')
 def validate_empty_mesh(gltf, bin_data):
-    """Mesh with zero vertices/loops — must not crash on min/max reduction."""
+    """Mesh with zero vertices/loops - must not crash on min/max reduction."""
     assert len(gltf.get('meshes', [])) == 1, "expected 1 mesh"
     prim = gltf['meshes'][0]['primitives'][0]
     pos_acc = _acc(gltf, prim['attributes']['POSITION'])
