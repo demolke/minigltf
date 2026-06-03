@@ -454,6 +454,17 @@ def validate_multi_material_mesh(gltf, bin_data):
     assert len(mesh['primitives']) >= 1, "expected at least 1 primitive"
 
 
+@test('empty_mesh', 'empty_mesh.py')
+def validate_empty_mesh(gltf, bin_data):
+    """Mesh with zero vertices/loops — must not crash on min/max reduction."""
+    assert len(gltf.get('meshes', [])) == 1, "expected 1 mesh"
+    prim = gltf['meshes'][0]['primitives'][0]
+    pos_acc = _acc(gltf, prim['attributes']['POSITION'])
+    assert pos_acc['count'] == 0, f"expected count 0, got {pos_acc['count']}"
+    assert pos_acc['min'] == [0.0, 0.0, 0.0], "expected zero min"
+    assert pos_acc['max'] == [0.0, 0.0, 0.0], "expected zero max"
+
+
 @test('shared_material_meshes', 'shared_material_meshes.py')
 def validate_shared_material_meshes(gltf, bin_data):
     """Two meshes sharing one material - 2 meshes, 1 material."""

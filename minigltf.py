@@ -286,8 +286,12 @@ def mini_export(output_file: str) -> None:
             _out[:, 0] = _base_flat[_lx]
             _out[:, 1] = _base_flat[_lz]   # z
             _out[:, 2] = -_base_flat[_ly]  # -y
-            minv = mathutils.Vector(_out.min(axis=0).tolist())
-            maxv = mathutils.Vector(_out.max(axis=0).tolist())
+            if n_loops > 0:
+                minv = mathutils.Vector(_out.min(axis=0).tolist())
+                maxv = mathutils.Vector(_out.max(axis=0).tolist())
+            else:
+                minv = mathutils.Vector((0.0, 0.0, 0.0))
+                maxv = mathutils.Vector((0.0, 0.0, 0.0))
 
             timings['positions'] = timings.get('positions', 0.0) + time.perf_counter() - _t
             accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': n_loops, 'min': minv, 'max': maxv})
@@ -318,9 +322,11 @@ def mini_export(output_file: str) -> None:
             _t = time.perf_counter()
 
             _uv0 = bchunk.view(n_loops * 2)
-            m.uv_layers[0].uv.foreach_get('vector', _uv0)
+            if m.uv_layers:
+                m.uv_layers[0].uv.foreach_get('vector', _uv0)
             _uv0 = _uv0.reshape(n_loops, 2)
-            _uv0[:, 1] = 1.0 - _uv0[:, 1]
+            if n_loops > 0:
+                _uv0[:, 1] = 1.0 - _uv0[:, 1]
 
             accessors.append({'type': '"VEC2"', 'componentType': 5126, 'count': n_loops})
             bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 2 * 4, 'target': 34962})
