@@ -484,15 +484,41 @@ def validate_no_material_mesh(gltf, bin_data):
     assert 'material' not in prim, "primitive should have no material field"
 
 
+@test('stress_test', 'stress_test.py', timeout=120)
+def validate_stress_test(gltf, bin_data):
+    """Comprehensive stress test: multiple armatures, meshes, edge-case animations."""
+    # Two non-empty meshes (Mesh1 and Mesh2); EmptyMesh skipped
+    assert len(gltf.get('meshes', [])) == 2, f"expected 2 meshes, got {len(gltf.get('meshes', []))}"
+    # Two skins (one per armature)
+    assert len(gltf.get('skins', [])) == 2, f"expected 2 skins, got {len(gltf.get('skins', []))}"
+    # Mesh1 has JOINTS_0 and WEIGHTS_0
+    prim1 = gltf['meshes'][0]['primitives'][0]
+    assert 'JOINTS_0' in prim1['attributes'], "Mesh1 should have JOINTS_0"
+    assert 'WEIGHTS_0' in prim1['attributes'], "Mesh1 should have WEIGHTS_0"
+    # Mesh1 has shape key targets
+    assert 'targets' in prim1, "Mesh1 should have blend shape targets"
+    # Mesh1 has two UV layers
+    assert 'TEXCOORD_1' in prim1['attributes'], "Mesh1 should have TEXCOORD_1"
+    # Mesh1 has a material; Mesh2 has none
+    assert 'material' in prim1, "Mesh1 should have a material"
+    prim2 = gltf['meshes'][1]['primitives'][0]
+    assert 'material' not in prim2, "Mesh2 should have no material"
+    # At least one animation exported
+    assert len(gltf.get('animations', [])) >= 1, "expected at least 1 animation"
+    # No sampler/channel count mismatch
+    for anim in gltf.get('animations', []):
+        assert len(anim['channels']) == len(anim['samplers']), f"animation '{anim['name']}': channels/samplers count mismatch"
+    # All sampler indices valid
+    for anim in gltf.get('animations', []):
+        n_samplers = len(anim['samplers'])
+        for ch in anim['channels']:
+            assert ch['sampler'] < n_samplers, f"channel references out-of-bounds sampler {ch['sampler']} (only {n_samplers})"
+
+
 @test('empty_mesh', 'empty_mesh.py')
 def validate_empty_mesh(gltf, bin_data):
-    """Mesh with zero vertices/loops - must not crash on min/max reduction."""
-    assert len(gltf.get('meshes', [])) == 1, "expected 1 mesh"
-    prim = gltf['meshes'][0]['primitives'][0]
-    pos_acc = _acc(gltf, prim['attributes']['POSITION'])
-    assert pos_acc['count'] == 0, f"expected count 0, got {pos_acc['count']}"
-    assert pos_acc['min'] == [0.0, 0.0, 0.0], "expected zero min"
-    assert pos_acc['max'] == [0.0, 0.0, 0.0], "expected zero max"
+    """Mesh with zero vertices - skipped entirely so Godot doesn't reject it."""
+    assert len(gltf.get('meshes', [])) == 0, "empty mesh should not be exported"
 
 
 @test('shared_material_meshes', 'shared_material_meshes.py')

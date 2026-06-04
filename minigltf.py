@@ -128,7 +128,7 @@ def mini_export(output_file: str) -> None:
             continue
 
         for m in o.data.materials:
-            if m not in materials:
+            if m is not None and m not in materials:
                 materials.append(m)
 
     timings['setup'] = time.perf_counter() - _t
@@ -140,6 +140,8 @@ def mini_export(output_file: str) -> None:
             continue
         _md = _o.data
         _md.calc_loop_triangles()
+        if len(_md.loops) == 0:
+            continue
         _nl = len(_md.loops); _nt = len(_md.loop_triangles)
         _bin_size += _nl * (12 + 12 + 8)                      # pos + normal + uv0
         if len(_md.uv_layers) > 1: _bin_size += _nl * 8       # uv1
@@ -204,9 +206,10 @@ def mini_export(output_file: str) -> None:
         jsn.write(b']')
 
         if isinstance(o, bpy.types.Object) and o.type == 'MESH':
-            meshes.append(o)
-            jsn.write(b',"mesh":')
-            jsn.write(str(meshes.index(o)).encode())
+            if len(o.data.loops) > 0:
+                meshes.append(o)
+                jsn.write(b',"mesh":')
+                jsn.write(str(meshes.index(o)).encode())
 
             for m in o.modifiers:
                 if m.type == 'ARMATURE' and m.object:
@@ -227,15 +230,17 @@ def mini_export(output_file: str) -> None:
         if isinstance(o, bpy.types.Object) and o.type == 'ARMATURE':
             children += [b for b in o.data.bones if b.parent is None]
 
-        # Child nodes
+        # Child nodes (only those tracked in objs)
         if children:
-            jsn.write(b',"children":[')
-            for c in range(len(children)):
-                child = children[c]
-                jsn.write(str(objs.index(child)).encode())
-                if c < len(children) - 1:
-                    jsn.write(b',')
-            jsn.write(b']')
+            valid_children = [c for c in children if c in objs]
+            if valid_children:
+                jsn.write(b',"children":[')
+                for c in range(len(valid_children)):
+                    child = valid_children[c]
+                    jsn.write(str(objs.index(child)).encode())
+                    if c < len(valid_children) - 1:
+                        jsn.write(b',')
+                jsn.write(b']')
 
         jsn.write(b'}')
         if i < len(objs) - 1:
@@ -486,9 +491,9 @@ def mini_export(output_file: str) -> None:
             emissive = ''
             normalStrength = 1.0
 
-            bsdf = next((n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            bsdf = next((n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None) if m.use_nodes and m.node_tree else None
 
-            for link in m.node_tree.links:
+            for link in (m.node_tree.links if m.use_nodes and m.node_tree else []):
                 if link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name == 'Base Color' and link.from_node.type == 'TEX_IMAGE':
                     baseColor = link.from_node.image.filepath
 
@@ -775,108 +780,89 @@ def mini_export(output_file: str) -> None:
             jsn.write(_je(a.name))
             jsn.write(b',"channels":[')
 
-            # Expects all channel parts to have same keyframes
-            sampleridx = 0
-            curvekeys = sorted(curves.keys())
-            bone_channels_written = 0
-            for c in range(len(curvekeys)):
-                name = curvekeys[c]
-
-                if not name.startswith('pose.bones') or armature is None:
+            # Pre-compute valid bone animation entries so channels and samplers
+            # share identical filtering and stay in sync.
+            _valid_bone_anims = []
+            for _bname in sorted(curves.keys()):
+                if not _bname.startswith('pose.bones') or armature is None:
                     continue
-
-                name = name.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
-                parts = name.rsplit('.', 1)
-                if len(parts) != 2:
+                _stripped = _bname.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
+                _parts = _stripped.rsplit('.', 1)
+                if len(_parts) != 2:
                     continue
-                bone_name, channel = parts
-                bone = None
+                _bone_name, _channel = _parts
+                if _channel not in CHANNEL_MAPPING:
+                    print(f"[minigltf] WARNING: bone '{_bone_name}' uses unsupported channel '{_channel}' — skipping")
+                    continue
+                _bone = None
                 for _arm in bpy.data.armatures:
-                    if bone_name in _arm.bones:
-                        bone = _arm.bones[bone_name]
+                    if _bone_name in _arm.bones:
+                        _bone = _arm.bones[_bone_name]
                         break
-                if bone is None or bone not in objs:
+                if _bone is None or _bone not in objs:
                     continue
-                if channel not in CHANNEL_MAPPING:
-                    print(f"[minigltf] WARNING: bone '{bone_name}' uses unsupported channel '{channel}' — skipping (convert to quaternion)")
+                _curveset = curves[_bname]
+                _primary_fc = next((fc for fc in _curveset if fc is not None), None)
+                if _primary_fc is None or len(_primary_fc.keyframe_points) == 0:
                     continue
+                _valid_bone_anims.append((_bone, _channel, _curveset, _primary_fc))
 
+            _sk_first_fc = next(iter(shape_key_curves.values()), None) if shape_key_curves else None
+            _has_sk_anim = bool(
+                _sk_first_fc and sk_mesh_obj and sk_mesh_obj in meshes
+                and sk_mesh_obj.data.shape_keys
+                and len(sk_mesh_obj.data.shape_keys.key_blocks) > 1
+                and len(_sk_first_fc.keyframe_points) > 0
+            )
+
+            sampleridx = 0
+            for idx, (_bone, _channel, _curveset, _primary_fc) in enumerate(_valid_bone_anims):
+                if idx > 0:
+                    jsn.write(b',')
                 jsn.write(b'{"sampler":')
                 jsn.write(str(sampleridx).encode())
                 jsn.write(b',"target":{"node":')
-                jsn.write(str(objs.index(bone)).encode())
+                jsn.write(str(objs.index(_bone)).encode())
                 jsn.write(b',"path":"')
-                jsn.write(CHANNEL_MAPPING[channel].encode())
+                jsn.write(CHANNEL_MAPPING[_channel].encode())
                 jsn.write(b'"}}')
                 sampleridx += 1
-                bone_channels_written += 1
 
-                if c < len(curvekeys) - 1:
-                    jsn.write(b',')
-
-            if shape_key_curves and sk_mesh_obj:
-                if bone_channels_written > 0:
+            if _has_sk_anim:
+                if _valid_bone_anims:
                     jsn.write(b',')
                 jsn.write(b'{"sampler":')
                 jsn.write(str(sampleridx).encode())
                 jsn.write(b',"target":{"node":')
                 jsn.write(str(objs.index(sk_mesh_obj)).encode())
                 jsn.write(b',"path":"weights"}}')
-                sampleridx += 1
 
             jsn.write(b'],"samplers":[')
-            bone_samplers_written = 0
-            for c in range(len(curvekeys)):
-                name = curvekeys[c]
-                curveset = curves[name]
-
-                if not name.startswith('pose.bones') or armature is None:
-                    continue
-
-                name = name.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
-                parts = name.rsplit('.', 1)
-                if len(parts) != 2:
-                    continue
-                bone_name, channel = parts
-                bone = None
-                for _arm in bpy.data.armatures:
-                    if bone_name in _arm.bones:
-                        bone = _arm.bones[bone_name]
-                        break
-                if bone is None or bone not in objs:
-                    continue
-                if channel not in CHANNEL_MAPPING:
-                    continue
-
-                if bone.parent:
-                    correction = (bone.parent.matrix_local.inverted_safe() @ bone.matrix_local)
+            for idx, (_bone, _channel, _curveset, _primary_fc) in enumerate(_valid_bone_anims):
+                if idx > 0:
+                    jsn.write(b',')
+                if _bone.parent:
+                    correction = (_bone.parent.matrix_local.inverted_safe() @ _bone.matrix_local)
                 else:
-                    correction = axis_basis_change @ bone.matrix_local
+                    correction = axis_basis_change @ _bone.matrix_local
 
-                # Use the first present channel for timestamps; skip degenerate curves
-                _primary_fc = next((c for c in curveset if c is not None), None)
-                if _primary_fc is None:
-                    continue
+                fps_val = bpy.context.scene.render.fps * bpy.context.scene.render.fps_base
+                t_secs = [k.co.x / fps_val for k in _primary_fc.keyframe_points]
+                _n_kp = len(t_secs)
 
-                # timestamps
                 jsn.write(b'{"input":')
                 jsn.write(str(len(accessors)).encode())
                 offset = bchunk.tell()
-                fps_val = bpy.context.scene.render.fps * bpy.context.scene.render.fps_base
-                t_secs = [k.co.x / fps_val for k in _primary_fc.keyframe_points]
-                accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': len(t_secs), 'min': min(t_secs), 'max': max(t_secs)})
-                bufferViews.append({'byteOffset': offset, 'byteLength': len(t_secs) * 4})
+                accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': _n_kp, 'min': min(t_secs), 'max': max(t_secs)})
+                bufferViews.append({'byteOffset': offset, 'byteLength': _n_kp * 4})
                 _tt = time.perf_counter()
                 bchunk.write(np.asarray(t_secs, dtype=np.float32))
                 _t_anim_timestamps += time.perf_counter() - _tt
 
-                # Quaternion or Vector3
-                count = 4 if curveset[3] else 3
-
+                count = 4 if _curveset[3] else 3
                 jsn.write(b',"output":')
                 jsn.write(str(len(accessors)).encode())
                 offset = bchunk.tell()
-                _n_kp = len(_primary_fc.keyframe_points)
                 accessors.append({'type': f'"VEC{count}"', 'componentType': 5126, 'count': _n_kp})
                 bufferViews.append({'byteOffset': offset, 'byteLength': _n_kp * 4 * count})
 
@@ -884,13 +870,13 @@ def mini_export(output_file: str) -> None:
                 _vals = []
                 for t in range(_n_kp):
                     if count == 4:
-                        q = mathutils.Quaternion((_fc_val(curveset[0], t), _fc_val(curveset[1], t), _fc_val(curveset[2], t), _fc_val(curveset[3], t)))
+                        q = mathutils.Quaternion((_fc_val(_curveset[0], t), _fc_val(_curveset[1], t), _fc_val(_curveset[2], t), _fc_val(_curveset[3], t)))
                         result = (correction @ q.to_matrix().to_4x4()).to_quaternion()
                         _vals += (result.x, result.y, result.z, result.w)
-                    elif count == 3 and channel == 'scale':
-                        _vals += (_fc_val(curveset[0], t), _fc_val(curveset[1], t), _fc_val(curveset[2], t))
-                    elif count == 3 and channel == 'location':
-                        v = mathutils.Vector((_fc_val(curveset[0], t), _fc_val(curveset[1], t), _fc_val(curveset[2], t)))
+                    elif count == 3 and _channel == 'scale':
+                        _vals += (_fc_val(_curveset[0], t), _fc_val(_curveset[1], t), _fc_val(_curveset[2], t))
+                    elif count == 3 and _channel == 'location':
+                        v = mathutils.Vector((_fc_val(_curveset[0], t), _fc_val(_curveset[1], t), _fc_val(_curveset[2], t)))
                         location = (correction @ mathutils.Matrix.Translation(v).to_4x4()).to_translation()
                         _vals += (location.x, location.y, location.z)
                 bchunk.write(np.asarray(_vals, dtype=np.float32))
@@ -899,20 +885,15 @@ def mini_export(output_file: str) -> None:
                 else:
                     _t_anim_location += time.perf_counter() - _tt
 
-                jsn.write(b'}')
-                bone_samplers_written += 1
+                jsn.write(b',"interpolation":"LINEAR"}')
 
-                if c < len(curvekeys) - 1:
-                    jsn.write(b',')
-
-            if shape_key_curves and sk_mesh_obj:
-                if bone_samplers_written > 0:
+            if _has_sk_anim:
+                if _valid_bone_anims:
                     jsn.write(b',')
                 key_blocks = sk_mesh_obj.data.shape_keys.key_blocks
                 morph_names = [kb.name for kb in key_blocks[1:]]
                 num_morphs = len(morph_names)
-                first_fc = next(iter(shape_key_curves.values()))
-                keyframe_times = [kp.co.x for kp in first_fc.keyframe_points]
+                keyframe_times = [kp.co.x for kp in _sk_first_fc.keyframe_points]
                 num_frames = len(keyframe_times)
                 fps = bpy.context.scene.render.fps * bpy.context.scene.render.fps_base
 
@@ -1024,9 +1005,10 @@ def mini_export(output_file: str) -> None:
         jsn.write(b'],')
 
     # Buffers section
-    jsn.write(b'"buffers":[{"byteLength":')
-    jsn.write(str(bchunk.tell()).encode())
-    jsn.write(b'}],')
+    if bchunk.tell() > 0:
+        jsn.write(b'"buffers":[{"byteLength":')
+        jsn.write(str(bchunk.tell()).encode())
+        jsn.write(b'}],')
 
     # Scene section
     jsn.write(b'"scene":0,\n')
@@ -1050,14 +1032,15 @@ def mini_export(output_file: str) -> None:
 
     _bchunk_len = bchunk.tell()
     _jsn_bytes = jsn.getbuffer()
-    _total_length = 28 + len(_jsn_bytes) + _bchunk_len
+    # Omit BIN chunk when there's no binary data — Godot rejects byteLength:0
+    _bin_chunk = struct.pack('<II', _bchunk_len, 0x004E4942) + bytes(bchunk.getbuffer()) if _bchunk_len > 0 else b''
+    _total_length = 12 + 8 + len(_jsn_bytes) + len(_bin_chunk)
 
     with open(output_file, 'wb') as f:
         f.write(struct.pack('<III', 0x46546C67, 2, _total_length))  # GLB header
         f.write(struct.pack('<II', len(_jsn_bytes), 0x4E4F534A))    # JSON chunk header
         f.write(_jsn_bytes)
-        f.write(struct.pack('<II', _bchunk_len, 0x004E4942))        # BIN chunk header
-        f.write(bchunk.getbuffer())
+        f.write(_bin_chunk)
     timings['file_io'] = time.perf_counter() - _t
 
     for o in edited:
