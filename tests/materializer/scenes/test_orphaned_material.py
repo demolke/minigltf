@@ -20,7 +20,7 @@ def main():
     tex = nodes.new('ShaderNodeTexImage')
     tex.image = bpy.data.images.load(bc_path)
     links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
-    # Note: no obj.data.materials.append(mat) — orphaned!
+    # Note: no obj.data.materials.append(mat) - orphaned!
 
     # Create a mesh object with NO materials so the scene has at least one object
     make_mesh_object('EmptyMesh')

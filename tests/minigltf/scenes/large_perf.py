@@ -1,6 +1,6 @@
 """Blender scene: large performance benchmark
 ~100k vertex sphere, 40-bone skeleton,
-skin weights, 50 shape keys, 30 animations × 1440 frames."""
+skin weights, 50 shape keys, 30 animations x 1440 frames."""
 
 import sys
 import os
@@ -130,7 +130,7 @@ def build_mesh():
     loop_vi = np.empty(n_loops, dtype=np.int32)
     mesh.loops.foreach_get("vertex_index", loop_vi)
 
-    # Spherical UV: u = atan2(y, x) / (2π) % 1,  v = (z + 1) / 2
+    # Spherical UV: u = atan2(y, x) / (2*PI) % 1,  v = (z + 1) / 2
     lx = vco[loop_vi, 0]
     ly = vco[loop_vi, 1]
     lz = vco[loop_vi, 2]
@@ -242,9 +242,9 @@ def add_shape_keys(obj, mesh, vco):
 
 
 def add_animations(arm_obj):
-    """Phase 5: 3 animations × 1440 frames, keyframe every 48 frames, all 40 bones."""
+    """Phase 5: 3 animations x 1440 frames, keyframe every 48 frames, all 40 bones."""
     t0 = time.time()
-    print("[5/6] Building animations (30 × 1440 frames × 40 bones)...", flush=True)
+    print("[5/6] Building animations (30 x 1440 frames x 40 bones)...", flush=True)
 
     bone_names = [bd[0] for bd in BONE_DEFS]
     n_bones = len(bone_names)

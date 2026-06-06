@@ -65,34 +65,42 @@ def _je(s: str) -> bytes:
     return json.dumps(s).encode()
 
 
-def _image_uri(blender_filepath: str, output_file: str) -> str:
+def _image_uri(img, output_file: str) -> str:
     """Return a URI for a texture, relative to the output GLB location.
 
-    Blender stores image paths relative to the .blend file (// prefix).
-    The GLB may be written to a completely different directory (e.g.
-    .godot/imported/), so we resolve to an absolute path first, then
-    compute a new relative path anchored to the GLB output directory.
+    For linked images the filepath is relative to the LIBRARY file, not the
+    current .blend - resolve via img.library when present.
     """
-    abs_tex = bpy.path.abspath(blender_filepath)
+    fp = img.filepath
+    if getattr(img, 'library', None):
+        lib_dir = os.path.dirname(bpy.path.abspath(img.library.filepath))
+        rel_fp = fp[2:] if fp.startswith('//') else fp
+        abs_tex = os.path.normpath(os.path.join(lib_dir, rel_fp))
+    else:
+        abs_tex = bpy.path.abspath(fp)
     glb_dir = os.path.dirname(os.path.abspath(output_file))
     try:
         rel = os.path.relpath(abs_tex, glb_dir)
     except ValueError:
         # os.path.relpath raises ValueError on Windows when paths are on
-        # different drives — fall back to the absolute path.
+        # different drives - fall back to the absolute path.
         rel = abs_tex
     return rel.replace('\\', '/')
 
-def mini_export(output_file: str) -> None:
+def mini_export(output_file: str, split: bool = True) -> None:
     # If we're in Edit Mode, we have to switch to object mode first.
     edited = []
-    for o in bpy.data.objects:
+    for o in bpy.context.scene.objects:
         if o.mode == 'EDIT':
             edited.append(o)
             bpy.context.view_layer.objects.active = o
             bpy.ops.object.mode_set(mode='OBJECT')
 
-    axis_basis_change = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, -1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
+    axis_basis_change = mathutils.Matrix(
+        ((1.0, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0, 0.0),
+        (0.0, -1.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0)))
 
     _t = time.perf_counter()
 
@@ -100,13 +108,40 @@ def mini_export(output_file: str) -> None:
     jsn.write(b'{')
     jsn.write(b'"asset":{"version":"2.0","generator":"minigltf"},\n')
 
-    objs = [o for o in bpy.data.objects if o.type in ['MESH', 'ARMATURE']]
-    for a in bpy.data.armatures:
-        objs += [b for b in a.bones]
+    # World flag: export_non_linked_only = True -> skip objects that come
+    # directly from a linked library (only local and override objects are kept).
+    _world = bpy.context.scene.world
+    _non_linked_only = bool(_world.get('export_non_linked_only', False)) if _world else False
+
+    # Linked objects that have a local override: always skip the original so we
+    # never export both the linked source and its override duplicate.
+    _overridden_originals = set()
+    for _o in bpy.context.scene.objects:
+        _ovlib = getattr(_o, 'override_library', None)
+        if _ovlib and getattr(_ovlib, 'reference', None):
+            _overridden_originals.add(_ovlib.reference)
+
+    _scene_objs = bpy.context.scene.objects
+    objs = []
+    for _o in _scene_objs:
+        if _o.type not in ('MESH', 'ARMATURE'):
+            continue
+        if _o in _overridden_originals:
+            continue
+        if _non_linked_only and _o.library is not None:
+            continue
+        objs.append(_o)
+
+    # Add bones only from armatures that passed the filter above.
+    _scene_armatures = set()
+    for _o in list(objs):
+        if _o.type == 'ARMATURE':
+            _scene_armatures.add(_o.data)
+            objs += list(_o.data.bones)
 
     world_matrix = {}
 
-    for a in bpy.data.objects:
+    for a in _scene_objs:
         if a.type != 'ARMATURE':
             continue
         armature = a.data
@@ -133,7 +168,7 @@ def mini_export(output_file: str) -> None:
 
     timings['setup'] = time.perf_counter() - _t
     # Pre-scan to size the binary buffer accurately and avoid costly reallocs in
-    # Blender's allocator (observed 29× slowdown vs a single pre-allocated buffer).
+    # Blender's allocator (observed 29x slowdown vs a single pre-allocated buffer).
     _bin_size = 0
     for _o in objs:
         if not isinstance(_o, bpy.types.Object) or _o.type != 'MESH':
@@ -152,7 +187,8 @@ def mini_export(output_file: str) -> None:
             _bin_size += (len(_md.shape_keys.key_blocks) - 1) * _nl * 12
     for _sk in [o for o in objs if isinstance(o, bpy.types.Object) and o.type == 'ARMATURE']:
         _bin_size += len(_sk.data.bones) * 64                  # inverse bind matrices
-    for _a in bpy.data.actions:
+    _local_actions = [_a for _a in bpy.data.actions if not getattr(_a, 'library', None)]
+    for _a in _local_actions:
         for _f in _action_fcurves(_a):
             _bin_size += len(_f.keyframe_points) * 32          # anim samples (rough)
     bchunk = _BinWriter(_bin_size + 65536)
@@ -346,7 +382,7 @@ def mini_export(output_file: str) -> None:
                 bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 2 * 4, 'target': 34962})
             timings['uvs'] = timings.get('uvs', 0.0) + time.perf_counter() - _t
 
-            # Joints and Weights — only for skinned meshes
+            # Joints and Weights - only for skinned meshes
             if meshes[i] in joints_index:
                 jsn.write(b',"JOINTS_0":')
                 jsn.write(str(len(accessors)).encode())
@@ -438,7 +474,7 @@ def mini_export(output_file: str) -> None:
                     _out_sk[:, 2] *= -1
 
                     # Compute min/max on per-vertex delta (n_verts elements, contiguous)
-                    # rather than on per-loop output (4× larger, same values, strided columns)
+                    # rather than on per-loop output (4x larger, same values, strided columns)
                     _dk_x = _sk_buf[0::3] - _base_flat[0::3]
                     _dk_y = _sk_buf[1::3] - _base_flat[1::3]
                     _dk_z = _sk_buf[2::3] - _base_flat[2::3]
@@ -485,37 +521,37 @@ def mini_export(output_file: str) -> None:
         for i in range(len(materials)):
             m = materials[i]
 
-            baseColor = ''
-            normal = ''
-            metallicRoughness = ''
-            emissive = ''
+            baseColor = None
+            normal = None
+            metallicRoughness = None
+            emissive = None
             normalStrength = 1.0
 
             bsdf = next((n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None) if m.use_nodes and m.node_tree else None
 
             for link in (m.node_tree.links if m.use_nodes and m.node_tree else []):
                 if link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name == 'Base Color' and link.from_node.type == 'TEX_IMAGE':
-                    baseColor = link.from_node.image.filepath
+                    baseColor = link.from_node.image
 
                 if link.to_node.type == 'NORMAL_MAP' and link.to_socket.name == 'Color' and link.from_node.type == 'TEX_IMAGE':
-                    normal = link.from_node.image.filepath
+                    normal = link.from_node.image
                     normalStrength = link.to_node.inputs['Strength'].default_value
 
                 if link.from_node.type == 'SEPARATE_COLOR' and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name in ('Roughness', 'Metallic'):
                     for im in m.node_tree.links:
                         if im.from_node.type == 'TEX_IMAGE' and im.to_node == link.from_node:
-                            metallicRoughness = im.from_node.image.filepath
+                            metallicRoughness = im.from_node.image
 
                 if link.from_node.type == 'TEX_IMAGE' and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name in ('Roughness', 'Metallic'):
-                    metallicRoughness = link.from_node.image.filepath
+                    metallicRoughness = link.from_node.image
 
                 # Emission Color socket name changed between Blender 3.x and 4.x
                 if (link.from_node.type == 'TEX_IMAGE' and link.to_node.type == 'BSDF_PRINCIPLED'
                         and link.to_socket.name in ('Emission', 'Emission Color')):
-                    emissive = link.from_node.image.filepath
+                    emissive = link.from_node.image
 
             # Warn about node patterns that cannot be fully expressed in glTF.
-            # Export continues regardless — scalars fill missing texture slots.
+            # Export continues regardless - scalars fill missing texture slots.
             if bsdf:
                 def _direct_src(socket_name):
                     s = bsdf.inputs.get(socket_name)
@@ -530,7 +566,7 @@ def mini_export(output_file: str) -> None:
                     bc_node, _ = _direct_src('Base Color')
                     if alpha_node is not bc_node:
                         print(f'[minigltf] WARNING material "{m.name}": separate alpha texture '
-                              f'cannot be expressed in glTF — alpha channel will not be exported')
+                              f'cannot be expressed in glTF - alpha channel will not be exported')
 
                 # Separate metallic and roughness (different images)
                 m_node, _ = _direct_src('Metallic')
@@ -539,16 +575,16 @@ def mini_export(output_file: str) -> None:
                         r_node and r_node.type == 'TEX_IMAGE' and
                         m_node is not r_node):
                     print(f'[minigltf] WARNING material "{m.name}": metallic and roughness use '
-                          f'separate textures — glTF requires a single packed texture; '
+                          f'separate textures - glTF requires a single packed texture; '
                           f'only one channel will be exported')
 
-                # One of metallic/roughness is a texture, the other is a scalar —
+                # One of metallic/roughness is a texture, the other is a scalar -
                 # the scalar will be read from whatever value is in the unpacked channel
                 if (m_node and m_node.type == 'TEX_IMAGE') != (r_node and r_node.type == 'TEX_IMAGE'):
                     have  = 'metallic' if (m_node and m_node.type == 'TEX_IMAGE') else 'roughness'
                     other = 'roughness' if have == 'metallic' else 'metallic'
                     print(f'[minigltf] WARNING material "{m.name}": {have} has a texture but '
-                          f'{other} is a scalar — the {other} scalar cannot be preserved alongside '
+                          f'{other} is a scalar - the {other} scalar cannot be preserved alongside '
                           f'a packed texture; {other} will be read from the unpacked channel')
 
                 # Intermediate nodes on any PBR slot
@@ -558,7 +594,7 @@ def mini_export(output_file: str) -> None:
                         src = s.links[0].from_node
                         if src.type not in ('TEX_IMAGE', 'NORMAL_MAP', 'SEPARATE_COLOR'):
                             print(f'[minigltf] WARNING material "{m.name}": slot "{slot}" '
-                                  f'has unsupported node "{src.type}" — '
+                                  f'has unsupported node "{src.type}" - '
                                   f'texture will not be exported for this slot')
 
 
@@ -567,7 +603,7 @@ def mini_export(output_file: str) -> None:
             if metallicRoughness:
                 for link in m.node_tree.links:
                     if (link.from_node.type == 'TEX_IMAGE' and link.to_node.type == 'SEPARATE_COLOR'
-                            and link.from_node.image.filepath == metallicRoughness):
+                            and link.from_node.image == metallicRoughness):
                         isORM = True
                         break
 
@@ -743,11 +779,12 @@ def mini_export(output_file: str) -> None:
     _t_anim_rotation = 0.0
     _t_anim_location = 0.0
     _t_anim_morph = 0.0
-    if bpy.data.actions:
+    _local_actions = [a for a in bpy.data.actions if not getattr(a, 'library', None)]
+    if _local_actions:
         CHANNEL_MAPPING = {'location': 'translation', 'rotation_quaternion': 'rotation', 'scale': 'scale'}
         jsn.write(b'"animations":[')
-        for i in range(len(bpy.data.actions)):
-            a = bpy.data.actions[i]
+        for i in range(len(_local_actions)):
+            a = _local_actions[i]
 
             # Group channels together
             curves = {}
@@ -759,7 +796,7 @@ def mini_export(output_file: str) -> None:
                     curves[f.data_path] = [None, None, None, None]
                 curves[f.data_path][f.array_index] = f
 
-            armature = bpy.data.armatures[0] if bpy.data.armatures else None
+            armature = next(iter(_scene_armatures), None)
             if 'armature' in a:
                 armature = a['armature'].data
 
@@ -792,10 +829,10 @@ def mini_export(output_file: str) -> None:
                     continue
                 _bone_name, _channel = _parts
                 if _channel not in CHANNEL_MAPPING:
-                    print(f"[minigltf] WARNING: bone '{_bone_name}' uses unsupported channel '{_channel}' — skipping")
+                    print(f"[minigltf] WARNING: bone '{_bone_name}' uses unsupported channel '{_channel}' - skipping")
                     continue
                 _bone = None
-                for _arm in bpy.data.armatures:
+                for _arm in _scene_armatures:
                     if _bone_name in _arm.bones:
                         _bone = _arm.bones[_bone_name]
                         break
@@ -925,7 +962,7 @@ def mini_export(output_file: str) -> None:
 
             jsn.write(b']}')
 
-            if i < len(bpy.data.actions) - 1:
+            if i < len(_local_actions) - 1:
                 jsn.write(b',')
 
         jsn.write(b'],')
@@ -1032,7 +1069,7 @@ def mini_export(output_file: str) -> None:
 
     _bchunk_len = bchunk.tell()
     _jsn_bytes = jsn.getbuffer()
-    # Omit BIN chunk when there's no binary data — Godot rejects byteLength:0
+    # Omit BIN chunk when there's no binary data - Godot rejects byteLength:0
     _bin_chunk = struct.pack('<II', _bchunk_len, 0x004E4942) + bytes(bchunk.getbuffer()) if _bchunk_len > 0 else b''
     _total_length = 12 + 8 + len(_jsn_bytes) + len(_bin_chunk)
 

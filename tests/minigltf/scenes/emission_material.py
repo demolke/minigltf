@@ -1,7 +1,7 @@
 """Blender scene: two cubes testing emission export.
 
 EmitScalarMat uses a scalar emission color + strength (no texture).
-EmitTexMat would require an actual image file — skipped for simplicity;
+EmitTexMat would require an actual image file - skipped for simplicity;
 the scalar path already exercises the emissiveFactor code path.
 
 DoubleSidedMat tests use_backface_culling=False -> doubleSided:true.

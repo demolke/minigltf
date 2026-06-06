@@ -22,7 +22,7 @@ def main():
     mat, nodes, links, bsdf = new_material('AlphaOnlyMat')
     mat.blend_method = 'BLEND'
 
-    # Only alpha texture — no base color texture, BSDF Base Color stays at default (0.8)
+    # Only alpha texture - no base color texture, BSDF Base Color stays at default (0.8)
     a_tex = nodes.new('ShaderNodeTexImage')
     a_tex.image = bpy.data.images.load(alpha_path)
     a_tex.image.colorspace_settings.name = 'Non-Color'

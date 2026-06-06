@@ -52,7 +52,7 @@ def main():
     pixels, w, h = load_webp_pixels(orm_webp)
 
     if pixels.max() < 0.05:
-        print(f'FAIL: orm.webp is all black (max pixel={pixels.max():.4f}) — likely a save pipeline bug')
+        print(f'FAIL: orm.webp is all black (max pixel={pixels.max():.4f}) - likely a save pipeline bug')
         sys.exit(1)
 
     mid_y = h // 2

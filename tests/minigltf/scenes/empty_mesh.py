@@ -2,7 +2,7 @@
 
 - One mesh with zero vertices
 - One mesh with vertices but no faces (zero loops)
-Both must be skipped — no mesh primitive, no accessor count=0 error.
+Both must be skipped - no mesh primitive, no accessor count=0 error.
 """
 
 import sys

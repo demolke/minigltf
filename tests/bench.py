@@ -22,7 +22,7 @@ import argparse
 from pathlib import Path
 
 if 'bpy' not in sys.modules:
-    # Running outside Blender — print the command the user needs and exit.
+    # Running outside Blender - print the command the user needs and exit.
     blend = os.environ.get('BLENDER', 'blender')
     script = os.path.abspath(__file__)
     print(f"This script must run inside Blender. Example:")

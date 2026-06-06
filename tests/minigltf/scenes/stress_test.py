@@ -12,7 +12,7 @@
 - Animations with mismatched keyframe counts per channel
 - Euler rotation on one bone (skipped with warning)
 - An action with no valid channels (empty animation)
-- Child objects that are not mesh/armature (EMPTY) — must not crash
+- Child objects that are not mesh/armature (EMPTY) - must not crash
 - Two actions on the same armature
 """
 
@@ -86,7 +86,7 @@ def main():
     mat1 = make_material("Mat1", "//textures/base_color.png")
     mat2 = make_material("Mat2", "//textures/base_color.png")
     mesh1.data.materials.append(mat1)
-    mesh1.data.materials.append(mat2)  # second slot — only mat1 exported
+    mesh1.data.materials.append(mat2)  # second slot - only mat1 exported
 
     # Skin to arm1
     mod1 = mesh1.modifiers.new("Armature1", 'ARMATURE')
@@ -104,7 +104,7 @@ def main():
     verts = mesh1.data.vertices
     n = len(verts)
     for vi, v in enumerate(verts):
-        # Give all 6 groups a weight — only top 4 will be used
+        # Give all 6 groups a weight - only top 4 will be used
         w = 1.0 / 6.0
         vg_root.add([vi], w, 'REPLACE')
         vg_mid.add([vi], w, 'REPLACE')
@@ -134,15 +134,15 @@ def main():
         else:
             vg_joint.add([vi], 1.0, 'REPLACE')
 
-    # --- Mesh 3: no armature, no material, empty (zero vertices) — should be skipped ---
+    # --- Mesh 3: no armature, no material, empty (zero vertices) - should be skipped ---
     empty_mesh_data = bpy.data.meshes.new("EmptyMesh")
     empty_obj = bpy.data.objects.new("EmptyMesh", empty_mesh_data)
     bpy.context.scene.collection.objects.link(empty_obj)
 
-    # --- Empty (non-mesh) child of arm1 — must not crash objs.index() ---
+    # --- Empty (non-mesh) child of arm1 - must not crash objs.index() ---
     empty_obj2 = bpy.data.objects.new("EmptyChild", None)
     bpy.context.scene.collection.objects.link(empty_obj2)
-    empty_obj2.parent = arm1  # child of armature — not in objs, must not crash
+    empty_obj2.parent = arm1  # child of armature - not in objs, must not crash
 
     # --- Action 1: arm1, multiple channels, mismatched keyframe counts ---
     fps = bpy.context.scene.render.fps
@@ -172,12 +172,12 @@ def main():
         (fps,     [0.707, 0.707, 0.0, 0.0]),
         (fps * 2, [1.0, 0.0, 0.0, 0.0]),
     ])
-    # Mid.L: location only at frames 1, fps (2 keyframes — different count)
+    # Mid.L: location only at frames 1, fps (2 keyframes - different count)
     add_loc(action1, "Mid.L", [
         (1,   [0.0, 0.0, 0.0]),
         (fps, [0.0, 0.0, 0.5]),
     ])
-    # Tip.L: quaternion at frame 1 only (single keyframe — minimal)
+    # Tip.L: quaternion at frame 1 only (single keyframe - minimal)
     add_quat(action1, "Tip.L", [
         (1, [1.0, 0.0, 0.0, 0.0]),
     ])
@@ -200,7 +200,7 @@ def main():
         (1,   [1.0, 0.0, 0.0, 0.0]),
         (fps, [0.0, 0.0, 1.0, 0.0]),
     ])
-    # Joint.001 uses euler — should be skipped with warning
+    # Joint.001 uses euler - should be skipped with warning
     for idx in range(3):
         fc = action_fcurves(action3).new(
             data_path='pose.bones["Joint.001"].rotation_euler', index=idx)

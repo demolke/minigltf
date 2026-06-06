@@ -40,7 +40,7 @@ VALIDATOR = os.environ.get('GLTF_VALIDATOR', str(Path(__file__).parent.parent / 
 # Severity codes that are intentional deviations from the spec
 _FILTERED_VALIDATOR_CODES = {
     'URI_GLB',                          # intentional: Godot reads external URIs from GLB
-    'NODE_SKINNED_MESH_NON_ROOT',       # skinned mesh parented to armature — fine for Godot
+    'NODE_SKINNED_MESH_NON_ROOT',       # skinned mesh parented to armature - fine for Godot
     'MESH_PRIMITIVE_GENERATED_TANGENT_SPACE',  # no tangent generation
     'UNUSED_OBJECT',                    # orphan images from material placeholders
 }
@@ -73,7 +73,7 @@ def _acc(gltf, idx):
 # Validators
 # ---------------------------------------------------------------------------
 @test('basic_mesh', 'basic_mesh.py')
-def validate_basic_mesh(gltf, bin_data):
+def validate_basic_mesh(gltf, bin_data, out_dir):
     assert 'asset' in gltf, "missing 'asset'"
     assert gltf['asset']['version'] == '2.0', "wrong glTF version"
 
@@ -112,7 +112,7 @@ def validate_basic_mesh(gltf, bin_data):
 
 
 @test('full_material', 'full_material.py')
-def validate_full_material(gltf, bin_data):
+def validate_full_material(gltf, bin_data, out_dir):
     assert len(gltf.get('materials', [])) == 1, "expected 1 material"
     assert len(gltf.get('images', [])) == 3, f"expected 3 images, got {len(gltf.get('images', []))}"
     assert len(gltf.get('textures', [])) == 3, "expected 3 textures"
@@ -131,7 +131,7 @@ def validate_full_material(gltf, bin_data):
 
 
 @test('scalar_material', 'scalar_material.py')
-def validate_scalar_material(gltf, bin_data):
+def validate_scalar_material(gltf, bin_data, out_dir):
     assert len(gltf.get('materials', [])) == 1, "expected 1 material"
     # No textures: images and textures arrays should be absent or empty
     assert len(gltf.get('images', [])) == 0, "expected no images for texture-free material"
@@ -154,7 +154,7 @@ def validate_scalar_material(gltf, bin_data):
 
 
 @test('alpha_material', 'alpha_material.py')
-def validate_alpha_material(gltf, bin_data):
+def validate_alpha_material(gltf, bin_data, out_dir):
     assert len(gltf.get('materials', [])) == 2, "expected 2 materials (BLEND + MASK)"
 
     blend_mat = next((m for m in gltf['materials'] if m.get('name') == 'BlendMat'), None)
@@ -177,7 +177,7 @@ def validate_alpha_material(gltf, bin_data):
 
 
 @test('emission_material', 'emission_material.py')
-def validate_emission_material(gltf, bin_data):
+def validate_emission_material(gltf, bin_data, out_dir):
     assert len(gltf.get('materials', [])) == 3, "expected 3 materials"
 
     emit_mat = next((m for m in gltf['materials'] if m.get('name') == 'EmitScalarMat'), None)
@@ -203,7 +203,7 @@ def validate_emission_material(gltf, bin_data):
 
 
 @test('armature', 'armature.py')
-def validate_armature(gltf, bin_data):
+def validate_armature(gltf, bin_data, out_dir):
     assert 'skins' in gltf, "no skins"
     assert len(gltf['skins']) == 1, "expected 1 skin"
 
@@ -241,7 +241,7 @@ def validate_armature(gltf, bin_data):
 
 
 @test('shape_keys', 'shape_keys.py')
-def validate_shape_keys(gltf, bin_data):
+def validate_shape_keys(gltf, bin_data, out_dir):
     assert len(gltf.get('meshes', [])) == 1, "expected 1 mesh"
 
     prim = gltf['meshes'][0]['primitives'][0]
@@ -262,7 +262,7 @@ def validate_shape_keys(gltf, bin_data):
 
 
 @test('two_uvs', 'two_uvs.py')
-def validate_two_uvs(gltf, bin_data):
+def validate_two_uvs(gltf, bin_data, out_dir):
     attrs = _prim_attrs(gltf)
     assert 'TEXCOORD_0' in attrs, "missing TEXCOORD_0"
     assert 'TEXCOORD_1' in attrs, "missing TEXCOORD_1"
@@ -280,7 +280,7 @@ def validate_two_uvs(gltf, bin_data):
 
 
 @test('animation', 'animation.py')
-def validate_animation(gltf, bin_data):
+def validate_animation(gltf, bin_data, out_dir):
     assert 'animations' in gltf, "no animations"
     assert len(gltf['animations']) == 1, f"expected 1 animation, got {len(gltf['animations'])}"
 
@@ -315,7 +315,7 @@ def validate_animation(gltf, bin_data):
 
 
 @test('shape_key_anim', 'shape_key_anim.py')
-def validate_shape_key_anim(gltf, bin_data):
+def validate_shape_key_anim(gltf, bin_data, out_dir):
     assert 'animations' in gltf, "no animations"
     assert len(gltf['animations']) == 1, f"expected 1 animation, got {len(gltf['animations'])}"
 
@@ -340,7 +340,7 @@ def validate_shape_key_anim(gltf, bin_data):
     assert timestamps[1] > timestamps[0], "timestamps not monotonically increasing"
 
     weights_acc = _acc(gltf, sampler['output'])
-    assert weights_acc['count'] == 4, f"expected 4 weight values (2 frames × 2 targets), got {weights_acc['count']}"
+    assert weights_acc['count'] == 4, f"expected 4 weight values (2 frames x 2 targets), got {weights_acc['count']}"
     weights = read_accessor(gltf, bin_data, sampler['output'])
 
     # Frame 0 (t=1/24): Inflate=0.0, Squash=0.0
@@ -356,7 +356,7 @@ def validate_shape_key_anim(gltf, bin_data):
 
 
 @test('partial_anim', 'partial_anim.py')
-def validate_partial_anim(gltf, bin_data):
+def validate_partial_anim(gltf, bin_data, out_dir):
     assert 'animations' in gltf, "no animations"
     assert len(gltf['animations']) == 1, f"expected 1 animation, got {len(gltf['animations'])}"
     anim = gltf['animations'][0]
@@ -380,7 +380,7 @@ def validate_partial_anim(gltf, bin_data):
 
 
 @test('multiple_meshes', 'multiple_meshes.py')
-def validate_multiple_meshes(gltf, bin_data):
+def validate_multiple_meshes(gltf, bin_data, out_dir):
     assert len(gltf.get('meshes', [])) == 3, f"expected 3 meshes, got {len(gltf.get('meshes', []))}"
     assert len(gltf.get('materials', [])) == 2, f"expected 2 materials, got {len(gltf.get('materials', []))}"
     assert len(gltf.get('images', [])) == 2, f"expected 2 images, got {len(gltf.get('images', []))}"
@@ -416,7 +416,7 @@ def validate_multiple_meshes(gltf, bin_data):
 
 
 @test('large_perf', 'large_perf.py', timeout=900)
-def validate_large_perf(gltf, bin_data):
+def validate_large_perf(gltf, bin_data, out_dir):
     assert len(gltf.get('meshes', [])) == 1, "expected 1 mesh"
     assert 'skins' in gltf and len(gltf['skins']) >= 1, "expected at least 1 skin"
     skin = gltf['skins'][0]
@@ -427,7 +427,7 @@ def validate_large_perf(gltf, bin_data):
 
 
 @test('warn_separate_channels', 'warn_separate_channels.py')
-def validate_warn_separate_channels(gltf, bin_data):
+def validate_warn_separate_channels(gltf, bin_data, out_dir):
     """Export should succeed; material has metallicRoughnessTexture (or at least one texture slot)."""
     assert len(gltf.get('materials', [])) == 1, "expected 1 material"
     mat = gltf['materials'][0]
@@ -437,7 +437,7 @@ def validate_warn_separate_channels(gltf, bin_data):
 
 
 @test('warn_mixed_channels', 'warn_mixed_channels.py')
-def validate_warn_mixed_channels(gltf, bin_data):
+def validate_warn_mixed_channels(gltf, bin_data, out_dir):
     """Export should succeed with metallicRoughnessTexture."""
     assert len(gltf.get('materials', [])) == 1, "expected 1 material"
     mat = gltf['materials'][0]
@@ -446,7 +446,7 @@ def validate_warn_mixed_channels(gltf, bin_data):
 
 
 @test('multi_material_mesh', 'multi_material_mesh.py')
-def validate_multi_material_mesh(gltf, bin_data):
+def validate_multi_material_mesh(gltf, bin_data, out_dir):
     """One mesh with two material slots - at least 1 mesh exported with materials present."""
     assert len(gltf.get('materials', [])) >= 1, f"expected at least 1 material, got {len(gltf.get('materials', []))}"
     assert len(gltf.get('meshes', [])) >= 1, "expected at least 1 mesh"
@@ -455,21 +455,21 @@ def validate_multi_material_mesh(gltf, bin_data):
 
 
 @test('euler_bone_anim', 'euler_bone_anim.py')
-def validate_euler_bone_anim(gltf, bin_data):
+def validate_euler_bone_anim(gltf, bin_data, out_dir):
     """Bone in Euler rotation mode - must export without crashing (channels skipped)."""
     assert 'meshes' in gltf, "expected meshes"
 
 
 @test('multi_armature_anim', 'multi_armature_anim.py')
-def validate_multi_armature_anim(gltf, bin_data):
-    """Two armatures — animation must target bones from the correct armature."""
+def validate_multi_armature_anim(gltf, bin_data, out_dir):
+    """Two armatures - animation must target bones from the correct armature."""
     assert len(gltf.get('animations', [])) >= 1, "expected at least 1 animation"
     channels = gltf['animations'][0]['channels']
     assert len(channels) >= 1, "expected animation channels"
 
 
 @test('dotted_bone_anim', 'dotted_bone_anim.py')
-def validate_dotted_bone_anim(gltf, bin_data):
+def validate_dotted_bone_anim(gltf, bin_data, out_dir):
     """Bone named 'Bone.001' must not crash the animation channel split."""
     assert len(gltf.get('animations', [])) >= 1, "expected at least 1 animation"
     channels = gltf['animations'][0]['channels']
@@ -477,7 +477,7 @@ def validate_dotted_bone_anim(gltf, bin_data):
 
 
 @test('no_material_mesh', 'no_material_mesh.py')
-def validate_no_material_mesh(gltf, bin_data):
+def validate_no_material_mesh(gltf, bin_data, out_dir):
     """Mesh with no material assigned - primitive must export without a material index."""
     assert len(gltf.get('meshes', [])) == 1, "expected 1 mesh"
     prim = gltf['meshes'][0]['primitives'][0]
@@ -485,7 +485,7 @@ def validate_no_material_mesh(gltf, bin_data):
 
 
 @test('stress_test', 'stress_test.py', timeout=120)
-def validate_stress_test(gltf, bin_data):
+def validate_stress_test(gltf, bin_data, out_dir):
     """Comprehensive stress test: multiple armatures, meshes, edge-case animations."""
     # Two non-empty meshes (Mesh1 and Mesh2); EmptyMesh skipped
     assert len(gltf.get('meshes', [])) == 2, f"expected 2 meshes, got {len(gltf.get('meshes', []))}"
@@ -516,13 +516,73 @@ def validate_stress_test(gltf, bin_data):
 
 
 @test('empty_mesh', 'empty_mesh.py')
-def validate_empty_mesh(gltf, bin_data):
+def validate_empty_mesh(gltf, bin_data, out_dir):
     """Mesh with zero vertices - skipped entirely so Godot doesn't reject it."""
     assert len(gltf.get('meshes', [])) == 0, "empty mesh should not be exported"
 
 
+@test('linked_library', 'linked_library.py')
+def validate_linked_library(gltf, bin_data, out_dir):
+    assert len(gltf.get('meshes', [])) == 1, "expected 1 mesh"
+    assert 'skins' in gltf, "expected skins (armature)"
+
+    # Exactly one armature node - no duplicate from override_create
+    arm_nodes = [n for n in gltf.get('nodes', []) if 'mesh' not in n and 'children' in n
+                 or n.get('name', '').endswith('Armature')]
+    node_names = [n.get('name', '') for n in gltf.get('nodes', [])]
+    assert node_names.count('CharArmature') == 1, (
+        f"expected exactly 1 CharArmature node, got {node_names.count('CharArmature')} - "
+        f"nodes: {node_names}"
+    )
+
+    # Only the local Walk animation - no linked animations
+    assert 'animations' in gltf, "expected animations"
+    assert len(gltf['animations']) == 1, (
+        f"expected exactly 1 animation (Walk), got {len(gltf['animations'])}: "
+        f"{[a.get('name') for a in gltf['animations']]}"
+    )
+    assert gltf['animations'][0].get('name') == 'Walk', "expected animation named 'Walk'"
+
+    assert 'images' in gltf and len(gltf['images']) >= 1, "expected at least 1 image"
+    uri = gltf['images'][0].get('uri', '')
+    assert uri, "image URI must not be empty"
+    # The URI must resolve to a real file relative to the GLB output directory
+    tex_path = os.path.normpath(os.path.join(out_dir, uri))
+    assert os.path.exists(tex_path), (
+        f"texture file not found at resolved path '{tex_path}' (URI='{uri}')"
+    )
+
+
+@test('linked_library_flag', 'linked_library_flag.py')
+def validate_linked_library_flag(gltf, bin_data, out_dir):
+    # With export_non_linked_only=True the linked mesh must be absent.
+    assert len(gltf.get('meshes', [])) == 0, \
+        f"expected no meshes (linked mesh should be skipped), got {len(gltf.get('meshes', []))}"
+    assert len(gltf.get('materials', [])) == 0, "expected no materials with flag on"
+    assert len(gltf.get('images', [])) == 0, "expected no images with flag on"
+    # The local armature nodes and Walk animation must still be present.
+    nodes = gltf.get('nodes', [])
+    assert any(n.get('name') == 'CharArmature' for n in nodes), \
+        "local armature node must be exported"
+    assert 'animations' in gltf, "animations must always be exported"
+    walk = next((a for a in gltf['animations'] if a.get('name') == 'Walk'), None)
+    assert walk is not None, "Walk animation must be present"
+    assert len(walk['channels']) >= 1, "Walk animation must have channels"
+
+
+@test('linked_location', 'linked_location.py')
+def validate_linked_location(gltf, bin_data, out_dir):
+    assert len(gltf.get('meshes', [])) == 1, "expected 1 mesh"
+    mesh_node = next((n for n in gltf.get('nodes', []) if 'mesh' in n), None)
+    assert mesh_node is not None, "no node references a mesh"
+    t = mesh_node.get('translation', [0.0, 0.0, 0.0])
+    assert abs(t[0] - 10.0) < 0.001, f"glTF X expected 10, got {t[0]}"
+    assert abs(t[1] - 10.0) < 0.001, f"glTF Y (Blender Z) expected 10, got {t[1]}"
+    assert abs(t[2] - (-10.0)) < 0.001, f"glTF Z (-Blender Y) expected -10, got {t[2]}"
+
+
 @test('shared_material_meshes', 'shared_material_meshes.py')
-def validate_shared_material_meshes(gltf, bin_data):
+def validate_shared_material_meshes(gltf, bin_data, out_dir):
     """Two meshes sharing one material - 2 meshes, 1 material."""
     assert len(gltf.get('meshes', [])) == 2, f"expected 2 meshes, got {len(gltf.get('meshes', []))}"
     assert len(gltf.get('materials', [])) == 1, f"expected 1 shared material, got {len(gltf.get('materials', []))}"
@@ -600,7 +660,7 @@ def run_one(name, scene, validator, output_base, timeout=120):
 
     try:
         gltf, bin_data = parse_glb(glb)
-        validator(gltf, bin_data)
+        validator(gltf, bin_data, out_dir)
     except Exception as e:
         return False, f"{type(e).__name__}: {e}\n{traceback.format_exc()}", blender_elapsed
 

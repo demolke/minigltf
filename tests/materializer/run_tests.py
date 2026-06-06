@@ -44,7 +44,7 @@ def run_blender(scene_script, output_dir, timeout=60):
     elif 'FAIL' in combined or 'Traceback' in combined or 'Error' in combined:
         ok = False
     else:
-        # No PASS printed and no obvious error — treat as failure.
+        # No PASS printed and no obvious error - treat as failure.
         ok = False
     return ok, result.stdout, result.stderr
 

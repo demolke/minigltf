@@ -366,7 +366,7 @@ def _pixels(node: bpy.types.ShaderNodeTexImage) -> ndarray:
         img.reload()
     w, h = img.size
     label = img.name if img.packed_file is not None else (img.filepath or img.name)
-    print(f'\nloading {label}  ({w}×{h})')
+    print(f'\nloading {label}  ({w}x{h})')
     if w == 0 or h == 0:
         raise ValueError(f"node '{node.name}' image '{img.name}' has zero size")
     arr = np.empty(h * w * 4, dtype=np.float32)
@@ -690,7 +690,7 @@ def rewire(pbr: PBRMat, paths: dict[str, str], dry_run: bool) -> None:
         tree.links.new(tn.outputs['Color'],  sep.inputs['Color'])
         tree.links.new(sep.outputs['Green'], bsdf.inputs['Roughness'])
         tree.links.new(sep.outputs['Blue'],  bsdf.inputs['Metallic'])
-        # R (AO) not wired — no AO socket on Principled BSDF
+        # R (AO) not wired - no AO socket on Principled BSDF
 
     if 'normal' in paths:
         img = bpy.data.images.load(paths['normal'], check_existing=True)

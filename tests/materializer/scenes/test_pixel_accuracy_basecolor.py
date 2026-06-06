@@ -44,7 +44,7 @@ def main():
 
     # Sanity: output must not be all-black
     if pixels[:, :, :3].max() < 0.05:
-        print(f'FAIL: albedo.webp is all black (max pixel={pixels.max():.4f}) — likely a save pipeline bug')
+        print(f'FAIL: albedo.webp is all black (max pixel={pixels.max():.4f}) - likely a save pipeline bug')
         sys.exit(1)
 
     # Top-left tile center (tile 0,0 -> red)
