@@ -503,6 +503,7 @@ def composite(
     quality: int,
     force: bool,
     dry_run: bool,
+    cache: dict[tuple, str],  # Complex tuple caching added here
 ) -> dict[str, str]:
     """Composite and save WebP textures. Returns dict of slot to path.
 
@@ -533,128 +534,148 @@ def composite(
 
     # Base color
     if pbr.base_color or pbr.needs_composite_alpha:
-        path = os.path.join(slot_dir(pbr.base_color, pbr.alpha), f'{name}_albedo.webp')
-        if not skip(path):
-            nodes = [n for n in (
-                pbr.base_color.node if pbr.base_color else None,
-                pbr.alpha.node      if pbr.alpha      else None,
-            ) if n]
-            h, w = _max_size(*nodes)
+        bc_path = pbr.base_color.path if pbr.base_color else None
+        alpha_path = pbr.alpha.path if pbr.alpha else None
+        key = ('albedo', bc_path, alpha_path, pbr.base_color_factor)
+        
+        if key in cache:
+            out['base_color'] = cache[key]
+            print(f'    using cached albedo: {os.path.basename(cache[key])}')
+        else:
+            path = os.path.join(slot_dir(pbr.base_color, pbr.alpha), f'{name}_albedo.webp')
+            if not skip(path):
+                nodes = [n for n in (
+                    pbr.base_color.node if pbr.base_color else None,
+                    pbr.alpha.node      if pbr.alpha      else None,
+                ) if n]
+                h, w = _max_size(*nodes)
 
-            if pbr.base_color:
-                arr = _load_slot(pbr.base_color, h, w, pbr, 'Base Color')
-                if arr is None:
+                if pbr.base_color:
+                    arr = _load_slot(pbr.base_color, h, w, pbr, 'Base Color')
+                    if arr is None:
+                        arr = np.ones((h, w, 4), dtype=np.float32)
+                else:
                     arr = np.ones((h, w, 4), dtype=np.float32)
-            else:
-                arr = np.ones((h, w, 4), dtype=np.float32)
-                for i, v in enumerate(pbr.base_color_factor):
-                    # base_color_factor is linear; convert RGB to sRGB to match
-                    # the sRGB-encoded values that foreach_get returns for textures.
-                    arr[:, :, i] = _linear_to_srgb(v) if i < 3 else v
+                    for i, v in enumerate(pbr.base_color_factor):
+                        arr[:, :, i] = _linear_to_srgb(v) if i < 3 else v
 
-            if pbr.needs_composite_alpha:
-                alpha_arr = _load_slot(pbr.alpha, h, w, pbr, 'Alpha')
-                if alpha_arr is not None:
-                    ch = _channel(alpha_arr, pbr.alpha.channel)
-                    if ch.ndim == 3 and ch.shape[2] > 1:
-                        ch = ch[:, :, 0:1]
-                    # foreach_get returns raw sRGB-encoded bytes; Blender's shader
-                    # decodes them to linear before feeding any socket, including Alpha.
-                    if pbr.alpha.node.image.colorspace_settings.name == 'sRGB':
-                        ch = _srgb_to_linear_arr(ch)
-                    arr = arr.copy()
-                    arr[:, :, 3:4] = ch
-                    print('composited separate alpha into base color A channel')
+                if pbr.needs_composite_alpha:
+                    alpha_arr = _load_slot(pbr.alpha, h, w, pbr, 'Alpha')
+                    if alpha_arr is not None:
+                        ch = _channel(alpha_arr, pbr.alpha.channel)
+                        if ch.ndim == 3 and ch.shape[2] > 1:
+                            ch = ch[:, :, 0:1]
+                        if pbr.alpha.node.image.colorspace_settings.name == 'sRGB':
+                            ch = _srgb_to_linear_arr(ch)
+                        arr = arr.copy()
+                        arr[:, :, 3:4] = ch
+                        print('composited separate alpha into base color A channel')
 
-            img = _bpy_image(f'{name}_albedo', arr, alpha=True, colorspace='sRGB')
-            _save(img, path, lossless, quality, dry_run)
-            if not dry_run:
-                img.source = 'FILE'
+                img = _bpy_image(f'{name}_albedo', arr, alpha=True, colorspace='sRGB')
+                _save(img, path, lossless, quality, dry_run)
+                if not dry_run:
+                    img.source = 'FILE'
+            
+            cache[key] = path
             out['base_color'] = path
 
     # ORM
     if pbr.needs_orm:
-        path = os.path.join(slot_dir(pbr.ao, pbr.roughness, pbr.metallic), f'{name}_orm.webp')
-        if not skip(path):
-            nodes = [n for n in (
-                pbr.ao.node        if pbr.ao        else None,
-                pbr.roughness.node if pbr.roughness else None,
-                pbr.metallic.node  if pbr.metallic  else None,
-            ) if n]
-            h, w = _max_size(*nodes)
+        ao_path = pbr.ao.path if pbr.ao else None
+        r_path = pbr.roughness.path if pbr.roughness else None
+        m_path = pbr.metallic.path if pbr.metallic else None
+        key = ('orm', ao_path, r_path, m_path, pbr.roughness_factor, pbr.metallic_factor)
+        
+        if key in cache:
+            out['orm'] = cache[key]
+            print(f'    using cached ORM: {os.path.basename(cache[key])}')
+        else:
+            path = os.path.join(slot_dir(pbr.ao, pbr.roughness, pbr.metallic), f'{name}_orm.webp')
+            if not skip(path):
+                nodes = [n for n in (
+                    pbr.ao.node        if pbr.ao        else None,
+                    pbr.roughness.node if pbr.roughness else None,
+                    pbr.metallic.node  if pbr.metallic  else None,
+                ) if n]
+                h, w = _max_size(*nodes)
 
-            orm = np.ones((h, w, 3), dtype=np.float32)
-            orm[:, :, 1] = pbr.roughness_factor
-            orm[:, :, 2] = pbr.metallic_factor
+                orm = np.ones((h, w, 3), dtype=np.float32)
+                orm[:, :, 1] = pbr.roughness_factor
+                orm[:, :, 2] = pbr.metallic_factor
 
-            if pbr.ao:
-                a = _load_slot(pbr.ao, h, w, pbr, 'AO')
-                if a is not None:
-                    ch = _channel(a, pbr.ao.channel)
-                    orm[:, :, 0:1] = ch[:, :, 0:1]
+                if pbr.ao:
+                    a = _load_slot(pbr.ao, h, w, pbr, 'AO')
+                    if a is not None:
+                        ch = _channel(a, pbr.ao.channel)
+                        orm[:, :, 0:1] = ch[:, :, 0:1]
 
-            if pbr.roughness:
-                a = _load_slot(pbr.roughness, h, w, pbr, 'Roughness')
-                if a is not None:
-                    ch = _channel(a, pbr.roughness.channel)
-                    if ch.shape[2] > 1:
-                        ch = ch[:, :, 0:1]
-                    orm[:, :, 1:2] = ch
+                if pbr.roughness:
+                    a = _load_slot(pbr.roughness, h, w, pbr, 'Roughness')
+                    if a is not None:
+                        ch = _channel(a, pbr.roughness.channel)
+                        if ch.shape[2] > 1:
+                            ch = ch[:, :, 0:1]
+                        orm[:, :, 1:2] = ch
 
-            if pbr.metallic:
-                a = _load_slot(pbr.metallic, h, w, pbr, 'Metallic')
-                if a is not None:
-                    ch = _channel(a, pbr.metallic.channel)
-                    if ch.shape[2] > 1:
-                        ch = ch[:, :, 0:1]
-                    orm[:, :, 2:3] = ch
+                if pbr.metallic:
+                    a = _load_slot(pbr.metallic, h, w, pbr, 'Metallic')
+                    if a is not None:
+                        ch = _channel(a, pbr.metallic.channel)
+                        if ch.shape[2] > 1:
+                            ch = ch[:, :, 0:1]
+                        orm[:, :, 2:3] = ch
 
-            img = _bpy_image(f'{name}_orm', orm, alpha=False, colorspace='Non-Color')
-            _save(img, path, lossless, quality, dry_run)
-            if not dry_run:
-                img.source = 'FILE'
+                img = _bpy_image(f'{name}_orm', orm, alpha=False, colorspace='Non-Color')
+                _save(img, path, lossless, quality, dry_run)
+                if not dry_run:
+                    img.source = 'FILE'
+            
+            cache[key] = path
             out['orm'] = path
 
     # Normal
     if pbr.normal:
-        path = os.path.join(slot_dir(pbr.normal), f'{name}_normal.webp')
-        if not skip(path):
-            arr = _load_slot(pbr.normal, 0, 0, pbr, 'Normal')
-            if arr is not None:
-                img = _bpy_image(f'{name}_normal', arr[:, :, :3], alpha=False, colorspace='Non-Color')
-                _save(img, path, lossless, quality, dry_run)
-                if not dry_run:
-                    img.source = 'FILE'
-                out['normal'] = path
+        n_path = pbr.normal.path if pbr.normal else None
+        key = ('normal', n_path, pbr.normal_strength)
+        
+        if key in cache:
+            out['normal'] = cache[key]
+            print(f'    using cached normal: {os.path.basename(cache[key])}')
+        else:
+            path = os.path.join(slot_dir(pbr.normal), f'{name}_normal.webp')
+            if not skip(path):
+                arr = _load_slot(pbr.normal, 0, 0, pbr, 'Normal')
+                if arr is not None:
+                    img = _bpy_image(f'{name}_normal', arr[:, :, :3], alpha=False, colorspace='Non-Color')
+                    _save(img, path, lossless, quality, dry_run)
+                    if not dry_run:
+                        img.source = 'FILE'
+            
+            cache[key] = path
+            out['normal'] = path
 
     # Emission
     if pbr.emission:
-        path = os.path.join(slot_dir(pbr.emission), f'{name}_emission.webp')
-        if not skip(path):
-            arr = _load_slot(pbr.emission, 0, 0, pbr, 'Emission')
-            if arr is not None:
-                img = _bpy_image(f'{name}_emission', arr[:, :, :3], alpha=False, colorspace='sRGB')
-                _save(img, path, lossless, quality, dry_run)
-                if not dry_run:
-                    img.source = 'FILE'
-                out['emission'] = path
+        e_path = pbr.emission.path if pbr.emission else None
+        key = ('emission', e_path, pbr.emission_factor)
+        
+        if key in cache:
+            out['emission'] = cache[key]
+            print(f'    using cached emission: {os.path.basename(cache[key])}')
+        else:
+            path = os.path.join(slot_dir(pbr.emission), f'{name}_emission.webp')
+            if not skip(path):
+                arr = _load_slot(pbr.emission, 0, 0, pbr, 'Emission')
+                if arr is not None:
+                    img = _bpy_image(f'{name}_emission', arr[:, :, :3], alpha=False, colorspace='sRGB')
+                    _save(img, path, lossless, quality, dry_run)
+                    if not dry_run:
+                        img.source = 'FILE'
+            
+            cache[key] = path
+            out['emission'] = path
 
     return out
-
-
-# Node rewiring
-def _tex_node(
-    tree: bpy.types.NodeTree,
-    bpy_img: bpy.types.Image,
-    label: str,
-    x: float,
-    y: float,
-) -> bpy.types.ShaderNodeTexImage:
-    n = tree.nodes.new('ShaderNodeTexImage')
-    n.image    = bpy_img
-    n.label    = label
-    n.location = (x, y)
-    return n
 
 
 def rewire(pbr: PBRMat, paths: dict[str, str], dry_run: bool) -> None:
@@ -709,6 +730,20 @@ def rewire(pbr: PBRMat, paths: dict[str, str], dry_run: bool) -> None:
         emit_in = bsdf.inputs.get('Emission Color') or bsdf.inputs.get('Emission')
         if emit_in:
             tree.links.new(tn.outputs['Color'], emit_in)
+
+
+def _tex_node(
+    tree: bpy.types.NodeTree,
+    bpy_img: bpy.types.Image,
+    label: str,
+    x: float,
+    y: float,
+) -> bpy.types.ShaderNodeTexImage:
+    n = tree.nodes.new('ShaderNodeTexImage')
+    n.image    = bpy_img
+    n.label    = label
+    n.location = (x, y)
+    return n
 
 
 def main() -> None:
@@ -773,11 +808,14 @@ def main() -> None:
             print('Aborted.')
             sys.exit(0)
 
+    # Initialize the robust caching dictionary
+    conversion_cache: dict[tuple, str] = {}
+
     # Execute
     for mat, pbr in pairs:
         if pbr is None:
             continue
-        paths = composite(pbr, output_dir, args.lossless, args.quality, args.force, args.dry_run)
+        paths = composite(pbr, output_dir, args.lossless, args.quality, args.force, args.dry_run, conversion_cache)
         rewire(pbr, paths, args.dry_run)
 
     if not args.dry_run:
