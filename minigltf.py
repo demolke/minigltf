@@ -132,6 +132,22 @@ def mini_export(output_file: str, split: bool = True) -> None:
             continue
         objs.append(_o)
 
+    # For linked assets (instanced collections empties) export as a transform
+    # node with a `linked` extras hint
+    _collection_instances = []
+    for _o in _scene_objs:
+        if _o.type != 'EMPTY' or getattr(_o, 'instance_type', None) != 'COLLECTION':
+            continue
+        _col = _o.instance_collection
+        if _col is None or getattr(_col, 'library', None) is None:
+            continue
+        # If any object in the collection is already overridden, real objects
+        # export instead - don't also emit a scene-reference node.
+        if any(_obj in _overridden_originals for _obj in _col.objects):
+            continue
+        _collection_instances.append(_o)
+    objs += _collection_instances
+
     # Add bones only from armatures that passed the filter above.
     _scene_armatures = set()
     for _o in list(objs):
@@ -260,6 +276,19 @@ def mini_export(output_file: str, split: bool = True) -> None:
 
                     jsn.write(b',"skin":')
                     jsn.write(str(skins.index(m.object)).encode())
+
+        if isinstance(o, bpy.types.Object) and o in _collection_instances:
+            _col = o.instance_collection
+            _lib_abs = bpy.path.abspath(_col.library.filepath)
+            _glb_dir = os.path.dirname(os.path.abspath(output_file))
+            try:
+                _rel = os.path.relpath(_lib_abs, _glb_dir)
+            except ValueError:
+                _rel = _lib_abs
+            _link = _rel.replace('\\', '/') + ':' + _col.name
+            jsn.write(b',"extras":{"link":')
+            jsn.write(_je(_link))
+            jsn.write(b'}')
 
         # Bones are nodes in GLTF
         children = [x for x in o.children]
@@ -789,9 +818,6 @@ def mini_export(output_file: str, split: bool = True) -> None:
             # Group channels together
             curves = {}
             for f in _action_fcurves(a):
-                if 'scale' in f.data_path:
-                    continue
-
                 if f.data_path not in curves:
                     curves[f.data_path] = [None, None, None, None]
                 curves[f.data_path][f.array_index] = f

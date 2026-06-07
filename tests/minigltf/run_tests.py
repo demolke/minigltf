@@ -581,6 +581,39 @@ def validate_linked_location(gltf, bin_data, out_dir):
     assert abs(t[2] - (-10.0)) < 0.001, f"glTF Z (-Blender Y) expected -10, got {t[2]}"
 
 
+@test('linked_collection_instance', 'linked_collection_instance.py')
+def validate_linked_collection_instance(gltf, bin_data, out_dir):
+    # No real mesh should be exported - the collection is not overridden.
+    assert len(gltf.get('meshes', [])) == 0, \
+        "un-overridden collection instance must not export mesh geometry"
+
+    # Exactly one node representing the instance empty.
+    nodes = gltf.get('nodes', [])
+    assert len(nodes) == 1, f"expected 1 node (the instance empty), got {len(nodes)}"
+    node = nodes[0]
+
+    # extras.link must be present and well-formed.
+    extras = node.get('extras', {})
+    gs = extras.get('link', '')
+    assert gs, "extras.link must not be empty"
+    assert ':Character' in gs, f"link must contain ':Character', got: {gs!r}"
+    assert gs.endswith('.blend:Character'), \
+        f"link must end with .blend:Character, got: {gs!r}"
+
+    # The blend path inside the value must resolve to a real file.
+    inner = gs[len('res://'):]          # strip res://
+    blend_rel = inner.split(':')[0]     # strip :CollectionName
+    blend_abs = os.path.normpath(os.path.join(out_dir, blend_rel))
+    assert os.path.exists(blend_abs), \
+        f"library blend not found at resolved path '{blend_abs}'"
+
+    # Transform: Blender (5,3,2) -> glTF [x, z, -y] = [5, 2, -3]
+    t = node.get('translation', [0.0, 0.0, 0.0])
+    assert abs(t[0] - 5.0) < 0.001, f"X expected 5, got {t[0]}"
+    assert abs(t[1] - 2.0) < 0.001, f"Y(Z) expected 2, got {t[1]}"
+    assert abs(t[2] - (-3.0)) < 0.001, f"Z(-Y) expected -3, got {t[2]}"
+
+
 @test('shared_material_meshes', 'shared_material_meshes.py')
 def validate_shared_material_meshes(gltf, bin_data, out_dir):
     """Two meshes sharing one material - 2 meshes, 1 material."""
