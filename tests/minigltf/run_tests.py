@@ -601,8 +601,7 @@ def validate_linked_collection_instance(gltf, bin_data, out_dir):
         f"link must end with .blend:Character, got: {gs!r}"
 
     # The blend path inside the value must resolve to a real file.
-    inner = gs[len('res://'):]          # strip res://
-    blend_rel = inner.split(':')[0]     # strip :CollectionName
+    blend_rel = gs.split(':')[0]
     blend_abs = os.path.normpath(os.path.join(out_dir, blend_rel))
     assert os.path.exists(blend_abs), \
         f"library blend not found at resolved path '{blend_abs}'"
