@@ -51,6 +51,10 @@ mode or handles.
 **Animations**
 - Skeleton animation: translation and rotation channels per bone
 - Shape key animation: weight tracks targeting mesh nodes
+- Camera/light object animation: location/rotation/scale, exported exactly like
+  bone tracks (raw keyframes, no resampling)
+- Animated light energy and color via the `KHR_animation_pointer` extension
+  (Godot reads these as `light_energy` / `light_color` tracks)
 - Multiple actions per scene, each becomes a separate glTF animation
 
 **Cameras**

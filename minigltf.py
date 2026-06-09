@@ -66,6 +66,19 @@ def _je(s: str) -> bytes:
     return json.dumps(s).encode()
 
 
+# Watts -> lumens, matching Blender's glTF exporter (SPEC mode). Used for both the
+# static light intensity and its animation so the two stay consistent.
+_WATTS_TO_LUMENS = 683.0
+
+
+def _light_intensity(lt, energy: float) -> float:
+    """glTF KHR_lights_punctual intensity for a Blender light energy value.
+    Sun lights are lux (energy passes through); others are candela."""
+    if lt.type == 'SUN':
+        return energy
+    return energy * _WATTS_TO_LUMENS / (4.0 * math.pi)
+
+
 def _image_uri(img, output_file: str) -> str:
     """Return a URI for a texture, relative to the output GLB location.
 
@@ -893,19 +906,34 @@ def mini_export(output_file: str, split: bool = True) -> None:
     _t_anim_rotation = 0.0
     _t_anim_location = 0.0
     _t_anim_morph = 0.0
+    _used_anim_pointer = False
     _local_actions = [a for a in bpy.data.actions if not getattr(a, 'library', None)]
     if _local_actions:
         CHANNEL_MAPPING = {'location': 'translation', 'rotation_quaternion': 'rotation', 'scale': 'scale'}
-        jsn.write(b'"animations":[')
-        for i in range(len(_local_actions)):
-            a = _local_actions[i]
+        fps_val = bpy.context.scene.render.fps * bpy.context.scene.render.fps_base
 
-            # Group channels together
+        def _emit_sampler(ab, times, vals, n):
+            """Write one LINEAR sampler: float input(times) + output(vals) accessors."""
+            ab.write(b'{"input":' + str(len(accessors)).encode())
+            off = bchunk.tell()
+            accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': len(times),
+                              'min': min(times), 'max': max(times)})
+            bufferViews.append({'byteOffset': off, 'byteLength': len(times) * 4})
+            bchunk.write(np.asarray(times, dtype=np.float32))
+            ab.write(b',"output":' + str(len(accessors)).encode())
+            off = bchunk.tell()
+            accessors.append({'type': '"SCALAR"' if n == 1 else '"VEC%d"' % n,
+                              'componentType': 5126, 'count': len(vals) // n})
+            bufferViews.append({'byteOffset': off, 'byteLength': len(vals) * 4})
+            bchunk.write(np.asarray(vals, dtype=np.float32))
+            ab.write(b',"interpolation":"LINEAR"}')
+
+        _anim_chunks = []
+        for a in _local_actions:
+            # Group fcurves by data path
             curves = {}
             for f in _action_fcurves(a):
-                if f.data_path not in curves:
-                    curves[f.data_path] = [None, None, None, None]
-                curves[f.data_path][f.array_index] = f
+                curves.setdefault(f.data_path, [None, None, None, None])[f.array_index] = f
 
             armature = next(iter(_scene_armatures), None)
             if 'armature' in a:
@@ -914,8 +942,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
             shape_key_curves = {}
             for path, fcs in curves.items():
                 if path.startswith('key_blocks[') and '.value' in path:
-                    key_name = path.split('"')[1]
-                    shape_key_curves[key_name] = fcs[0]
+                    shape_key_curves[path.split('"')[1]] = fcs[0]
 
             sk_mesh_obj = None
             for obj in meshes:
@@ -924,13 +951,9 @@ def mini_export(output_file: str, split: bool = True) -> None:
                     sk_mesh_obj = obj
                     break
 
-            jsn.write(b'{"name":')
-            jsn.write(_je(a.name))
-            jsn.write(b',"channels":[')
-
-            # Pre-compute valid bone animation entries so channels and samplers
-            # share identical filtering and stay in sync.
-            _valid_bone_anims = []
+            # Transform tracks. Bones and camera/light objects are handled the same
+            # Each entry: (node, gltf_path, curveset, primary_fc, correction)
+            transforms = []
             for _bname in sorted(curves.keys()):
                 if not _bname.startswith('pose.bones') or armature is None:
                     continue
@@ -942,18 +965,50 @@ def mini_export(output_file: str, split: bool = True) -> None:
                 if _channel not in CHANNEL_MAPPING:
                     print(f"[minigltf] WARNING: bone '{_bone_name}' uses unsupported channel '{_channel}' - skipping")
                     continue
-                _bone = None
-                for _arm in _scene_armatures:
-                    if _bone_name in _arm.bones:
-                        _bone = _arm.bones[_bone_name]
-                        break
+                _bone = next((arm.bones[_bone_name] for arm in _scene_armatures
+                              if _bone_name in arm.bones), None)
                 if _bone is None or _bone not in objs:
                     continue
-                _curveset = curves[_bname]
-                _primary_fc = next((fc for fc in _curveset if fc is not None), None)
-                if _primary_fc is None or len(_primary_fc.keyframe_points) == 0:
+                cs = curves[_bname]
+                pf = next((fc for fc in cs if fc is not None), None)
+                if pf is None or len(pf.keyframe_points) == 0:
                     continue
-                _valid_bone_anims.append((_bone, _channel, _curveset, _primary_fc))
+                if _bone.parent:
+                    corr = _bone.parent.matrix_local.inverted_safe() @ _bone.matrix_local
+                else:
+                    corr = axis_basis_change @ _bone.matrix_local
+                transforms.append((_bone, CHANNEL_MAPPING[_channel], cs, pf, corr))
+
+            # Camera/light object transforms: exactly the same path as bones
+            for _o in objs:
+                if not (isinstance(_o, bpy.types.Object) and _o.type in ('CAMERA', 'LIGHT')):
+                    continue
+                if not (_o.animation_data and _o.animation_data.action == a):
+                    continue
+                for _dp, _path in CHANNEL_MAPPING.items():
+                    cs = curves.get(_dp)
+                    pf = next((fc for fc in cs if fc is not None), None) if cs else None
+                    if pf is None or len(pf.keyframe_points) == 0:
+                        continue
+                    transforms.append((_o, _path, cs, pf, axis_basis_change))
+
+            # Light property tracks (KHR_animation_pointer): energy -> intensity and
+            # color.
+	    # Each entry: (pointer, primary_fc, n, value_fn(t) -> [n values])
+            pointers = []
+            for _li, _lt in enumerate(lights):
+                if not (_lt.animation_data and _lt.animation_data.action == a):
+                    continue
+                base = f'/extensions/KHR_lights_punctual/lights/{_li}'
+                ecs = curves.get('energy')
+                if ecs and ecs[0] and len(ecs[0].keyframe_points):
+                    pointers.append((base + '/intensity', ecs[0], 1,
+                                     lambda t, fc=ecs[0], lt=_lt: [_light_intensity(lt, _fc_val(fc, t))]))
+                ccs = curves.get('color')
+                _cpf = next((fc for fc in ccs if fc is not None), None) if ccs else None
+                if _cpf is not None and len(_cpf.keyframe_points):
+                    pointers.append((base + '/color', _cpf, 3,
+                                     lambda t, cs=ccs: [_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t)]))
 
             _sk_first_fc = next(iter(shape_key_curves.values()), None) if shape_key_curves else None
             _has_sk_anim = bool(
@@ -963,120 +1018,77 @@ def mini_export(output_file: str, split: bool = True) -> None:
                 and len(_sk_first_fc.keyframe_points) > 0
             )
 
-            sampleridx = 0
-            for idx, (_bone, _channel, _curveset, _primary_fc) in enumerate(_valid_bone_anims):
-                if idx > 0:
-                    jsn.write(b',')
-                jsn.write(b'{"sampler":')
-                jsn.write(str(sampleridx).encode())
-                jsn.write(b',"target":{"node":')
-                jsn.write(str(objs.index(_bone)).encode())
-                jsn.write(b',"path":"')
-                jsn.write(CHANNEL_MAPPING[_channel].encode())
-                jsn.write(b'"}}')
-                sampleridx += 1
+            # Skip actions that produce no channels - an empty animation is invalid glTF.
+            if not transforms and not _has_sk_anim and not pointers:
+                continue
+            if pointers:
+                _used_anim_pointer = True
+
+            ab = BytesIO()
+            ab.write(b'{"name":' + _je(a.name) + b',"channels":[')
+            _sidx = 0
+            for (node, path, cs, pf, corr) in transforms:
+                ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"node":%d,"path":"%s"}}'
+                         % (_sidx, objs.index(node), path.encode()))
+                _sidx += 1
+            if _has_sk_anim:
+                ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"node":%d,"path":"weights"}}'
+                         % (_sidx, objs.index(sk_mesh_obj)))
+                _sidx += 1
+            for (pointer, pf, n, vfn) in pointers:
+                ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"path":"pointer","extensions":{"KHR_animation_pointer":{"pointer":'
+                         % _sidx + _je(pointer) + b'}}}}')
+                _sidx += 1
+
+            ab.write(b'],"samplers":[')
+            _need_comma = False
+            for (node, path, cs, pf, corr) in transforms:
+                if _need_comma:
+                    ab.write(b',')
+                _need_comma = True
+                times = [k.co.x / fps_val for k in pf.keyframe_points]
+                vals = []
+                for t in range(len(times)):
+                    if path == 'rotation':
+                        q = mathutils.Quaternion((_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t), _fc_val(cs[3], t)))
+                        r = (corr @ q.to_matrix().to_4x4()).to_quaternion()
+                        vals += (r.x, r.y, r.z, r.w)
+                    elif path == 'scale':
+                        vals += (_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t))
+                    else:  # translation
+                        v = mathutils.Vector((_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t)))
+                        loc = (corr @ mathutils.Matrix.Translation(v).to_4x4()).to_translation()
+                        vals += (loc.x, loc.y, loc.z)
+                _emit_sampler(ab, times, vals, 4 if path == 'rotation' else 3)
 
             if _has_sk_anim:
-                if _valid_bone_anims:
-                    jsn.write(b',')
-                jsn.write(b'{"sampler":')
-                jsn.write(str(sampleridx).encode())
-                jsn.write(b',"target":{"node":')
-                jsn.write(str(objs.index(sk_mesh_obj)).encode())
-                jsn.write(b',"path":"weights"}}')
-
-            jsn.write(b'],"samplers":[')
-            for idx, (_bone, _channel, _curveset, _primary_fc) in enumerate(_valid_bone_anims):
-                if idx > 0:
-                    jsn.write(b',')
-                if _bone.parent:
-                    correction = (_bone.parent.matrix_local.inverted_safe() @ _bone.matrix_local)
-                else:
-                    correction = axis_basis_change @ _bone.matrix_local
-
-                fps_val = bpy.context.scene.render.fps * bpy.context.scene.render.fps_base
-                t_secs = [k.co.x / fps_val for k in _primary_fc.keyframe_points]
-                _n_kp = len(t_secs)
-
-                jsn.write(b'{"input":')
-                jsn.write(str(len(accessors)).encode())
-                offset = bchunk.tell()
-                accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': _n_kp, 'min': min(t_secs), 'max': max(t_secs)})
-                bufferViews.append({'byteOffset': offset, 'byteLength': _n_kp * 4})
-                _tt = time.perf_counter()
-                bchunk.write(np.asarray(t_secs, dtype=np.float32))
-                _t_anim_timestamps += time.perf_counter() - _tt
-
-                count = 4 if _curveset[3] else 3
-                jsn.write(b',"output":')
-                jsn.write(str(len(accessors)).encode())
-                offset = bchunk.tell()
-                accessors.append({'type': f'"VEC{count}"', 'componentType': 5126, 'count': _n_kp})
-                bufferViews.append({'byteOffset': offset, 'byteLength': _n_kp * 4 * count})
-
-                _tt = time.perf_counter()
-                _vals = []
-                for t in range(_n_kp):
-                    if count == 4:
-                        q = mathutils.Quaternion((_fc_val(_curveset[0], t), _fc_val(_curveset[1], t), _fc_val(_curveset[2], t), _fc_val(_curveset[3], t)))
-                        result = (correction @ q.to_matrix().to_4x4()).to_quaternion()
-                        _vals += (result.x, result.y, result.z, result.w)
-                    elif count == 3 and _channel == 'scale':
-                        _vals += (_fc_val(_curveset[0], t), _fc_val(_curveset[1], t), _fc_val(_curveset[2], t))
-                    elif count == 3 and _channel == 'location':
-                        v = mathutils.Vector((_fc_val(_curveset[0], t), _fc_val(_curveset[1], t), _fc_val(_curveset[2], t)))
-                        location = (correction @ mathutils.Matrix.Translation(v).to_4x4()).to_translation()
-                        _vals += (location.x, location.y, location.z)
-                bchunk.write(np.asarray(_vals, dtype=np.float32))
-                if count == 4:
-                    _t_anim_rotation += time.perf_counter() - _tt
-                else:
-                    _t_anim_location += time.perf_counter() - _tt
-
-                jsn.write(b',"interpolation":"LINEAR"}')
-
-            if _has_sk_anim:
-                if _valid_bone_anims:
-                    jsn.write(b',')
-                key_blocks = sk_mesh_obj.data.shape_keys.key_blocks
-                morph_names = [kb.name for kb in key_blocks[1:]]
-                num_morphs = len(morph_names)
-                keyframe_times = [kp.co.x for kp in _sk_first_fc.keyframe_points]
-                num_frames = len(keyframe_times)
-                fps = bpy.context.scene.render.fps * bpy.context.scene.render.fps_base
-
-                jsn.write(b'{"input":')
-                jsn.write(str(len(accessors)).encode())
-                offset = bchunk.tell()
-                t_secs = [t / fps for t in keyframe_times]
-                accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': num_frames, 'min': min(t_secs), 'max': max(t_secs)})
-                bufferViews.append({'byteOffset': offset, 'byteLength': num_frames * 4})
-                _tt = time.perf_counter()
-                bchunk.write(np.asarray(t_secs, dtype=np.float32))
-                _t_anim_timestamps += time.perf_counter() - _tt
-
-                jsn.write(b',"output":')
-                jsn.write(str(len(accessors)).encode())
-                offset = bchunk.tell()
-                accessors.append({'type': '"SCALAR"', 'componentType': 5126, 'count': num_frames * num_morphs})
-                bufferViews.append({'byteOffset': offset, 'byteLength': num_frames * num_morphs * 4})
-                _tt = time.perf_counter()
-                _weights = []
-                for fi in range(num_frames):
+                if _need_comma:
+                    ab.write(b',')
+                _need_comma = True
+                morph_names = [kb.name for kb in sk_mesh_obj.data.shape_keys.key_blocks[1:]]
+                times = [kp.co.x / fps_val for kp in _sk_first_fc.keyframe_points]
+                weights = []
+                for fi in range(len(times)):
                     for morph_name in morph_names:
                         fc = shape_key_curves.get(morph_name)
-                        _weights.append(fc.keyframe_points[fi].co.y if fc and fi < len(fc.keyframe_points) else 0.0)
-                bchunk.write(np.asarray(_weights, dtype=np.float32))
-                _t_anim_morph += time.perf_counter() - _tt
+                        weights.append(fc.keyframe_points[fi].co.y if fc and fi < len(fc.keyframe_points) else 0.0)
+                _emit_sampler(ab, times, weights, 1)
 
-                jsn.write(b',"interpolation":"LINEAR"}')
+            for (pointer, pf, n, vfn) in pointers:
+                if _need_comma:
+                    ab.write(b',')
+                _need_comma = True
+                times = [k.co.x / fps_val for k in pf.keyframe_points]
+                vals = []
+                for t in range(len(times)):
+                    vals += vfn(t)
+                _emit_sampler(ab, times, vals, n)
 
-            jsn.write(b']}')
+            ab.write(b']}')
+            _anim_chunks.append(ab.getvalue())
 
-            if i < len(_local_actions) - 1:
-                jsn.write(b',')
-
-        jsn.write(b'],')
+        if _anim_chunks:
+            jsn.write(b'"animations":[' + b','.join(_anim_chunks) + b'],')
 
     timings['anim_timestamps'] = _t_anim_timestamps
     timings['anim_rotation'] = _t_anim_rotation
@@ -1165,6 +1177,8 @@ def mini_export(output_file: str, split: bool = True) -> None:
         _ext_used.append('KHR_lights_punctual')
     if _used_emissive_strength:
         _ext_used.append('KHR_materials_emissive_strength')
+    if _used_anim_pointer:
+        _ext_used.append('KHR_animation_pointer')
     if _ext_used:
         jsn.write(b'"extensionsUsed":[')
         jsn.write(b','.join(_je(e) for e in _ext_used))
@@ -1172,25 +1186,21 @@ def mini_export(output_file: str, split: bool = True) -> None:
 
     # Lights (KHR_lights_punctual)
     if lights:
-        _W2L = 683.0  # watts -> lumens, matches Blender's glTF exporter (SPEC mode)
         jsn.write(b'"extensions":{"KHR_lights_punctual":{"lights":[')
         for i in range(len(lights)):
             lt = lights[i]
             if lt.type == 'SUN':
                 gtype = 'directional'
-                intensity = lt.energy
             elif lt.type == 'SPOT':
                 gtype = 'spot'
-                intensity = lt.energy * _W2L / (4.0 * math.pi)
             elif lt.type == 'POINT':
                 gtype = 'point'
-                intensity = lt.energy * _W2L / (4.0 * math.pi)
             else:
                 # AREA (and anything else) has no glTF equivalent - approximate as point.
                 print(f'[minigltf] WARNING light "{lt.name}": type {lt.type} is not '
                       f'supported by glTF - exporting as a point light')
                 gtype = 'point'
-                intensity = lt.energy * _W2L / (4.0 * math.pi)
+            intensity = _light_intensity(lt, lt.energy)
 
             jsn.write(b'{"name":')
             jsn.write(_je(lt.name))

@@ -678,6 +678,64 @@ def validate_cameras_lights(gltf, bin_data, out_dir):
         assert 0 <= idx < len(lights), f"node light index out of range: {idx}"
 
 
+@test('animated_cam_light', 'animated_cam_light.py')
+def validate_animated_cam_light(gltf, bin_data, out_dir):
+    """Camera/light transform animation (exported like bones) plus animated light
+    energy/color via KHR_animation_pointer. Values read straight from the buffer."""
+    anims = {a['name']: a for a in gltf.get('animations', [])}
+    assert {'LampMove', 'CamMove', 'LampProps'} <= set(anims), \
+        f"missing expected animations, got {sorted(anims)}"
+    assert 'KHR_animation_pointer' in gltf.get('extensionsUsed', []), \
+        "KHR_animation_pointer not declared in extensionsUsed"
+
+    node_idx = {n['name']: i for i, n in enumerate(gltf['nodes'])}
+
+    def sampler_for(anim, predicate):
+        a = anims[anim]
+        for ch in a['channels']:
+            if predicate(ch['target']):
+                return a['samplers'][ch['sampler']]
+        raise AssertionError(f"{anim}: no channel matching predicate")
+
+    # Lamp object: translation + rotation channels on the Lamp node.
+    lamp = node_idx['Lamp']
+    transl = sampler_for('LampMove', lambda t: t.get('node') == lamp and t.get('path') == 'translation')
+    rot = sampler_for('LampMove', lambda t: t.get('node') == lamp and t.get('path') == 'rotation')
+
+    # Blender (0,0,5)->(0,10,5) becomes glTF (x, z, -y) = (0,5,0)->(0,5,-10).
+    tv = read_accessor(gltf, bin_data, transl['output'])
+    assert _acc(gltf, transl['output'])['type'] == 'VEC3'
+    assert abs(tv[1] - 5.0) < 1e-4 and abs(tv[2] - 0.0) < 1e-4, f"first translation {tv[:3]}"
+    assert abs(tv[5] - (-10.0)) < 1e-4, f"last translation Z expected -10, got {tv[5]}"
+
+    rv = read_accessor(gltf, bin_data, rot['output'])
+    assert _acc(gltf, rot['output'])['type'] == 'VEC4'
+    for i in range(0, len(rv), 4):
+        mag = sum(c * c for c in rv[i:i + 4]) ** 0.5
+        assert abs(mag - 1.0) < 1e-3, f"rotation key not unit length: {rv[i:i+4]}"
+
+    # Camera object: a rotation channel on the Cam node.
+    cam = node_idx['Cam']
+    sampler_for('CamMove', lambda t: t.get('node') == cam and t.get('path') == 'rotation')
+
+    # Light properties via pointer: intensity ratio matches energy ratio (10->100);
+    # color goes white -> red. Values are raw keyframes.
+    def is_ptr(target, suffix):
+        ext = target.get('extensions', {}).get('KHR_animation_pointer')
+        return bool(ext) and ext['pointer'].endswith(suffix)
+
+    intensity = sampler_for('LampProps', lambda t: is_ptr(t, '/intensity'))
+    iv = read_accessor(gltf, bin_data, intensity['output'])
+    assert _acc(gltf, intensity['output'])['type'] == 'SCALAR'
+    assert abs(iv[1] / iv[0] - 10.0) < 0.01, f"intensity ratio expected 10, got {iv[1] / iv[0]}"
+
+    color = sampler_for('LampProps', lambda t: is_ptr(t, '/color'))
+    cv = read_accessor(gltf, bin_data, color['output'])
+    assert _acc(gltf, color['output'])['type'] == 'VEC3'
+    assert cv[:3] == (1.0, 1.0, 1.0), f"first color {cv[:3]}"
+    assert cv[3] == 1.0 and cv[4] == 0.0 and cv[5] == 0.0, f"last color {cv[3:6]}"
+
+
 @test('shared_material_meshes', 'shared_material_meshes.py')
 def validate_shared_material_meshes(gltf, bin_data, out_dir):
     """Two meshes sharing one material - 2 meshes, 1 material."""
