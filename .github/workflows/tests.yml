@@ -5,22 +5,25 @@ on:
   pull_request:
   workflow_call:
 
+env:
+  BLENDER: /opt/blender/blender
+  GODOT: godot
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Blender
+      - name: Install Blender 5.1
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y blender
-          blender --version
-
-      - name: Install numpy
-        run: |
-          pip install numpy
+          curl -fsSL \
+            https://download.blender.org/release/Blender5.1/blender-5.1.0-linux-x64.tar.xz \
+            -o /tmp/blender.tar.xz
+          sudo mkdir -p /opt/blender
+          sudo tar -xf /tmp/blender.tar.xz -C /opt/blender --strip-components=1
+          "$BLENDER" --version
 
       - name: Install glTF validator
         run: |
@@ -31,6 +34,16 @@ jobs:
           chmod +x gltf_validator
           mv gltf_validator validator
 
+      - name: Install Godot 4.6
+        run: |
+          curl -fsSL \
+            https://github.com/godotengine/godot/releases/download/4.6-stable/Godot_v4.6-stable_linux.x86_64.zip \
+            -o /tmp/godot.zip
+          unzip -o /tmp/godot.zip -d /tmp
+          chmod +x /tmp/Godot_v4.6-stable_linux.x86_64
+          sudo mv /tmp/Godot_v4.6-stable_linux.x86_64 /usr/local/bin/godot
+          godot --headless --version
+
       - name: Run minigltf tests
         run: python tests/minigltf/run_tests.py
 
@@ -40,6 +53,5 @@ jobs:
       - name: Benchmark
         run: |
           BLEND=$(ls -t test_runs/*/large_perf/scene.blend | head -1)
-          blender --background "$BLEND" \
+          "$BLENDER" --background "$BLEND" \
             --python tests/bench.py -- --runs 5
-

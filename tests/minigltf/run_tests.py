@@ -18,6 +18,7 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -36,6 +37,31 @@ from glb_parser import parse_glb, read_accessor
 
 BLENDER = os.environ.get('BLENDER', 'blender')
 VALIDATOR = os.environ.get('GLTF_VALIDATOR', str(Path(REPO_DIR) / 'validator'))
+GODOT = os.environ.get('GODOT', 'godot')
+GODOT_TEMPLATE = Path(__file__).parent / 'godot'
+
+
+def run_godot_cutscene_check(out_dir):
+    """Create a Godot project in out_dir, then reconstruct and verify the cutscene."""
+    godot = shutil.which(GODOT) or (GODOT if os.path.isfile(GODOT) else None)
+    if godot is None:
+        return True, f"(godot '{GODOT}' not found, skipping cutscene check)"
+    for f in GODOT_TEMPLATE.iterdir():
+        if f.is_file():
+            shutil.copy(f, os.path.join(out_dir, f.name))
+    with open(os.path.join(out_dir, 'project.godot'), 'w') as f:
+        f.write('config_version=5\n\n[application]\n'
+                'config/name="minigltf cutscene"\nrun/main_scene="res://main.tscn"\n\n'
+                '[rendering]\nrenderer/rendering_method="gl_compatibility"\n')
+    result = subprocess.run(
+        [godot, '--headless', '--path', out_dir, '--script', 'res://cutscene_check.gd'],
+        capture_output=True, text=True, timeout=120,
+    )
+    out = result.stdout + result.stderr
+    if 'RESULT: PASS' in out:
+        return True, "OK"
+    lines = [l for l in out.splitlines() if 'FAIL' in l or 'RESULT' in l]
+    return False, "godot cutscene check failed:\n" + '\n'.join(lines[-25:] or out.splitlines()[-25:])
 
 # Severity codes that are intentional deviations from the spec
 _FILTERED_VALIDATOR_CODES = {
@@ -746,6 +772,70 @@ def validate_shared_material_meshes(gltf, bin_data, out_dir):
     assert mat_idx_a == mat_idx_b, "both meshes should reference the same material"
 
 
+@test('cutscene', 'cutscene.py')
+def validate_cutscene(gltf, bin_data, out_dir):
+    """A four-shot, two-character cutscene. The glb carries the individual
+    animation pieces (a reused 'Talking' action exported per character); the
+    schedule lives in scene.tscn. The glb half is checked here; the schedule is
+    reconstructed and verified in Godot by run_one()'s cutscene check."""
+    names = {a.get('name') for a in gltf.get('animations', [])}
+    # The reused action is exported once per character (author once, export twice).
+    assert 'Talking_AlphaRig' in names and 'Talking_BetaRig' in names, \
+        f"reused Talking must be per-character, got {sorted(names)}"
+    # Single-user actions keep their bare names.
+    for n in ('Happy', 'CrossedHands', 'Angry', 'Establish_Push'):
+        assert n in names, f"missing animation piece '{n}', got {sorted(names)}"
+
+    cams = {n['name'] for n in gltf.get('nodes', []) if 'camera' in n}
+    assert cams == {'CamEstablish', 'CamAlpha', 'CamBeta'}, f"unexpected cameras: {cams}"
+    assert len(gltf.get('skins', [])) == 2, "expected two rigged characters"
+    assert len(gltf.get('meshes', [])) == 2, "expected two character meshes"
+    assert len(gltf.get('materials', [])) == 2, "each character should have its own material"
+
+    tscn = os.path.join(out_dir, 'scene.tscn')
+    assert os.path.exists(tscn), "scene.tscn (cutscene schedule) was not written next to the .blend"
+    text = open(tscn, encoding='utf-8').read()
+    assert '&"cutscene":' in text, "tscn missing the 'cutscene' animation"
+    for player in ('AlphaRigPlayer', 'BetaRigPlayer'):
+        assert player in text, f"tscn missing per-actor playback track for {player}"
+
+
+@test('cutscene_linked', 'cutscene_linked.py')
+def validate_cutscene_linked(gltf, bin_data, out_dir):
+    """The same cutscene, but the character is a LINKED collection instanced twice.
+    output.glb holds the cameras + two extras.link instance nodes (no inline
+    character geometry); char.glb holds the shared character + its bare-named
+    animations. The schedule is reconstructed and verified in Godot by run_one()."""
+    # Main glb: cameras + Alpha/Beta link nodes, no inline character meshes/skins.
+    cams = {n['name'] for n in gltf.get('nodes', []) if 'camera' in n}
+    assert cams == {'CamEstablish', 'CamAlpha', 'CamBeta'}, f"unexpected cameras: {cams}"
+    link_nodes = {n['name']: n['extras']['link'] for n in gltf.get('nodes', [])
+                  if 'extras' in n and 'link' in n['extras']}
+    assert set(link_nodes) == {'Alpha', 'Beta'}, f"expected Alpha/Beta link nodes, got {set(link_nodes)}"
+    for name, link in link_nodes.items():
+        assert link.endswith(':Character'), f"{name} link should target the Character collection: {link}"
+    assert len(gltf.get('skins', [])) == 0, "linked instances must not inline skins"
+    assert len(gltf.get('meshes', [])) == 0, "linked instances must not inline meshes"
+    anims = {a.get('name') for a in gltf.get('animations', [])}
+    assert anims == {'Establish_Push', 'AlphaCam_Drift', 'BetaCam_Dutch'}, \
+        f"main glb should only hold camera-movement anims, got {sorted(anims)}"
+
+    # The library glb holds the shared character + its (bare-named) clips.
+    char = os.path.join(out_dir, 'char.glb')
+    assert os.path.exists(char), "char.glb (linked library) was not exported"
+    cgltf, _ = parse_glb(char)
+    canims = {a.get('name') for a in cgltf.get('animations', [])}
+    assert {'Talking', 'Happy', 'CrossedHands', 'Angry'} <= canims, \
+        f"char.glb missing bare-named clips, got {sorted(canims)}"
+    assert len(cgltf.get('skins', [])) == 1, "char.glb should have one rigged character"
+
+    # Schedule references the bare clip names (matching char.glb) on per-instance players.
+    text = open(os.path.join(out_dir, 'scene.tscn'), encoding='utf-8').read()
+    assert 'NodePath("AlphaPlayer")' in text and 'NodePath("BetaPlayer")' in text, \
+        "tscn missing per-instance playback tracks"
+    assert '"Talking", "Happy"' in text, "Alpha schedule should use bare clip names"
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -822,6 +912,13 @@ def run_one(name, scene, validator, output_base, timeout=120):
     ok, msg = run_khronos_validator(glb)
     if not ok:
         return False, msg, blender_elapsed
+
+    # If a cutscene was written next to the .blend, reconstruct and
+    # verify it in Godot.
+    if os.path.exists(os.path.join(out_dir, 'scene.tscn')):
+        ok, msg = run_godot_cutscene_check(out_dir)
+        if not ok:
+            return False, msg, blender_elapsed
 
     return True, "OK", blender_elapsed
 

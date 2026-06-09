@@ -32,6 +32,23 @@ def _action_fcurves(action):
                     result.extend(bag.fcurves)
     return result
 
+
+def _slot_fcurves(action, slot_handle):
+    """Return the fcurves of one action slot.
+
+    A single action can drive several IDs through different slots; `slot_handle`
+    picks the channelbag for the slot actually used by a given assignment/strip.
+    Falls back to action.fcurves on Blender <= 4.4 (no slots)."""
+    if hasattr(action, 'fcurves'):
+        return action.fcurves
+    result = []
+    for layer in action.layers:
+        for strip in layer.strips:
+            for bag in getattr(strip, 'channelbags', []):
+                if slot_handle is None or bag.slot_handle == slot_handle:
+                    result.extend(bag.fcurves)
+    return result
+
 class _BinWriter:
     """Append-only binary buffer backed by a single pre-allocated bytearray."""
 
@@ -928,164 +945,205 @@ def mini_export(output_file: str, split: bool = True) -> None:
             bchunk.write(np.asarray(vals, dtype=np.float32))
             ab.write(b',"interpolation":"LINEAR"}')
 
+        _MISS = object()
+
+        def _slot_used(ad, action):
+            """Slot handle in effect (direct or via any NLA strip), else _MISS.
+            None means "no/!slots" (Blender <= 4.4)."""
+            if ad is None:
+                return _MISS
+            if getattr(ad, 'action', None) is action:
+                return getattr(getattr(ad, 'action_slot', None), 'handle', None)
+            for _tr in ad.nla_tracks:
+                for _st in _tr.strips:
+                    if _st.action is action:
+                        return getattr(_st, 'action_slot_handle', None)
+            return _MISS
+
+        def _action_users(action):
+            """(target_obj, slot_handle, domain) for every object that uses `action`.
+            domain: 'xform' (armature bones / camera-light TRS), 'shapekey', 'lightprop'."""
+            users = []
+            for _o in objs:
+                if not isinstance(_o, bpy.types.Object):
+                    continue
+                sh = _slot_used(_o.animation_data, action)
+                if sh is not _MISS:
+                    users.append((_o, sh, 'xform'))
+                if _o.type == 'MESH' and _o.data.shape_keys:
+                    sh = _slot_used(_o.data.shape_keys.animation_data, action)
+                    if sh is not _MISS:
+                        users.append((_o, sh, 'shapekey'))
+                if _o.type == 'LIGHT':
+                    sh = _slot_used(_o.data.animation_data, action)
+                    if sh is not _MISS:
+                        users.append((_o, sh, 'lightprop'))
+            return users
+
         _anim_chunks = []
         for a in _local_actions:
-            # Group fcurves by data path
-            curves = {}
-            for f in _action_fcurves(a):
-                curves.setdefault(f.data_path, [None, None, None, None])[f.array_index] = f
+            users = _action_users(a)
+            if not users:
+                # Loose action (created but never assigned): place it with the old
+                # heuristic so nothing is silently dropped.
+                _paths = {f.data_path for f in _action_fcurves(a)}
+                _tgt = a['armature'] if ('armature' in a and a['armature'] in objs) else None
+                if any(p.startswith('pose.bones') for p in _paths):
+                    if _tgt is None:
+                        _tgt = next((o for o in objs if isinstance(o, bpy.types.Object)
+                                     and o.type == 'ARMATURE'), None)
+                    if _tgt is not None:
+                        users = [(_tgt, None, 'xform')]
+                elif any(p.startswith('key_blocks[') for p in _paths):
+                    _tgt = next((o for o in meshes if o.data.shape_keys), None)
+                    if _tgt is not None:
+                        users = [(_tgt, None, 'shapekey')]
 
-            armature = next(iter(_scene_armatures), None)
-            if 'armature' in a:
-                armature = a['armature'].data
+            # An action reused on more than one target becomes several glTF
+            # animations; disambiguate their names (Godot keys animations by name).
+            multi = len(users) > 1
 
-            shape_key_curves = {}
-            for path, fcs in curves.items():
-                if path.startswith('key_blocks[') and '.value' in path:
-                    shape_key_curves[path.split('"')[1]] = fcs[0]
+            for (target, slot_handle, domain) in users:
+                # Group this slot's fcurves by data path.
+                curves = {}
+                for f in _slot_fcurves(a, slot_handle):
+                    curves.setdefault(f.data_path, [None, None, None, None])[f.array_index] = f
 
-            sk_mesh_obj = None
-            for obj in meshes:
-                sk = obj.data.shape_keys
-                if sk and sk.animation_data and sk.animation_data.action == a:
-                    sk_mesh_obj = obj
-                    break
+                # Transform tracks. Bones and camera/light objects use the same path.
+                # Each entry: (node, gltf_path, curveset, primary_fc, correction)
+                transforms = []
+                pointers = []
+                shape_key_curves = {}
+                sk_mesh_obj = None
 
-            # Transform tracks. Bones and camera/light objects are handled the same
-            # Each entry: (node, gltf_path, curveset, primary_fc, correction)
-            transforms = []
-            for _bname in sorted(curves.keys()):
-                if not _bname.startswith('pose.bones') or armature is None:
+                if domain == 'xform' and target.type == 'ARMATURE':
+                    arm = target.data
+                    for _bname in sorted(curves.keys()):
+                        if not _bname.startswith('pose.bones'):
+                            continue
+                        _stripped = _bname.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
+                        _parts = _stripped.rsplit('.', 1)
+                        if len(_parts) != 2:
+                            continue
+                        _bone_name, _channel = _parts
+                        if _channel not in CHANNEL_MAPPING:
+                            print(f"[minigltf] WARNING: bone '{_bone_name}' uses unsupported channel '{_channel}' - skipping")
+                            continue
+                        _bone = arm.bones.get(_bone_name)
+                        if _bone is None or _bone not in objs:
+                            continue
+                        cs = curves[_bname]
+                        pf = next((fc for fc in cs if fc is not None), None)
+                        if pf is None or len(pf.keyframe_points) == 0:
+                            continue
+                        if _bone.parent:
+                            corr = _bone.parent.matrix_local.inverted_safe() @ _bone.matrix_local
+                        else:
+                            corr = axis_basis_change @ _bone.matrix_local
+                        transforms.append((_bone, CHANNEL_MAPPING[_channel], cs, pf, corr))
+                elif domain == 'xform' and target.type in ('CAMERA', 'LIGHT'):
+                    for _dp, _path in CHANNEL_MAPPING.items():
+                        cs = curves.get(_dp)
+                        pf = next((fc for fc in cs if fc is not None), None) if cs else None
+                        if pf is None or len(pf.keyframe_points) == 0:
+                            continue
+                        transforms.append((target, _path, cs, pf, axis_basis_change))
+                elif domain == 'lightprop' and target.data in lights:
+                    _li = lights.index(target.data)
+                    _lt = target.data
+                    base = f'/extensions/KHR_lights_punctual/lights/{_li}'
+                    ecs = curves.get('energy')
+                    if ecs and ecs[0] and len(ecs[0].keyframe_points):
+                        pointers.append((base + '/intensity', ecs[0], 1,
+                                         lambda t, fc=ecs[0], lt=_lt: [_light_intensity(lt, _fc_val(fc, t))]))
+                    ccs = curves.get('color')
+                    _cpf = next((fc for fc in ccs if fc is not None), None) if ccs else None
+                    if _cpf is not None and len(_cpf.keyframe_points):
+                        pointers.append((base + '/color', _cpf, 3,
+                                         lambda t, cs=ccs: [_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t)]))
+                elif domain == 'shapekey':
+                    for path, fcs in curves.items():
+                        if path.startswith('key_blocks[') and '.value' in path:
+                            shape_key_curves[path.split('"')[1]] = fcs[0]
+                    sk_mesh_obj = target
+
+                _sk_first_fc = next(iter(shape_key_curves.values()), None) if shape_key_curves else None
+                _has_sk_anim = bool(
+                    _sk_first_fc and sk_mesh_obj and sk_mesh_obj in meshes
+                    and sk_mesh_obj.data.shape_keys
+                    and len(sk_mesh_obj.data.shape_keys.key_blocks) > 1
+                    and len(_sk_first_fc.keyframe_points) > 0
+                )
+
+                # Skip usages that produce no channels - an empty animation is invalid glTF.
+                if not transforms and not _has_sk_anim and not pointers:
                     continue
-                _stripped = _bname.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
-                _parts = _stripped.rsplit('.', 1)
-                if len(_parts) != 2:
-                    continue
-                _bone_name, _channel = _parts
-                if _channel not in CHANNEL_MAPPING:
-                    print(f"[minigltf] WARNING: bone '{_bone_name}' uses unsupported channel '{_channel}' - skipping")
-                    continue
-                _bone = next((arm.bones[_bone_name] for arm in _scene_armatures
-                              if _bone_name in arm.bones), None)
-                if _bone is None or _bone not in objs:
-                    continue
-                cs = curves[_bname]
-                pf = next((fc for fc in cs if fc is not None), None)
-                if pf is None or len(pf.keyframe_points) == 0:
-                    continue
-                if _bone.parent:
-                    corr = _bone.parent.matrix_local.inverted_safe() @ _bone.matrix_local
-                else:
-                    corr = axis_basis_change @ _bone.matrix_local
-                transforms.append((_bone, CHANNEL_MAPPING[_channel], cs, pf, corr))
+                if pointers:
+                    _used_anim_pointer = True
 
-            # Camera/light object transforms: exactly the same path as bones
-            for _o in objs:
-                if not (isinstance(_o, bpy.types.Object) and _o.type in ('CAMERA', 'LIGHT')):
-                    continue
-                if not (_o.animation_data and _o.animation_data.action == a):
-                    continue
-                for _dp, _path in CHANNEL_MAPPING.items():
-                    cs = curves.get(_dp)
-                    pf = next((fc for fc in cs if fc is not None), None) if cs else None
-                    if pf is None or len(pf.keyframe_points) == 0:
-                        continue
-                    transforms.append((_o, _path, cs, pf, axis_basis_change))
+                _name = f"{a.name}_{target.name}" if multi else a.name
+                ab = BytesIO()
+                ab.write(b'{"name":' + _je(_name) + b',"channels":[')
+                _sidx = 0
+                for (node, path, cs, pf, corr) in transforms:
+                    ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"node":%d,"path":"%s"}}'
+                             % (_sidx, objs.index(node), path.encode()))
+                    _sidx += 1
+                if _has_sk_anim:
+                    ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"node":%d,"path":"weights"}}'
+                             % (_sidx, objs.index(sk_mesh_obj)))
+                    _sidx += 1
+                for (pointer, pf, n, vfn) in pointers:
+                    ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"path":"pointer","extensions":{"KHR_animation_pointer":{"pointer":'
+                             % _sidx + _je(pointer) + b'}}}}')
+                    _sidx += 1
 
-            # Light property tracks (KHR_animation_pointer): energy -> intensity and
-            # color.
-	    # Each entry: (pointer, primary_fc, n, value_fn(t) -> [n values])
-            pointers = []
-            for _li, _lt in enumerate(lights):
-                if not (_lt.animation_data and _lt.animation_data.action == a):
-                    continue
-                base = f'/extensions/KHR_lights_punctual/lights/{_li}'
-                ecs = curves.get('energy')
-                if ecs and ecs[0] and len(ecs[0].keyframe_points):
-                    pointers.append((base + '/intensity', ecs[0], 1,
-                                     lambda t, fc=ecs[0], lt=_lt: [_light_intensity(lt, _fc_val(fc, t))]))
-                ccs = curves.get('color')
-                _cpf = next((fc for fc in ccs if fc is not None), None) if ccs else None
-                if _cpf is not None and len(_cpf.keyframe_points):
-                    pointers.append((base + '/color', _cpf, 3,
-                                     lambda t, cs=ccs: [_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t)]))
+                ab.write(b'],"samplers":[')
+                _need_comma = False
+                for (node, path, cs, pf, corr) in transforms:
+                    if _need_comma:
+                        ab.write(b',')
+                    _need_comma = True
+                    times = [k.co.x / fps_val for k in pf.keyframe_points]
+                    vals = []
+                    for t in range(len(times)):
+                        if path == 'rotation':
+                            q = mathutils.Quaternion((_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t), _fc_val(cs[3], t)))
+                            r = (corr @ q.to_matrix().to_4x4()).to_quaternion()
+                            vals += (r.x, r.y, r.z, r.w)
+                        elif path == 'scale':
+                            vals += (_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t))
+                        else:  # translation
+                            v = mathutils.Vector((_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t)))
+                            loc = (corr @ mathutils.Matrix.Translation(v).to_4x4()).to_translation()
+                            vals += (loc.x, loc.y, loc.z)
+                    _emit_sampler(ab, times, vals, 4 if path == 'rotation' else 3)
 
-            _sk_first_fc = next(iter(shape_key_curves.values()), None) if shape_key_curves else None
-            _has_sk_anim = bool(
-                _sk_first_fc and sk_mesh_obj and sk_mesh_obj in meshes
-                and sk_mesh_obj.data.shape_keys
-                and len(sk_mesh_obj.data.shape_keys.key_blocks) > 1
-                and len(_sk_first_fc.keyframe_points) > 0
-            )
+                if _has_sk_anim:
+                    if _need_comma:
+                        ab.write(b',')
+                    _need_comma = True
+                    morph_names = [kb.name for kb in sk_mesh_obj.data.shape_keys.key_blocks[1:]]
+                    times = [kp.co.x / fps_val for kp in _sk_first_fc.keyframe_points]
+                    weights = []
+                    for fi in range(len(times)):
+                        for morph_name in morph_names:
+                            fc = shape_key_curves.get(morph_name)
+                            weights.append(fc.keyframe_points[fi].co.y if fc and fi < len(fc.keyframe_points) else 0.0)
+                    _emit_sampler(ab, times, weights, 1)
 
-            # Skip actions that produce no channels - an empty animation is invalid glTF.
-            if not transforms and not _has_sk_anim and not pointers:
-                continue
-            if pointers:
-                _used_anim_pointer = True
+                for (pointer, pf, n, vfn) in pointers:
+                    if _need_comma:
+                        ab.write(b',')
+                    _need_comma = True
+                    times = [k.co.x / fps_val for k in pf.keyframe_points]
+                    vals = []
+                    for t in range(len(times)):
+                        vals += vfn(t)
+                    _emit_sampler(ab, times, vals, n)
 
-            ab = BytesIO()
-            ab.write(b'{"name":' + _je(a.name) + b',"channels":[')
-            _sidx = 0
-            for (node, path, cs, pf, corr) in transforms:
-                ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"node":%d,"path":"%s"}}'
-                         % (_sidx, objs.index(node), path.encode()))
-                _sidx += 1
-            if _has_sk_anim:
-                ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"node":%d,"path":"weights"}}'
-                         % (_sidx, objs.index(sk_mesh_obj)))
-                _sidx += 1
-            for (pointer, pf, n, vfn) in pointers:
-                ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"path":"pointer","extensions":{"KHR_animation_pointer":{"pointer":'
-                         % _sidx + _je(pointer) + b'}}}}')
-                _sidx += 1
-
-            ab.write(b'],"samplers":[')
-            _need_comma = False
-            for (node, path, cs, pf, corr) in transforms:
-                if _need_comma:
-                    ab.write(b',')
-                _need_comma = True
-                times = [k.co.x / fps_val for k in pf.keyframe_points]
-                vals = []
-                for t in range(len(times)):
-                    if path == 'rotation':
-                        q = mathutils.Quaternion((_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t), _fc_val(cs[3], t)))
-                        r = (corr @ q.to_matrix().to_4x4()).to_quaternion()
-                        vals += (r.x, r.y, r.z, r.w)
-                    elif path == 'scale':
-                        vals += (_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t))
-                    else:  # translation
-                        v = mathutils.Vector((_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t)))
-                        loc = (corr @ mathutils.Matrix.Translation(v).to_4x4()).to_translation()
-                        vals += (loc.x, loc.y, loc.z)
-                _emit_sampler(ab, times, vals, 4 if path == 'rotation' else 3)
-
-            if _has_sk_anim:
-                if _need_comma:
-                    ab.write(b',')
-                _need_comma = True
-                morph_names = [kb.name for kb in sk_mesh_obj.data.shape_keys.key_blocks[1:]]
-                times = [kp.co.x / fps_val for kp in _sk_first_fc.keyframe_points]
-                weights = []
-                for fi in range(len(times)):
-                    for morph_name in morph_names:
-                        fc = shape_key_curves.get(morph_name)
-                        weights.append(fc.keyframe_points[fi].co.y if fc and fi < len(fc.keyframe_points) else 0.0)
-                _emit_sampler(ab, times, weights, 1)
-
-            for (pointer, pf, n, vfn) in pointers:
-                if _need_comma:
-                    ab.write(b',')
-                _need_comma = True
-                times = [k.co.x / fps_val for k in pf.keyframe_points]
-                vals = []
-                for t in range(len(times)):
-                    vals += vfn(t)
-                _emit_sampler(ab, times, vals, n)
-
-            ab.write(b']}')
-            _anim_chunks.append(ab.getvalue())
+                ab.write(b']}')
+                _anim_chunks.append(ab.getvalue())
 
         if _anim_chunks:
             jsn.write(b'"animations":[' + b','.join(_anim_chunks) + b'],')
@@ -1268,6 +1326,23 @@ def mini_export(output_file: str, split: bool = True) -> None:
         f.write(_jsn_bytes)
         f.write(_bin_chunk)
     timings['file_io'] = time.perf_counter() - _t
+
+    # Export TSCN file with NLA animation
+    try:
+        try:
+            from . import minitscn as _minitscn
+        except ImportError:
+            import minitscn as _minitscn
+        _blend = bpy.data.filepath
+        if _blend:
+            _tscn = os.path.splitext(bpy.path.abspath(_blend))[0] + '.tscn'
+        elif output_file.lower().endswith(('.glb', '.gltf')):
+            _tscn = output_file.rsplit('.', 1)[0] + '.tscn'
+        else:
+            _tscn = output_file + '.tscn'
+        _minitscn.mini_export_tscn(_tscn)
+    except Exception as _e:
+        print(f'[minigltf] cutscene .tscn export skipped: {_e}')
 
     for o in edited:
         bpy.context.view_layer.objects.active = o
