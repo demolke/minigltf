@@ -36,7 +36,7 @@ mode or handles.
 - PBR metallic-roughness: base color texture, metallic/roughness texture, normal map
 - ORM combined texture (R=occlusion, G=roughness, B=metallic) exported with `occlusionTexture`
 - Scalar fallbacks for base color, metallic, roughness when no texture is connected
-- Emission: `emissiveFactor` (color × strength) or `emissiveTexture`
+- Emission: `emissiveFactor` (color × strength) or `emissiveTexture`; emission brighter than 1.0 uses the `KHR_materials_emissive_strength` extension so the factor stays spec-valid
 - Alpha modes: `BLEND` and `MASK` (with `alphaCutoff`)
 - Double-sided: derived from Blender's backface culling setting
 - Textures referenced by relative path
@@ -59,7 +59,7 @@ mode or handles.
 
 **Lights**
 - Point, sun (directional), and spot lights via the `KHR_lights_punctual` extension
-- Watt → lumen intensity conversion matching Blender's glTF exporter; spot cone angles from `spot_size` / `spot_blend`
+- Watt to lumen intensity conversion matching Blender's glTF exporter; spot cone angles from `spot_size` / `spot_blend`
 - Area lights have no glTF equivalent and are approximated as point lights (with a warning)
 
 **Coordinate system**

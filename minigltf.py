@@ -173,6 +173,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
     skins = []
     cameras = []   # bpy.types.Camera data-blocks, deduped; index == glTF camera index
     lights = []    # bpy.types.Light data-blocks, deduped; index == KHR light index
+    _used_emissive_strength = False  # set when any material exports KHR_materials_emissive_strength
     joints_index = {}
 
     for o in objs:
@@ -666,6 +667,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
             metallicFactor = None
             roughnessFactor = None
             emissiveFactor = None
+            emissiveStrength = None
             if bsdf:
                 if not baseColor:
                     c = bsdf.inputs['Base Color'].default_value
@@ -679,11 +681,18 @@ def mini_export(output_file: str, split: bool = True) -> None:
                     if emit_socket and not emit_socket.is_linked:
                         ev = emit_socket.default_value
                         strength = float(strength_socket.default_value) if strength_socket else 1.0
-                        r = round(ev[0] * strength, 4)
-                        g = round(ev[1] * strength, 4)
-                        b = round(ev[2] * strength, 4)
+                        r = ev[0] * strength
+                        g = ev[1] * strength
+                        b = ev[2] * strength
                         if r or g or b:
-                            emissiveFactor = [r, g, b]
+                            # glTF requires emissiveFactor components in [0,1]; any
+                            # excess (HDR emission) is carried by the
+                            # KHR_materials_emissive_strength extension instead.
+                            peak = max(r, g, b)
+                            if peak > 1.0:
+                                emissiveStrength = round(peak, 4)
+                                r, g, b = r / peak, g / peak, b / peak
+                            emissiveFactor = [round(r, 4), round(g, 4), round(b, 4)]
 
             doubleSided = not m.use_backface_culling
 
@@ -749,6 +758,12 @@ def mini_export(output_file: str, split: bool = True) -> None:
                 jsn.write(b',"emissiveFactor":[')
                 jsn.write(b','.join(str(v).encode() for v in emissiveFactor))
                 jsn.write(b']')
+
+            if emissiveStrength is not None:
+                _used_emissive_strength = True
+                jsn.write(b',"extensions":{"KHR_materials_emissive_strength":{"emissiveStrength":')
+                jsn.write(str(emissiveStrength).encode())
+                jsn.write(b'}}')
 
             jsn.write(b'}')
 
@@ -1143,10 +1158,21 @@ def mini_export(output_file: str, split: bool = True) -> None:
         jsn.write(str(bchunk.tell()).encode())
         jsn.write(b'}],')
 
+    # extensionsUsed (KHR_lights_punctual for lights; KHR_materials_emissive_strength
+    # for any material with HDR emission written above).
+    _ext_used = []
+    if lights:
+        _ext_used.append('KHR_lights_punctual')
+    if _used_emissive_strength:
+        _ext_used.append('KHR_materials_emissive_strength')
+    if _ext_used:
+        jsn.write(b'"extensionsUsed":[')
+        jsn.write(b','.join(_je(e) for e in _ext_used))
+        jsn.write(b'],')
+
     # Lights (KHR_lights_punctual)
     if lights:
         _W2L = 683.0  # watts -> lumens, matches Blender's glTF exporter (SPEC mode)
-        jsn.write(b'"extensionsUsed":["KHR_lights_punctual"],')
         jsn.write(b'"extensions":{"KHR_lights_punctual":{"lights":[')
         for i in range(len(lights)):
             lt = lights[i]

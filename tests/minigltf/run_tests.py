@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from glb_parser import parse_glb, read_accessor
 
 BLENDER = os.environ.get('BLENDER', 'blender')
-VALIDATOR = os.environ.get('GLTF_VALIDATOR', str(Path(__file__).parent.parent / 'validator'))
+VALIDATOR = os.environ.get('GLTF_VALIDATOR', str(Path(REPO_DIR) / 'validator'))
 
 # Severity codes that are intentional deviations from the spec
 _FILTERED_VALIDATOR_CODES = {
@@ -187,13 +187,23 @@ def validate_emission_material(gltf, bin_data, out_dir):
     assert ds_mat is not None, "DoubleSidedMat not found"
     assert ss_mat is not None, "SingleSidedMat not found"
 
-    # Emission: scalar factor with strength applied (color (1,0.5,0) * strength 2.0)
+    # Emission: color (1,0.5,0) * strength 2.0 = (2,1,0). glTF caps emissiveFactor
+    # at 1.0, so the peak (2.0) moves into KHR_materials_emissive_strength and the
+    # factor is normalised by it: (2,1,0)/2 = (1.0, 0.5, 0.0).
     assert 'emissiveFactor' in emit_mat, "EmitScalarMat missing emissiveFactor"
     ef = emit_mat['emissiveFactor']
     assert len(ef) == 3, "emissiveFactor must be a 3-element array"
-    assert abs(ef[0] - 2.0) < 0.01, f"emissiveFactor R expected ~2.0, got {ef[0]}"
-    assert abs(ef[1] - 1.0) < 0.01, f"emissiveFactor G expected ~1.0, got {ef[1]}"
+    assert all(0.0 <= c <= 1.0 for c in ef), f"emissiveFactor out of [0,1]: {ef}"
+    assert abs(ef[0] - 1.0) < 0.01, f"emissiveFactor R expected ~1.0, got {ef[0]}"
+    assert abs(ef[1] - 0.5) < 0.01, f"emissiveFactor G expected ~0.5, got {ef[1]}"
     assert abs(ef[2] - 0.0) < 0.01, f"emissiveFactor B expected ~0.0, got {ef[2]}"
+
+    strength = emit_mat.get('extensions', {}).get('KHR_materials_emissive_strength', {})
+    assert 'emissiveStrength' in strength, "EmitScalarMat missing KHR_materials_emissive_strength"
+    assert abs(strength['emissiveStrength'] - 2.0) < 0.01, \
+        f"emissiveStrength expected ~2.0, got {strength['emissiveStrength']}"
+    assert 'KHR_materials_emissive_strength' in gltf.get('extensionsUsed', []), \
+        "KHR_materials_emissive_strength not declared in extensionsUsed"
 
     # Double-sided: use_backface_culling=False means doubleSided:true
     assert ds_mat.get('doubleSided') is True, "DoubleSidedMat should have doubleSided:true"
