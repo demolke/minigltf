@@ -613,6 +613,61 @@ def validate_linked_collection_instance(gltf, bin_data, out_dir):
     assert abs(t[2] - (-3.0)) < 0.001, f"Z(-Y) expected -3, got {t[2]}"
 
 
+@test('cameras_lights', 'cameras_lights.py')
+def validate_cameras_lights(gltf, bin_data, out_dir):
+    """Cameras export to the glTF cameras array; lights via KHR_lights_punctual."""
+    # Two cameras: one perspective, one orthographic.
+    cams = gltf.get('cameras', [])
+    assert len(cams) == 2, f"expected 2 cameras, got {len(cams)}"
+    persp = next((c for c in cams if c.get('type') == 'perspective'), None)
+    ortho = next((c for c in cams if c.get('type') == 'orthographic'), None)
+    assert persp is not None, "no perspective camera exported"
+    assert ortho is not None, "no orthographic camera exported"
+
+    p = persp['perspective']
+    assert 'yfov' in p and p['yfov'] > 0, "perspective camera missing/zero yfov"
+    assert abs(p['znear'] - 0.1) < 1e-4, f"znear expected 0.1, got {p['znear']}"
+    assert abs(p['zfar'] - 250.0) < 1e-3, f"zfar expected 250, got {p['zfar']}"
+
+    o = ortho['orthographic']
+    for k in ('xmag', 'ymag', 'znear', 'zfar'):
+        assert k in o, f"orthographic camera missing {k}"
+    assert o['xmag'] > 0 and o['ymag'] > 0, "orthographic xmag/ymag must be non-zero"
+
+    # Camera nodes reference camera indices.
+    cam_nodes = [n for n in gltf.get('nodes', []) if 'camera' in n]
+    assert len(cam_nodes) == 2, f"expected 2 nodes referencing cameras, got {len(cam_nodes)}"
+    for n in cam_nodes:
+        assert 0 <= n['camera'] < len(cams), f"node camera index out of range: {n['camera']}"
+
+    # Lights via KHR_lights_punctual.
+    assert 'KHR_lights_punctual' in gltf.get('extensionsUsed', []), \
+        "KHR_lights_punctual not declared in extensionsUsed"
+    lights = gltf.get('extensions', {}).get('KHR_lights_punctual', {}).get('lights', [])
+    assert len(lights) == 3, f"expected 3 lights, got {len(lights)}"
+
+    types = {l['type'] for l in lights}
+    assert types == {'directional', 'point', 'spot'}, f"unexpected light types: {types}"
+
+    for l in lights:
+        assert 'color' in l and len(l['color']) == 3, f"light {l.get('name')} bad color"
+        assert 'intensity' in l, f"light {l.get('name')} missing intensity"
+
+    spot = next(l for l in lights if l['type'] == 'spot')
+    assert 'spot' in spot, "spot light missing spot cone block"
+    inner = spot['spot']['innerConeAngle']
+    outer = spot['spot']['outerConeAngle']
+    assert 0 <= inner < outer, f"spot cone angles invalid: inner={inner}, outer={outer}"
+
+    # Light nodes reference the extension light index.
+    light_nodes = [n for n in gltf.get('nodes', [])
+                   if 'KHR_lights_punctual' in n.get('extensions', {})]
+    assert len(light_nodes) == 3, f"expected 3 light nodes, got {len(light_nodes)}"
+    for n in light_nodes:
+        idx = n['extensions']['KHR_lights_punctual']['light']
+        assert 0 <= idx < len(lights), f"node light index out of range: {idx}"
+
+
 @test('shared_material_meshes', 'shared_material_meshes.py')
 def validate_shared_material_meshes(gltf, bin_data, out_dir):
     """Two meshes sharing one material - 2 meshes, 1 material."""

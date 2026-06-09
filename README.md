@@ -53,6 +53,15 @@ mode or handles.
 - Shape key animation: weight tracks targeting mesh nodes
 - Multiple actions per scene, each becomes a separate glTF animation
 
+**Cameras**
+- Perspective and orthographic cameras exported to the glTF `cameras` array
+- Vertical FOV derived from the camera's sensor fit and the scene render aspect ratio
+
+**Lights**
+- Point, sun (directional), and spot lights via the `KHR_lights_punctual` extension
+- Watt → lumen intensity conversion matching Blender's glTF exporter; spot cone angles from `spot_size` / `spot_blend`
+- Area lights have no glTF equivalent and are approximated as point lights (with a warning)
+
 **Coordinate system**
 - Blender Z-up → glTF Y-up axis conversion applied to all positions, normals, and rotations
 
@@ -62,7 +71,8 @@ mode or handles.
 - **Scale animation** channels are not exported
 - **Textures** are not embedded in the GLB; they must sit alongside the file at the relative paths stored in the material nodes
 - **4 joint influences** maximum; excess groups are dropped
-- **No vertex colours, tangents, IOR, lights, cameras, or particles**
+- **Area lights** are approximated as point lights; **light/camera animation** is not written to the glTF
+- **No vertex colours, tangents, IOR, or particles**
 - Requires **Blender 4.0+**; the Blender addon requires **4.2+**
 
 ## Usage

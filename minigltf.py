@@ -1,6 +1,7 @@
 import bpy
 from io import BytesIO
 import json
+import math
 import mathutils
 import numpy as np
 import os
@@ -124,7 +125,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
     _scene_objs = bpy.context.scene.objects
     objs = []
     for _o in _scene_objs:
-        if _o.type not in ('MESH', 'ARMATURE'):
+        if _o.type not in ('MESH', 'ARMATURE', 'CAMERA', 'LIGHT'):
             continue
         if _o in _overridden_originals:
             continue
@@ -170,6 +171,8 @@ def mini_export(output_file: str, split: bool = True) -> None:
     materials = []
     images = []
     skins = []
+    cameras = []   # bpy.types.Camera data-blocks, deduped; index == glTF camera index
+    lights = []    # bpy.types.Light data-blocks, deduped; index == KHR light index
     joints_index = {}
 
     for o in objs:
@@ -276,6 +279,19 @@ def mini_export(output_file: str, split: bool = True) -> None:
 
                     jsn.write(b',"skin":')
                     jsn.write(str(skins.index(m.object)).encode())
+
+        if isinstance(o, bpy.types.Object) and o.type == 'CAMERA':
+            if o.data not in cameras:
+                cameras.append(o.data)
+            jsn.write(b',"camera":')
+            jsn.write(str(cameras.index(o.data)).encode())
+
+        if isinstance(o, bpy.types.Object) and o.type == 'LIGHT':
+            if o.data not in lights:
+                lights.append(o.data)
+            jsn.write(b',"extensions":{"KHR_lights_punctual":{"light":')
+            jsn.write(str(lights.index(o.data)).encode())
+            jsn.write(b'}}')
 
         if isinstance(o, bpy.types.Object) and o in _collection_instances:
             _col = o.instance_collection
@@ -770,6 +786,60 @@ def mini_export(output_file: str, split: bool = True) -> None:
         jsn.write(b'],')
     timings['materials'] = time.perf_counter() - _t
 
+    # Cameras
+    if cameras:
+        _rd = bpy.context.scene.render
+        _res_x = _rd.resolution_x * _rd.pixel_aspect_x
+        _res_y = _rd.resolution_y * _rd.pixel_aspect_y
+        aspect = (_res_x / _res_y) if _res_y else 1.0
+
+        jsn.write(b'"cameras":[')
+        for i in range(len(cameras)):
+            cam = cameras[i]
+            jsn.write(b'{"name":')
+            jsn.write(_je(cam.name))
+
+            if cam.type == 'ORTHO':
+                # glTF xmag/ymag are half the view volume size along each axis.
+                half = cam.ortho_scale / 2.0
+                fit = cam.sensor_fit
+                if fit == 'VERTICAL' or (fit == 'AUTO' and aspect < 1.0):
+                    ymag = half
+                    xmag = half * aspect
+                else:
+                    xmag = half
+                    ymag = half / aspect if aspect else half
+                jsn.write(b',"type":"orthographic","orthographic":{"xmag":')
+                jsn.write(str(xmag).encode())
+                jsn.write(b',"ymag":')
+                jsn.write(str(ymag).encode())
+                jsn.write(b',"znear":')
+                jsn.write(str(cam.clip_start).encode())
+                jsn.write(b',"zfar":')
+                jsn.write(str(cam.clip_end).encode())
+                jsn.write(b'}}')
+            else:
+                # Convert the sensor-fit FOV (cam.angle) to glTF's vertical FOV.
+                fit = cam.sensor_fit
+                if fit == 'VERTICAL' or (fit == 'AUTO' and aspect < 1.0):
+                    yfov = cam.angle
+                else:
+                    yfov = 2.0 * math.atan(math.tan(cam.angle * 0.5) / aspect)
+                jsn.write(b',"type":"perspective","perspective":{"yfov":')
+                jsn.write(str(yfov).encode())
+                jsn.write(b',"aspectRatio":')
+                jsn.write(str(aspect).encode())
+                jsn.write(b',"znear":')
+                jsn.write(str(cam.clip_start).encode())
+                if cam.clip_end != float('inf'):
+                    jsn.write(b',"zfar":')
+                    jsn.write(str(cam.clip_end).encode())
+                jsn.write(b'}}')
+
+            if i < len(cameras) - 1:
+                jsn.write(b',')
+        jsn.write(b'],')
+
     # Skins
     _t = time.perf_counter()
     if skins:
@@ -1072,6 +1142,63 @@ def mini_export(output_file: str, split: bool = True) -> None:
         jsn.write(b'"buffers":[{"byteLength":')
         jsn.write(str(bchunk.tell()).encode())
         jsn.write(b'}],')
+
+    # Lights (KHR_lights_punctual)
+    if lights:
+        _W2L = 683.0  # watts -> lumens, matches Blender's glTF exporter (SPEC mode)
+        jsn.write(b'"extensionsUsed":["KHR_lights_punctual"],')
+        jsn.write(b'"extensions":{"KHR_lights_punctual":{"lights":[')
+        for i in range(len(lights)):
+            lt = lights[i]
+            if lt.type == 'SUN':
+                gtype = 'directional'
+                intensity = lt.energy
+            elif lt.type == 'SPOT':
+                gtype = 'spot'
+                intensity = lt.energy * _W2L / (4.0 * math.pi)
+            elif lt.type == 'POINT':
+                gtype = 'point'
+                intensity = lt.energy * _W2L / (4.0 * math.pi)
+            else:
+                # AREA (and anything else) has no glTF equivalent - approximate as point.
+                print(f'[minigltf] WARNING light "{lt.name}": type {lt.type} is not '
+                      f'supported by glTF - exporting as a point light')
+                gtype = 'point'
+                intensity = lt.energy * _W2L / (4.0 * math.pi)
+
+            jsn.write(b'{"name":')
+            jsn.write(_je(lt.name))
+            jsn.write(b',"type":"')
+            jsn.write(gtype.encode())
+            jsn.write(b'","color":[')
+            jsn.write(str(lt.color[0]).encode())
+            jsn.write(b',')
+            jsn.write(str(lt.color[1]).encode())
+            jsn.write(b',')
+            jsn.write(str(lt.color[2]).encode())
+            jsn.write(b'],"intensity":')
+            jsn.write(str(intensity).encode())
+
+            if lt.type in ('POINT', 'SPOT') and getattr(lt, 'use_custom_distance', False):
+                jsn.write(b',"range":')
+                jsn.write(str(lt.cutoff_distance).encode())
+
+            if gtype == 'spot':
+                outer = lt.spot_size / 2.0
+                inner = outer * (1.0 - lt.spot_blend)
+                # glTF requires innerConeAngle strictly less than outerConeAngle.
+                if inner >= outer:
+                    inner = outer - 1e-4
+                jsn.write(b',"spot":{"innerConeAngle":')
+                jsn.write(str(inner).encode())
+                jsn.write(b',"outerConeAngle":')
+                jsn.write(str(outer).encode())
+                jsn.write(b'}')
+
+            jsn.write(b'}')
+            if i < len(lights) - 1:
+                jsn.write(b',')
+        jsn.write(b']}},')
 
     # Scene section
     jsn.write(b'"scene":0,\n')
