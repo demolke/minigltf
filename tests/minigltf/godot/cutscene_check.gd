@@ -2,6 +2,11 @@
 # Expects the project to be imported already (godot --headless --import) so the
 # minigltf addon's import extension has built the "Cutscene" AnimationPlayer
 # inside the imported glb scene from the CutsceneData schedule.
+#
+# Also serves as the base script for specialised cutscene checks (see
+# cutscene_lipsync_check.gd): subclasses extend the shared pipeline through
+# the overridable hooks `_pre_drive`, `_advance_subplayers`, `_per_step` and
+# `_post_drive` below.
 extends SceneTree
 
 var failures := 0
@@ -22,6 +27,29 @@ func collapse(seq: Array) -> Array:
 
 func _init() -> void:
 	_main()
+
+
+# Hooks for subclasses
+# Called after track collection and the char-root checks, before the drive
+# loop. `players` maps track path -> AnimationPlayer; `clip_keys` maps track
+# path -> [[time, clip], time-sorted].
+func _pre_drive(_scene: Node, _players: Dictionary, _clip_keys: Dictionary) -> void:
+	pass
+
+# Called every drive step right after the Cutscene player advances, so a
+# subclass can advance the per-node sub players in lockstep (the synchronous
+# loop bypasses the scene tree which would normally advance them).
+func _advance_subplayers(_players: Dictionary, _step: float) -> void:
+	pass
+
+# Called every drive step after the cam/clip observation. The timeline has
+# just moved from `prev_t` to `t` (probe windows are `prev_t < probe.t <= t`).
+func _per_step(_t: float, _prev_t: float) -> void:
+	pass
+
+# Called after the drive loop's final assertions, before RESULT is printed.
+func _post_drive() -> void:
+	pass
 
 
 func _main() -> void:
@@ -55,6 +83,7 @@ func _main() -> void:
 	var players := {}                   # track path string -> AnimationPlayer
 	var cam_keys := []                  # [time, path] where the camera becomes current
 	var expected_clips := {}            # path -> [clips, in time order]
+	var clip_keys := {}                 # path -> [[time, clip], time-sorted]
 	for i in anim.get_track_count():
 		var path := anim.track_get_path(i)
 		var node_path := String(path.get_concatenated_names())
@@ -102,6 +131,7 @@ func _main() -> void:
 						ck(own, "clip '%s' on '%s' only animates its own node" % [clip, node_path])
 					keyed.append([anim.track_get_key_time(i, k), clip])
 				keyed.sort_custom(func(a, b): return a[0] < b[0])
+				clip_keys[node_path] = keyed
 				expected_clips[node_path] = keyed.map(func(e): return e[1])
 
 	cam_keys.sort_custom(func(a, b): return a[0] < b[0])
@@ -109,10 +139,12 @@ func _main() -> void:
 
 	# Regression checks for the coordinate conversion (rotation export):
 	# the character roots are the parents of the per-actor AnimationPlayers.
+	# (Head players sit on a head MeshInstance3D - those are not roots.)
 	var char_roots: Array[Node3D] = []
 	for name in players:
 		var parent := (players[name] as AnimationPlayer).get_parent() as Node3D
-		if parent == null or parent is Camera3D or char_roots.has(parent):
+		if parent == null or parent is Camera3D or parent is MeshInstance3D \
+				or char_roots.has(parent):
 			continue
 		char_roots.append(parent)
 	ck(char_roots.size() == 2, "found 2 character roots (got %d)" % char_roots.size())
@@ -151,6 +183,8 @@ func _main() -> void:
 					"%s Hips rest sits on its root (offset = %.2f, height = %.2f)"
 					% [root.name, horiz, hips_world.y])
 
+	_pre_drive(scene, players, clip_keys)
+
 	# Drive and record.
 	cut.play("cutscene")
 	var observed_cams := []
@@ -163,6 +197,8 @@ func _main() -> void:
 	var frustum_misses := []
 	while t <= anim.length + step:
 		cut.advance(step)
+		_advance_subplayers(players, step)
+		var prev_t := t
 		t += step
 		var current_cam: Camera3D = null
 		for cam_name in cameras:
@@ -174,6 +210,7 @@ func _main() -> void:
 			var cur := String((players[name] as AnimationPlayer).assigned_animation)
 			if cur != "" and (observed_clips[name].is_empty() or observed_clips[name][-1] != cur):
 				observed_clips[name].append(cur)
+		_per_step(t, prev_t)
 		# Every authored shot keeps both characters framed: the midpoint of the
 		# two characters (at chest height) must stay inside the active camera's
 		# frustum. A camera whose rotation exported wrong looks 90 degrees off
@@ -192,6 +229,8 @@ func _main() -> void:
 		var exp: Array = collapse(expected_clips[name])
 		var obs: Array = collapse(observed_clips[name])
 		ck(obs == exp, "%s clips in order: expected %s, observed %s" % [name, exp, obs])
+
+	_post_drive()
 
 	print("RESULT: ", "PASS" if failures == 0 else "FAIL (%d)" % failures)
 	quit(1 if failures > 0 else 0)

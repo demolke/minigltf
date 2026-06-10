@@ -18,16 +18,6 @@ REPO_DIR = str(Path(__file__).parent.parent.parent.resolve())
 SCENES_DIR = str(Path(__file__).parent / 'scenes')
 BLENDER = os.environ.get('BLENDER', 'blender')
 
-_TESTS = []
-
-
-def test(name, scene, timeout=60):
-    def decorator(fn):
-        _TESTS.append((name, scene, fn, timeout))
-        return fn
-    return decorator
-
-
 def run_blender(scene_script, output_dir, timeout=60):
     cmd = [
         BLENDER, '--background', '--python',
@@ -49,7 +39,7 @@ def run_blender(scene_script, output_dir, timeout=60):
     return ok, result.stdout, result.stderr
 
 
-def run_one(name, scene, validator, output_base, timeout=60):
+def run_one(name, scene, output_base, timeout=60):
     out_dir = os.path.join(output_base, name)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -73,62 +63,30 @@ def run_one(name, scene, validator, output_base, timeout=60):
 
 
 # ---------------------------------------------------------------------------
-# Test definitions (scene scripts self-validate and exit 0/1)
+# Test definitions: (name, scene_script) - scene scripts self-validate and
+# exit 0/1. An optional third element overrides the default 60s timeout.
 # ---------------------------------------------------------------------------
 
-@test('basecolor_only', 'test_basecolor_only.py')
-def _t1(out_dir, stdout, stderr): pass
-
-@test('separate_alpha', 'test_separate_alpha.py')
-def _t2(out_dir, stdout, stderr): pass
-
-@test('orm_separate_channels', 'test_orm_separate_channels.py')
-def _t3(out_dir, stdout, stderr): pass
-
-@test('normal_map', 'test_normal_map.py')
-def _t4(out_dir, stdout, stderr): pass
-
-@test('emission_texture', 'test_emission_texture.py')
-def _t5(out_dir, stdout, stderr): pass
-
-@test('scalar_fallbacks', 'test_scalar_fallbacks.py')
-def _t6(out_dir, stdout, stderr): pass
-
-@test('orphaned_material', 'test_orphaned_material.py')
-def _t7(out_dir, stdout, stderr): pass
-
-@test('no_principled_bsdf', 'test_no_principled_bsdf.py')
-def _t8(out_dir, stdout, stderr): pass
-
-@test('disconnected_bsdf', 'test_disconnected_bsdf.py')
-def _t9(out_dir, stdout, stderr): pass
-
-@test('force_overwrite', 'test_force_overwrite.py')
-def _t10(out_dir, stdout, stderr): pass
-
-@test('no_overwrite', 'test_no_overwrite.py')
-def _t11(out_dir, stdout, stderr): pass
-
-@test('dry_run', 'test_dry_run.py')
-def _t12(out_dir, stdout, stderr): pass
-
-@test('multiple_materials', 'test_multiple_materials.py')
-def _t13(out_dir, stdout, stderr): pass
-
-@test('pixel_accuracy_basecolor', 'test_pixel_accuracy_basecolor.py')
-def _t14(out_dir, stdout, stderr): pass
-
-@test('pixel_accuracy_orm', 'test_pixel_accuracy_orm.py')
-def _t15(out_dir, stdout, stderr): pass
-
-@test('rewire_links', 'test_rewire_links.py')
-def _t16(out_dir, stdout, stderr): pass
-
-@test('packed_texture', 'test_packed_texture.py')
-def _t17(out_dir, stdout, stderr): pass
-
-@test('alpha_only', 'test_alpha_only.py')
-def _t18(out_dir, stdout, stderr): pass
+_TESTS = [
+    ('basecolor_only', 'test_basecolor_only.py'),
+    ('separate_alpha', 'test_separate_alpha.py'),
+    ('orm_separate_channels', 'test_orm_separate_channels.py'),
+    ('normal_map', 'test_normal_map.py'),
+    ('emission_texture', 'test_emission_texture.py'),
+    ('scalar_fallbacks', 'test_scalar_fallbacks.py'),
+    ('orphaned_material', 'test_orphaned_material.py'),
+    ('no_principled_bsdf', 'test_no_principled_bsdf.py'),
+    ('disconnected_bsdf', 'test_disconnected_bsdf.py'),
+    ('force_overwrite', 'test_force_overwrite.py'),
+    ('no_overwrite', 'test_no_overwrite.py'),
+    ('dry_run', 'test_dry_run.py'),
+    ('multiple_materials', 'test_multiple_materials.py'),
+    ('pixel_accuracy_basecolor', 'test_pixel_accuracy_basecolor.py'),
+    ('pixel_accuracy_orm', 'test_pixel_accuracy_orm.py'),
+    ('rewire_links', 'test_rewire_links.py'),
+    ('packed_texture', 'test_packed_texture.py'),
+    ('alpha_only', 'test_alpha_only.py'),
+]
 
 
 def main():
@@ -156,10 +114,12 @@ def main():
 
     passed = 0
     failed = 0
-    for name, scene, _, timeout in selected:
+    for entry in selected:
+        name, scene = entry[0], entry[1]
+        timeout = entry[2] if len(entry) > 2 else 60
         sys.stdout.write(f'  {name:<35} ... ')
         sys.stdout.flush()
-        ok, msg, elapsed = run_one(name, scene, None, output_base, timeout=timeout)
+        ok, msg, elapsed = run_one(name, scene, output_base, timeout=timeout)
         if ok:
             print(f'PASS ({elapsed:.2f}s)')
             passed += 1

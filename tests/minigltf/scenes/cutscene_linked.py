@@ -17,31 +17,11 @@ run different performances from a single shared, linked character.
 
 import sys
 import os
-import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from scene_utils import parse_args, export_scene
+from scene_utils import parse_args, export_scene, save_textures
 
 
 CHAR_ACTIONS = ('Talking', 'Happy', 'CrossedHands', 'Angry')
-
-
-def _save_textures(output_dir):
-    import bpy
-    tex_dir = os.path.join(output_dir, 'textures')
-    for img in bpy.data.images:
-        if not img.filepath or img.library:
-            continue
-        base = os.path.basename(img.filepath.replace('//', '').replace('\\', '/'))
-        if not base:
-            continue
-        os.makedirs(tex_dir, exist_ok=True)
-        raw, fmt = img.filepath_raw, img.file_format
-        img.filepath_raw = os.path.join(tex_dir, base)
-        img.file_format = 'PNG'
-        try:
-            img.save()
-        finally:
-            img.filepath_raw, img.file_format = raw, fmt
 
 
 def main():
@@ -68,7 +48,7 @@ def main():
 
     char_blend = os.path.join(args.output_dir, 'char.blend')
     bpy.ops.wm.save_as_mainfile(filepath=char_blend)
-    _save_textures(args.output_dir)
+    save_textures(args.output_dir)
     # Export the library to its own glb (the actions export via the loose-action
     # fallback, targeting the single Char rig, with their bare names).
     mini_export(os.path.join(args.output_dir, 'char.glb'))
@@ -115,13 +95,7 @@ def main():
         scene.timeline_markers.new(f"cut_{fr}", frame=fr).camera = cam
 
     bpy.context.view_layer.update()
-    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(args.output_dir, 'scene.blend'))
-    try:
-        mini_export(os.path.join(args.output_dir, 'output.glb'))
-    except Exception:
-        print("ERROR: mini_export() raised:", file=sys.stderr)
-        traceback.print_exc()
-        sys.exit(1)
+    export_scene(args)
 
 
 main()

@@ -23,6 +23,51 @@ BONES = {
 }
 
 
+def attach_body(scene, name, me, vbone, rig, group_names):
+    """Create the body object for mesh `me`, weight it 1.0 per bone from the
+    vbone {vert_index: bone_name} map, and skin/parent it to `rig`."""
+    body = bpy.data.objects.new(name + "Body", me)
+    scene.collection.objects.link(body)
+    body.rotation_mode = 'XYZ'
+    groups = {bn: body.vertex_groups.new(name=bn) for bn in group_names}
+    for vi, bn in vbone.items():
+        groups[bn].add([vi], 1.0, 'REPLACE')
+    body.modifiers.new("Rig", 'ARMATURE').object = rig
+    body.parent = rig
+    # Body is parented to the rig; local coords must be zero so it sits exactly
+    # on top of the armature (the rig already carries the world-space offset).
+    body.location = (0, 0, 0)
+    body.rotation_euler = (0, 0, 0)
+    return body
+
+
+def make_procedural_material(name, texture_rgba):
+    """A 64x64 generated texture (hue keyed off texture_rgba) wired into a
+    Principled BSDF material. Returns the material."""
+    img = bpy.data.images.new(name + "Tex", 64, 64)
+    r0, g0, b0, _a = texture_rgba
+    base_hue, _s, _v = colorsys.rgb_to_hsv(r0, g0, b0)
+    pixels = []
+    for row in range(64):
+        v_frac = row / 63.0
+        for col in range(64):
+            u_frac = col / 63.0
+            h = (base_hue + u_frac * 0.5 + v_frac * 0.3) % 1.0
+            s = 0.85
+            v = 0.9 * (0.7 + 0.3 * math.sin(u_frac * 6 + v_frac * 4))
+            pr, pg, pb = colorsys.hsv_to_rgb(h, s, v)
+            pixels.extend([pr, pg, pb, 1.0])
+    img.pixels = pixels
+    img.filepath = '//textures/' + name + '.png'
+    mat = bpy.data.materials.new(name + "Mat")
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    tex = mat.node_tree.nodes.new("ShaderNodeTexImage")
+    tex.image = img
+    mat.node_tree.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+    return mat
+
+
 def build_character(scene, name, location=(0, 0, 0), facing_deg=0.0, texture_rgba=(0.8, 0.8, 0.8, 1.0)):
     """Create an armature rig + skinned stick-figure mesh with a flat-colour
     texture. Returns (rig_object, body_object)."""
@@ -68,41 +113,8 @@ def build_character(scene, name, location=(0, 0, 0), facing_deg=0.0, texture_rgb
     bm.to_mesh(me)
     bm.free()
 
-    body = bpy.data.objects.new(name + "Body", me)
-    scene.collection.objects.link(body)
-    body.rotation_mode = 'XYZ'
-    groups = {bn: body.vertex_groups.new(name=bn) for bn in BONES}
-    for vi, bn in vbone.items():
-        groups[bn].add([vi], 1.0, 'REPLACE')
-    body.modifiers.new("Rig", 'ARMATURE').object = rig
-    body.parent = rig
-    # Body is parented to the rig; local coords must be zero so it sits exactly
-    # on top of the armature (the rig already carries the world-space offset).
-    body.location = (0, 0, 0)
-    body.rotation_euler = (0, 0, 0)
-
-    img = bpy.data.images.new(name + "Tex", 64, 64)
-    r0, g0, b0, _a = texture_rgba
-    base_hue, _s, _v = colorsys.rgb_to_hsv(r0, g0, b0)
-    pixels = []
-    for row in range(64):
-        v_frac = row / 63.0
-        for col in range(64):
-            u_frac = col / 63.0
-            h = (base_hue + u_frac * 0.5 + v_frac * 0.3) % 1.0
-            s = 0.85
-            v = 0.9 * (0.7 + 0.3 * math.sin(u_frac * 6 + v_frac * 4))
-            pr, pg, pb = colorsys.hsv_to_rgb(h, s, v)
-            pixels.extend([pr, pg, pb, 1.0])
-    img.pixels = pixels
-    img.filepath = '//textures/' + name + '.png'
-    mat = bpy.data.materials.new(name + "Mat")
-    mat.use_nodes = True
-    bsdf = mat.node_tree.nodes.get("Principled BSDF")
-    tex = mat.node_tree.nodes.new("ShaderNodeTexImage")
-    tex.image = img
-    mat.node_tree.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
-    body.data.materials.append(mat)
+    body = attach_body(scene, name, me, vbone, rig, BONES)
+    body.data.materials.append(make_procedural_material(name, texture_rgba))
     return rig, body
 
 
@@ -207,29 +219,29 @@ def make_camera_rig(scene):
     cams = {
         'est': make_camera(scene, "CamEstablish", (0, -6.0, 1.7), both),
         'a': make_camera(scene, "CamAlpha", (2.6, -1.2, 1.7), (-1, 0, 1.6)),
-        'b': make_camera(scene, "CamBeta", (-2.6, -1.2, 1.7), (1, 0, 1.6), roll=14),
+        'b': make_camera(scene, "CamBeta", (-2.6, -1.2, 1.7), (1, 0, 1.6), roll=8),
     }
     actions = {
+        # A slow, steady dolly push straight along the view axis. The eased
+        # midpoint keeps the move gentle; no lateral jitter or roll bumps.
         'est': obj_action("Establish_Push", {
-            'location': [(1, (0, -6.0, 1.7)), (16, (0.06, -5.4, 1.72)), (28, (-0.05, -5.0, 1.66)),
-                         (40, (0.04, -4.6, 1.71)), (48, (0, -4.2, 1.7))],
+            'location': [(1, (0, -6.0, 1.7)), (24, (0, -5.4, 1.7)), (48, (0, -4.6, 1.7))],
             'rotation_quaternion': [
-                (1, tuple(_look((0, -6, 1.7), both))),
-                (20, tuple(_look((0, -5.2, 1.72), both) @ Quaternion(Vector((0, 0, 1)), math.radians(1.5)))),
-                (48, tuple(_look((0, -4.2, 1.7), both)))],
+                (1, tuple(_look((0, -6.0, 1.7), both))),
+                (48, tuple(_look((0, -4.6, 1.7), both)))],
         }),
         # Each camera action keys rotation on frame 1 too - without it the
         # orientation is undefined while the clip plays and the camera looks
         # wherever the previous clip left it.
         'a': obj_action("AlphaCam_Drift", {
-            'location': [(1, (2.6, -1.2, 1.7)), (48, (2.45, -1.05, 1.74))],
+            'location': [(1, (2.6, -1.2, 1.7)), (48, (2.52, -1.12, 1.72))],
             'rotation_quaternion': [
                 (1, tuple(_look((2.6, -1.2, 1.7), (-1, 0, 1.6)))),
-                (48, tuple(_look((2.45, -1.05, 1.74), (-1, 0, 1.6))))]}),
+                (48, tuple(_look((2.52, -1.12, 1.72), (-1, 0, 1.6))))]}),
         'b': obj_action("BetaCam_Dutch", {
-            'location': [(1, (-2.6, -1.2, 1.7)), (48, (-2.5, -1.1, 1.72))],
+            'location': [(1, (-2.6, -1.2, 1.7)), (48, (-2.55, -1.15, 1.71))],
             'rotation_quaternion': [
-                (1, tuple(_look((-2.6, -1.2, 1.7), (1, 0, 1.6), roll=14))),
-                (48, tuple(_look((-2.5, -1.1, 1.72), (1, 0, 1.6), roll=14)))]}),
+                (1, tuple(_look((-2.6, -1.2, 1.7), (1, 0, 1.6), roll=8))),
+                (48, tuple(_look((-2.55, -1.15, 1.71), (1, 0, 1.6), roll=8)))]}),
     }
     return cams, actions

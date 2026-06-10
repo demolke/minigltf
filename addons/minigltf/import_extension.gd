@@ -101,24 +101,47 @@ func _own(node: Node, scene: Node) -> void:
 
 
 # --- pass 2: split the master AnimationPlayer per animated node ---------------
+
+# The actor a track belongs to. Transform/bone tracks belong to the top-level
+# node (the rig or camera); blend-shape tracks belong to the mesh node itself
+# (its last path name) - the importer may nest a skinned MeshInstance3D under
+# the rig's Skeleton3D, yet its shape-key clips form their own schedule lane.
+func _track_target(anim: Animation, i: int) -> String:
+	var p := anim.track_get_path(i)
+	if p.get_name_count() == 0:
+		return ""
+	if anim.track_get_type(i) == Animation.TYPE_BLEND_SHAPE:
+		return String(p.get_name(p.get_name_count() - 1))
+	return String(p.get_name(0))
+
+
+# Resolve an actor name to its node: top-level first (the common case), then
+# anywhere in the tree (skinned meshes get reparented under their Skeleton3D).
+func _actor_node(scene: Node, target: String) -> Node:
+	var node := scene.get_node_or_null(NodePath(target))
+	if node == null:
+		node = scene.find_child(target, true, false)
+	return node
+
+
 func _split_master_player(scene: Node) -> void:
 	var master: AnimationPlayer = scene.get_node_or_null("AnimationPlayer")
 	if master == null:
 		return
 
-	# Top-level animated node name for every track in every clip.
+	# Animated actor name for every track in every clip.
 	var targets := {}
 	for lib_name in master.get_animation_library_list():
 		var lib := master.get_animation_library(lib_name)
 		for anim_name in lib.get_animation_list():
 			var anim := lib.get_animation(anim_name)
 			for i in anim.get_track_count():
-				var p := anim.track_get_path(i)
-				if p.get_name_count() > 0:
-					targets[String(p.get_name(0))] = true
+				var target := _track_target(anim, i)
+				if target != "":
+					targets[target] = true
 
 	for target in targets:
-		var node := scene.get_node_or_null(NodePath(target))
+		var node := _actor_node(scene, target)
 		if node == null:
 			continue
 		var ap := AnimationPlayer.new()
@@ -133,8 +156,7 @@ func _split_master_player(scene: Node) -> void:
 			for anim_name in src.get_animation_list():
 				var anim: Animation = src.get_animation(anim_name).duplicate(true)
 				for i in range(anim.get_track_count() - 1, -1, -1):
-					var p := anim.track_get_path(i)
-					if p.get_name_count() == 0 or String(p.get_name(0)) != target:
+					if _track_target(anim, i) != target:
 						anim.remove_track(i)
 				if anim.get_track_count() > 0:
 					lib.add_animation(anim_name, anim)
@@ -184,8 +206,13 @@ func _build_cutscene(scene: Node) -> void:
 	# passes 1 and 2 created.
 	for lane in data.get("playback", []):
 		var t := anim.add_track(Animation.TYPE_ANIMATION)
-		anim.track_set_path(t, NodePath(
-				String(lane["actor"]).validate_node_name() + "/AnimationPlayer"))
+		# Actors are usually top-level nodes, but shape-key lanes name the mesh
+		# node itself, which the importer may have nested under a Skeleton3D.
+		var actor := String(lane["actor"]).validate_node_name()
+		var actor_node := _actor_node(scene, actor)
+		var prefix := actor if actor_node == null \
+				else String(scene.get_path_to(actor_node))
+		anim.track_set_path(t, NodePath(prefix + "/AnimationPlayer"))
 		for key in lane["keys"]:
 			anim.animation_track_insert_key(t, float(key[0]), String(key[1]))
 

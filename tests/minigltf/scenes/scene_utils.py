@@ -82,7 +82,29 @@ def assign_action(anim_data, action, id_type='OBJECT'):
         anim_data.action_slot = _ensure_slot(action, id_type)
 
 
-def export_scene(args):
+def save_textures(output_dir):
+    """Write local (non-linked) textures to <output_dir>/textures so Godot can
+    load them alongside the .glb. Linked-library images are skipped."""
+    tex_dir = os.path.join(output_dir, 'textures')
+    for img in bpy.data.images:
+        if not img.filepath or img.library:
+            continue
+        basename = os.path.basename(img.filepath.replace('//', '').replace('\\', '/'))
+        if not basename:
+            continue
+        os.makedirs(tex_dir, exist_ok=True)
+        old_raw, old_fmt = img.filepath_raw, img.file_format
+        img.filepath_raw = os.path.join(tex_dir, basename)
+        img.file_format = 'PNG'
+        try:
+            img.save()
+        except Exception as e:
+            print(f'Warning: could not save texture {basename}: {e}', flush=True)
+        finally:
+            img.filepath_raw, img.file_format = old_raw, old_fmt
+
+
+def export_scene(args, glb_name='output.glb', **export_kwargs):
     """Run mini_export and save the .blend file to args.output_dir."""
     import traceback
     try:
@@ -93,32 +115,12 @@ def export_scene(args):
         sys.exit(1)
     os.makedirs(args.output_dir, exist_ok=True)
     try:
-        mini_export(os.path.join(args.output_dir, 'output.glb'))
+        mini_export(os.path.join(args.output_dir, glb_name), **export_kwargs)
     except Exception:
         print("ERROR: mini_export() raised an exception:", file=sys.stderr)
         traceback.print_exc()
         sys.exit(1)
 
-    # Write textures to disk so Godot can load them alongside the .glb.
-    _tex_dir = os.path.join(args.output_dir, 'textures')
-    for _img in bpy.data.images:
-        _fp = _img.filepath
-        if not _fp:
-            continue
-        _basename = os.path.basename(_fp.replace('//', '').replace('\\', '/'))
-        if not _basename:
-            continue
-        os.makedirs(_tex_dir, exist_ok=True)
-        _dest = os.path.join(_tex_dir, _basename)
-        _old_raw = _img.filepath_raw
-        _old_fmt = _img.file_format
-        _img.filepath_raw = _dest
-        _img.file_format = 'PNG'
-        try:
-            _img.save()
-        except Exception as _e:
-            print(f'Warning: could not save texture {_basename}: {_e}', flush=True)
-        _img.filepath_raw = _old_raw
-        _img.file_format = _old_fmt
+    save_textures(args.output_dir)
 
     bpy.ops.wm.save_as_mainfile(filepath=os.path.join(args.output_dir, 'scene.blend'))

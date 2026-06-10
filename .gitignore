@@ -1,4 +1,5 @@
 data
+!tests/minigltf/data/
 validator
 __pycache__/
 *.pyc

@@ -19,7 +19,6 @@ import datetime
 import json
 import os
 import shutil
-import struct
 import subprocess
 import sys
 import time
@@ -102,20 +101,12 @@ def _run_godot_script(godot, out_dir, script, label):
     return False, f"{label} failed:\n" + '\n'.join(lines[-25:] or out.splitlines()[-25:])
 
 
-def run_godot_cutscene_check(out_dir):
-    """Create a Godot project, import it (runs the addon), then verify the cutscene."""
-    godot, msg = _setup_godot_project(out_dir, "minigltf cutscene")
+def run_godot_check(out_dir, script):
+    """Create a Godot project, import it (runs the addon), then run `script` in it."""
+    godot, msg = _setup_godot_project(out_dir, "minigltf check")
     if godot is None:
         return True, msg
-    return _run_godot_script(godot, out_dir, "cutscene_check.gd", "godot cutscene check")
-
-
-def run_godot_camera_orbit_check(out_dir):
-    """Create a Godot project for the camera_orbit scene and verify camera framing."""
-    godot, msg = _setup_godot_project(out_dir, "minigltf camera orbit")
-    if godot is None:
-        return True, msg
-    return _run_godot_script(godot, out_dir, "camera_orbit_check.gd", "godot camera orbit check")
+    return _run_godot_script(godot, out_dir, script, f"godot check ({script})")
 
 # Severity codes that are intentional deviations from the spec
 _FILTERED_VALIDATOR_CODES = {
@@ -131,9 +122,11 @@ _FILTERED_VALIDATOR_CODES = {
 _TESTS = []
 
 
-def test(name, scene, timeout=120):
+def test(name, scene, timeout=120, godot=None):
+    """Register a test. `godot` names a script from tests/minigltf/godot/ to run
+    in a Godot project built around the exported glb (the Godot phase)."""
     def decorator(fn):
-        _TESTS.append((name, scene, fn, timeout))
+        _TESTS.append((name, scene, fn, timeout, godot))
         return fn
     return decorator
 
@@ -667,8 +660,6 @@ def validate_linked_library(gltf, bin_data, out_dir):
     assert 'skins' in gltf, "expected skins (armature)"
 
     # Exactly one armature node - no duplicate from override_create
-    arm_nodes = [n for n in gltf.get('nodes', []) if 'mesh' not in n and 'children' in n
-                 or n.get('name', '').endswith('Armature')]
     node_names = [n.get('name', '') for n in gltf.get('nodes', [])]
     assert node_names.count('CharArmature') == 1, (
         f"expected exactly 1 CharArmature node, got {node_names.count('CharArmature')} - "
@@ -866,12 +857,12 @@ def validate_animated_cam_light(gltf, bin_data, out_dir):
     assert cv[3] == 1.0 and cv[4] == 0.0 and cv[5] == 0.0, f"last color {cv[3:6]}"
 
 
-@test('camera_orbit', 'camera_orbit.py')
+@test('camera_orbit', 'camera_orbit.py', godot='camera_orbit_check.gd')
 def validate_camera_orbit(gltf, bin_data, out_dir):
     """A camera orbits a cube (radius 6, height 3, 13 keys every 30 degrees), always
     aimed at it. Checks the glTF structure here; the full in-engine framing
     check (static pose + every animated frame) runs in Godot via
-    camera_orbit_check.gd (triggered by run_one when a Camera node is present)."""
+    camera_orbit_check.gd."""
     cam_nodes = [n for n in gltf['nodes'] if 'camera' in n]
     assert len(cam_nodes) == 1, f"expected 1 camera node, got {len(cam_nodes)}"
     cam_i = next(i for i, n in enumerate(gltf['nodes']) if 'camera' in n)
@@ -909,13 +900,13 @@ def validate_shared_material_meshes(gltf, bin_data, out_dir):
     assert mat_idx_a == mat_idx_b, "both meshes should reference the same material"
 
 
-@test('cutscene', 'cutscene.py')
+@test('cutscene', 'cutscene.py', godot='cutscene_check.gd')
 def validate_cutscene(gltf, bin_data, out_dir):
     """A four-shot, two-character cutscene. The glb carries the individual
     animation pieces (a reused 'Talking' action exported per character) plus the
     NLA schedule in the extras of a CutsceneData node. The glb half is checked
     here; the Cutscene player the post-import script rebuilds from the schedule
-    is verified in Godot by run_one()'s cutscene check."""
+    is verified in Godot by cutscene_check.gd."""
     names = {a.get('name') for a in gltf.get('animations', [])}
     # The reused action is exported once per character (author once, export twice).
     assert 'Talking_AlphaRig' in names and 'Talking_BetaRig' in names, \
@@ -950,12 +941,13 @@ def validate_cutscene(gltf, bin_data, out_dir):
     assert data['length'] > 0, "schedule length must be positive"
 
 
-@test('cutscene_linked', 'cutscene_linked.py')
+@test('cutscene_linked', 'cutscene_linked.py', godot='cutscene_check.gd')
 def validate_cutscene_linked(gltf, bin_data, out_dir):
     """The same cutscene, but the character is a LINKED collection instanced twice.
     output.glb holds the cameras + two extras.link instance nodes (no inline
     character geometry); char.glb holds the shared character + its bare-named
-    animations. The schedule is reconstructed and verified in Godot by run_one()."""
+    animations. The schedule is reconstructed and verified in Godot by
+    cutscene_check.gd."""
     # Main glb: cameras + Alpha/Beta link nodes, no inline character meshes/skins.
     cams = {n['name'] for n in gltf.get('nodes', []) if 'camera' in n}
     assert cams == {'CamEstablish', 'CamAlpha', 'CamBeta'}, f"unexpected cameras: {cams}"
@@ -991,6 +983,104 @@ def validate_cutscene_linked(gltf, bin_data, out_dir):
     assert all(c in {'Talking', 'Happy', 'CrossedHands', 'Angry'}
                for c in lanes['Alpha'] + lanes['Beta']), \
         f"linked lanes must use bare clip names: {lanes}"
+
+
+@test('cutscene_lipsync', 'cutscene_lipsync.py', timeout=300,
+      godot='cutscene_lipsync_check.gd')
+def validate_cutscene_lipsync(gltf, bin_data, out_dir):
+    """The four-shot cutscene with detailed humanoids: 48-bone rigs plus a
+    separate scanned head per character (52 ARKit shape keys) whose facial
+    performances export as weights-path clips and get their own schedule lanes.
+    The glb half is checked here; shape-key transfer and timeline playback are
+    verified in Godot by cutscene_lipsync_check.gd."""
+    # --- head meshes: 52 morph targets + matching extras.targetNames ----------
+    meshes = {m.get('name'): m for m in gltf.get('meshes', [])}
+    assert {'AlphaHead', 'BetaHead'} <= set(meshes), \
+        f"missing head meshes, got {sorted(meshes)}"
+    target_names = None
+    for head in ('AlphaHead', 'BetaHead'):
+        prim = meshes[head]['primitives'][0]
+        targets = prim.get('targets', [])
+        assert len(targets) == 52, f"{head}: expected 52 morph targets, got {len(targets)}"
+        for i, tgt in enumerate(targets):
+            assert 'POSITION' in tgt, f"{head} morph target {i} missing POSITION"
+        names = meshes[head].get('extras', {}).get('targetNames', [])
+        assert len(names) == 52, f"{head}: expected 52 targetNames, got {len(names)}"
+        assert target_names is None or names == target_names, \
+            "AlphaHead and BetaHead targetNames differ"
+        target_names = names
+    for expected in ('jawOpen', 'mouthSmile_L', 'browDown_L', 'eyeBlink_L',
+                     'mouthPucker', 'mouthStretch_R', 'tongueOut'):
+        assert expected in target_names, f"targetNames missing '{expected}'"
+
+    # --- face clips: weights-path channels on the right head nodes ------------
+    anims = {a.get('name'): a for a in gltf.get('animations', [])}
+    face_clip_targets = {
+        'TalkingFace_AlphaHead': 'AlphaHead',
+        'TalkingFace_BetaHead': 'BetaHead',
+        'HappyFace': 'AlphaHead',
+        'AngryFace': 'BetaHead',
+        'CrossedHandsFace': 'BetaHead',
+    }
+    for clip, head in face_clip_targets.items():
+        assert clip in anims, f"missing face clip '{clip}', got {sorted(anims)}"
+        channels = anims[clip]['channels']
+        weights_chs = [c for c in channels if c['target'].get('path') == 'weights']
+        assert len(weights_chs) == 1, \
+            f"{clip}: expected 1 weights channel, got {len(weights_chs)}"
+        node = gltf['nodes'][weights_chs[0]['target']['node']]
+        assert node.get('name') == head, \
+            f"{clip}: weights channel targets '{node.get('name')}', expected '{head}'"
+
+    # --- spot-check decoded TalkingFace jawOpen keyframes ----------------------
+    jaw = target_names.index('jawOpen')
+    expected_jaw = [0.0, 0.6, 0.1, 0.5, 0.15, 0.45, 0.0]
+    expected_frames = [1, 8, 16, 24, 32, 40, 48]
+    for clip in ('TalkingFace_AlphaHead', 'TalkingFace_BetaHead'):
+        anim = anims[clip]
+        ch = next(c for c in anim['channels'] if c['target']['path'] == 'weights')
+        sampler = anim['samplers'][ch['sampler']]
+        times = read_accessor(gltf, bin_data, sampler['input'])
+        assert len(times) == 7, f"{clip}: expected 7 keyframes, got {len(times)}"
+        for t, fr in zip(times, expected_frames):
+            assert abs(t - fr / 24.0) < 1e-4, \
+                f"{clip}: keyframe at {t:.4f}s, expected frame {fr} ({fr / 24.0:.4f}s)"
+        weights = read_accessor(gltf, bin_data, sampler['output'])
+        assert len(weights) == 7 * 52, \
+            f"{clip}: expected 7*52 weight values, got {len(weights)}"
+        for f, exp in enumerate(expected_jaw):
+            got = weights[f * 52 + jaw]
+            assert abs(got - exp) < 1e-4, \
+                f"{clip}: jawOpen frame {f} expected {exp}, got {got}"
+
+    # --- bone clips, cameras, rig structure ------------------------------------
+    for clip in ('Talking_Alpha', 'Talking_Beta', 'Happy', 'Angry', 'CrossedHands'):
+        assert clip in anims, f"missing bone clip '{clip}', got {sorted(anims)}"
+    cams = {n['name'] for n in gltf.get('nodes', []) if 'camera' in n}
+    assert cams == {'CamEstablish', 'CamAlpha', 'CamBeta'}, f"unexpected cameras: {cams}"
+    assert len(gltf.get('skins', [])) == 2, "expected two rigged characters"
+    for skin in gltf['skins']:
+        assert len(skin['joints']) == 48, \
+            f"expected 48-bone rigs, got {len(skin['joints'])} joints"
+    _assert_skinned_mesh_under_armature(gltf)
+
+    # --- CutsceneData schedule: 7 lanes including the head lanes ---------------
+    _assert_glb_only(out_dir)
+    data = _cutscene_data(gltf)
+    lanes = {l['actor']: [k[1] for k in l['keys']] for l in data['playback']}
+    assert set(lanes) == {'Alpha', 'AlphaHead', 'Beta', 'BetaHead',
+                          'CamEstablish', 'CamAlpha', 'CamBeta'}, \
+        f"expected 7 lanes, got {sorted(lanes)}"
+    assert lanes['AlphaHead'] == ['TalkingFace_AlphaHead', 'HappyFace',
+                                  'TalkingFace_AlphaHead', 'TalkingFace_AlphaHead'], \
+        f"unexpected AlphaHead lane: {lanes['AlphaHead']}"
+    assert lanes['BetaHead'] == ['TalkingFace_BetaHead', 'CrossedHandsFace',
+                                 'AngryFace', 'TalkingFace_BetaHead'], \
+        f"unexpected BetaHead lane: {lanes['BetaHead']}"
+    cut_cams = [c['camera'] for c in data['cuts']]
+    assert cut_cams == ['CamEstablish', 'CamAlpha', 'CamBeta', 'CamEstablish'], \
+        f"unexpected camera-cut order: {cut_cams}"
+    assert data['length'] > 0, "schedule length must be positive"
 
 
 # ---------------------------------------------------------------------------
@@ -1040,7 +1130,7 @@ def run_blender(scene_script, output_dir, timeout=120):
     return result.returncode == 0, result.stdout, result.stderr
 
 
-def run_one(name, scene, validator, output_base, timeout=120):
+def run_one(name, scene, validator, output_base, timeout=120, godot_script=None):
     out_dir = os.path.join(output_base, name)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1070,18 +1160,10 @@ def run_one(name, scene, validator, output_base, timeout=120):
     if not ok:
         return False, msg, blender_elapsed
 
-    # If the glb carries a cutscene (a CutsceneData schedule node), reconstruct
-    # and verify it in Godot via the addon.
-    if any(n.get('name') == 'CutsceneData' for n in gltf.get('nodes', [])):
-        ok, msg = run_godot_cutscene_check(out_dir)
-        if not ok:
-            return False, msg, blender_elapsed
-
-    # If the glb has a camera and an Orbit animation, verify framing in Godot.
-    has_cam = any('camera' in n for n in gltf.get('nodes', []))
-    has_orbit = any(a.get('name') == 'Orbit' for a in gltf.get('animations', []))
-    if has_cam and has_orbit:
-        ok, msg = run_godot_camera_orbit_check(out_dir)
+    # Godot phase: tests declared with @test(..., godot='<script>.gd') get their
+    # glb imported into a Godot project (running the addon) and the script run.
+    if godot_script:
+        ok, msg = run_godot_check(out_dir, godot_script)
         if not ok:
             return False, msg, blender_elapsed
 
@@ -1114,10 +1196,11 @@ def main():
 
     passed = 0
     failed = 0
-    for name, scene, validator, timeout in selected:
+    for name, scene, validator, timeout, godot_script in selected:
         sys.stdout.write(f"  {name:<25} ... ")
         sys.stdout.flush()
-        ok, msg, elapsed = run_one(name, scene, validator, output_base, timeout=timeout)
+        ok, msg, elapsed = run_one(name, scene, validator, output_base,
+                                   timeout=timeout, godot_script=godot_script)
         if ok:
             print(f"PASS ({elapsed:.2f}s)")
             passed += 1
