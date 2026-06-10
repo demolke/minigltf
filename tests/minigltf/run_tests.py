@@ -1175,14 +1175,14 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('tests', nargs='*', help="Names of tests to run (default: all)")
     parser.add_argument('--output-dir', default=None,
-                        help="Directory for test artifacts (default: test_runs/<timestamp>)")
+                        help="Directory for test artifacts (default: _test_runs/<timestamp>)")
     args = parser.parse_args()
 
     if args.output_dir:
         output_base = args.output_dir
     else:
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_base = os.path.join(REPO_DIR, 'test_runs', ts)
+        output_base = os.path.join(REPO_DIR, '_test_runs', ts)
     os.makedirs(output_base, exist_ok=True)
 
     selected = [t for t in _TESTS if (not args.tests or t[0] in args.tests)]

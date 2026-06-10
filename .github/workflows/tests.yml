@@ -52,6 +52,6 @@ jobs:
 
       - name: Benchmark
         run: |
-          BLEND=$(ls -t test_runs/*/large_perf/scene.blend | head -1)
+          BLEND=$(ls -t _test_runs/*/large_perf/scene.blend | head -1)
           "$BLENDER" --background "$BLEND" \
             --python tests/bench.py -- --runs 5
