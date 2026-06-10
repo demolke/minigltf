@@ -44,7 +44,8 @@ def attach_body(scene, name, me, vbone, rig, group_names):
 def make_procedural_material(name, texture_rgba):
     """A 64x64 generated texture (hue keyed off texture_rgba) wired into a
     Principled BSDF material. Returns the material."""
-    img = bpy.data.images.new(name + "Tex", 64, 64)
+    img = bpy.data.images.new(name + "Tex", 64, 64, float_buffer=False)
+    img.colorspace_settings.name = 'sRGB'
     r0, g0, b0, _a = texture_rgba
     base_hue, _s, _v = colorsys.rgb_to_hsv(r0, g0, b0)
     pixels = []
@@ -58,6 +59,7 @@ def make_procedural_material(name, texture_rgba):
             pr, pg, pb = colorsys.hsv_to_rgb(h, s, v)
             pixels.extend([pr, pg, pb, 1.0])
     img.pixels = pixels
+    img.pack()
     img.filepath = '//textures/' + name + '.png'
     mat = bpy.data.materials.new(name + "Mat")
     mat.use_nodes = True
