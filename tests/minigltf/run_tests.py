@@ -98,7 +98,7 @@ def _run_godot_script(godot, out_dir, script, label):
     if 'RESULT: PASS' in out:
         return True, "OK"
     lines = [l for l in out.splitlines() if 'FAIL' in l or 'RESULT' in l]
-    return False, f"{label} failed:\n" + '\n'.join(lines[-25:] or out.splitlines()[-25:])
+    return False, f"{label} failed:\n" + '\n'.join(lines or out.splitlines())
 
 
 def run_godot_check(out_dir, script):

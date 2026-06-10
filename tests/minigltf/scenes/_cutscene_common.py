@@ -190,8 +190,7 @@ def push(obj, act, start, tname):
     s = tr.strips.new(act.name, int(start), act)
     if act.slots:
         s.action_slot = act.slots[0]
-    if hasattr(obj, 'type') and obj.type == 'ARMATURE':
-        s.extrapolation = 'NOTHING'
+    s.extrapolation = 'HOLD_FORWARD'
     # strips.new() sets animation_data.action as a side effect in Blender 5.0+,
     # leaving an unpushed override strip that shadows the NLA in the viewport.
     obj.animation_data.action = None
