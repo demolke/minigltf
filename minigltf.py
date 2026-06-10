@@ -83,6 +83,104 @@ def _je(s: str) -> bytes:
     return json.dumps(s).encode()
 
 
+# --- Cutscene (NLA schedule) support -----------------------------------------
+#
+# glTF cannot express the NLA timeline (camera cuts + per-actor strip schedule),
+# so the schedule is stored as JSON in the extras of a synthetic "CutsceneData"
+# node inside the glb. The Godot addon in addons/minigltf/ (a registered
+# GLTFDocumentExtension) reads it back at import time and builds the "Cutscene"
+# AnimationPlayer:
+#   - value tracks toggle <Camera>:current at the marker times,
+#   - animation-playback tracks drive <Actor>/AnimationPlayer, naming the glb
+#     clip to play. Two characters can therefore run different clips at once.
+# The addon also splits the master AnimationPlayer Godot's importer creates
+# into one AnimationPlayer per animated top-level node (per Blender animation
+# target), pruning each clip down to the tracks that drive that node, and
+# resolves extras.link linked-library glbs.
+
+
+def _anim_data_holders(obj):
+    """The animation_data holders that contribute glTF animations for obj."""
+    holders = []
+    if obj.animation_data:
+        holders.append(obj.animation_data)
+    if obj.type == 'MESH' and obj.data.shape_keys and obj.data.shape_keys.animation_data:
+        holders.append(obj.data.shape_keys.animation_data)
+    if obj.type == 'LIGHT' and obj.data.animation_data:
+        holders.append(obj.data.animation_data)
+    return holders
+
+
+def _action_target_counts(scene):
+    """{action_name: number of distinct LOCAL target objects that use it} - mirrors
+    the 'multiple users => suffix the name' rule in the animation export. Linked
+    actions are excluded: they live in a library glb where they target a single
+    character, so they keep their bare name there and must be referenced bare
+    from the schedule."""
+    targets = {}
+    for obj in scene.objects:
+        used = set()
+        for ad in _anim_data_holders(obj):
+            if ad.action and not ad.action.library:
+                used.add(ad.action.name)
+            for tr in ad.nla_tracks:
+                for st in tr.strips:
+                    if st.action and not st.action.library:
+                        used.add(st.action.name)
+        for name in used:
+            targets.setdefault(name, set()).add(obj.name)
+    return {name: len(objs) for name, objs in targets.items()}
+
+
+def _clip_name(action_name, target_name, counts):
+    return action_name if counts.get(action_name, 1) <= 1 else f"{action_name}_{target_name}"
+
+
+def _cutscene_schedule():
+    """The NLA schedule for the current scene as a JSON-ready dict, or None
+    when there is no cutscene (no camera-bound markers and no NLA strips)."""
+    scene = bpy.context.scene
+    fps = scene.render.fps * scene.render.fps_base
+    counts = _action_target_counts(scene)
+
+    # Camera cuts from camera-bound markers.
+    markers = sorted((m for m in scene.timeline_markers if m.camera is not None),
+                     key=lambda m: m.frame)
+    cuts = [{'time': m.frame / fps, 'camera': m.camera.name} for m in markers]
+
+    # Per-actor playback schedule: actor object name -> [[start_sec, clip_name]],
+    # plus the end of the last strip so the cutscene runs to completion.
+    playback = []
+    end_sec = 0.0
+    for obj in scene.objects:
+        keys = []
+        for ad in _anim_data_holders(obj):
+            for tr in ad.nla_tracks:
+                if tr.mute:
+                    continue
+                for st in tr.strips:
+                    if st.mute or st.action is None:
+                        continue
+                    keys.append([st.frame_start / fps,
+                                 _clip_name(st.action.name, obj.name, counts)])
+                    end_sec = max(end_sec, st.frame_end / fps)
+        if keys:
+            keys.sort(key=lambda k: k[0])
+            playback.append({'actor': obj.name, 'keys': keys})
+
+    if not cuts and not playback:
+        return None
+
+    length = end_sec
+    for c in cuts:
+        length = max(length, c['time'])
+    for lane in playback:
+        length = max(length, lane['keys'][-1][0])
+
+    return {'version': 1, 'fps': fps, 'length': length,
+            'cuts': cuts, 'playback': playback}
+
+
 # Watts -> lumens, matching Blender's glTF exporter (SPEC mode). Used for both the
 # static light intensity and its animation so the two stay consistent.
 _WATTS_TO_LUMENS = 683.0
@@ -193,7 +291,9 @@ def mini_export(output_file: str, split: bool = True) -> None:
             continue
         armature = a.data
         for b in armature.bones:
-            world_matrix[b] = (a.matrix_world @ b.matrix_local) @ axis_basis_change
+            # Armature-space, NOT world: bone nodes are children of the armature
+            # node, which already carries the object's world transform.
+            world_matrix[b] = b.matrix_local @ axis_basis_change
 
     accessors = []
     bufferViews = []
@@ -244,6 +344,11 @@ def mini_export(output_file: str, split: bool = True) -> None:
     bchunk = _BinWriter(_bin_size + 65536)
     _t = time.perf_counter()
 
+    # Cutscene schedule (NLA timeline) - stored in a synthetic CutsceneData
+    # node appended after the real nodes; must be known before the nodes
+    # section is streamed.
+    _cutscene = _cutscene_schedule()
+
     # Nodes section
     jsn.write(b'"nodes":[')
     for i in range(len(objs)):
@@ -264,6 +369,13 @@ def mini_export(output_file: str, split: bool = True) -> None:
             if o.rotation_mode != 'QUATERNION':
                 quaternion = o.rotation_euler.to_quaternion()
             scale = o.scale
+            if o.type in ('CAMERA', 'LIGHT'):
+                # Cameras and lights aim down local -Z in both Blender and glTF,
+                # so their node rotation converts as C @ R (same as the animated
+                # camera/light samples), not the conjugation C @ R @ C^-1 that
+                # the component swizzle below applies. Right-multiplying by C
+                # first makes the swizzled write come out as exactly C @ R.
+                quaternion = (quaternion.to_matrix().to_4x4() @ axis_basis_change).to_quaternion()
 
         jsn.write(b',"translation": [')
         jsn.write(str(translation.x).encode())
@@ -357,6 +469,13 @@ def mini_export(output_file: str, split: bool = True) -> None:
         jsn.write(b'}')
         if i < len(objs) - 1:
             jsn.write(b',')
+
+    if _cutscene is not None:
+        if objs:
+            jsn.write(b',')
+        jsn.write(b'{"name":"CutsceneData","extras":{"minigltf_cutscene":')
+        jsn.write(json.dumps(_cutscene).encode())
+        jsn.write(b'}}')
 
     jsn.write(b'],')
     timings['nodes'] = time.perf_counter() - _t
@@ -903,7 +1022,10 @@ def mini_export(output_file: str, split: bool = True) -> None:
                 bone = skin.data.bones[b]
                 jsn.write(str(objs.index(bone)).encode())
 
-                matrix = (axis_basis_change @ (skin.matrix_world @ bone.matrix_local)).inverted_safe()
+                # IBMs transform from bone-local space to mesh space.  The
+                # armature node is the mesh's parent in the exported hierarchy,
+                # so the engine already applies the armature's world transform;
+                matrix = (axis_basis_change @ bone.matrix_local).inverted_safe()
                 # glTF stores MAT4 column-major; numpy sees the matrix row-major, so transpose.
                 bchunk.view(16).reshape(4, 4)[:] = np.array(matrix, dtype=np.float32).T
 
@@ -1305,6 +1427,11 @@ def mini_export(output_file: str, split: bool = True) -> None:
         if i < len(root_objs) - 1:
             jsn.write(b',')
 
+    if _cutscene is not None:
+        if root_objs:
+            jsn.write(b',')
+        jsn.write(str(len(objs)).encode())  # the synthetic CutsceneData node
+
     jsn.write(b']}]\n')
     jsn.write(b'}')
     timings['json_metadata'] = time.perf_counter() - _t
@@ -1326,23 +1453,6 @@ def mini_export(output_file: str, split: bool = True) -> None:
         f.write(_jsn_bytes)
         f.write(_bin_chunk)
     timings['file_io'] = time.perf_counter() - _t
-
-    # Export TSCN file with NLA animation
-    try:
-        try:
-            from . import minitscn as _minitscn
-        except ImportError:
-            import minitscn as _minitscn
-        _blend = bpy.data.filepath
-        if _blend:
-            _tscn = os.path.splitext(bpy.path.abspath(_blend))[0] + '.tscn'
-        elif output_file.lower().endswith(('.glb', '.gltf')):
-            _tscn = output_file.rsplit('.', 1)[0] + '.tscn'
-        else:
-            _tscn = output_file + '.tscn'
-        _minitscn.mini_export_tscn(_tscn)
-    except Exception as _e:
-        print(f'[minigltf] cutscene .tscn export skipped: {_e}')
 
     for o in edited:
         bpy.context.view_layer.objects.active = o

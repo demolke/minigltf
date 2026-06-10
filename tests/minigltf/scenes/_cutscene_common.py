@@ -4,6 +4,7 @@ Builds a stick-figure character and four reusable bone actions.
 """
 
 import math
+import colorsys
 import bpy
 import bmesh
 from mathutils import Vector, Quaternion, Euler
@@ -69,17 +70,31 @@ def build_character(scene, name, location=(0, 0, 0), facing_deg=0.0, texture_rgb
 
     body = bpy.data.objects.new(name + "Body", me)
     scene.collection.objects.link(body)
-    body.location = location
     body.rotation_mode = 'XYZ'
-    body.rotation_euler = (0, 0, math.radians(facing_deg))
     groups = {bn: body.vertex_groups.new(name=bn) for bn in BONES}
     for vi, bn in vbone.items():
         groups[bn].add([vi], 1.0, 'REPLACE')
     body.modifiers.new("Rig", 'ARMATURE').object = rig
     body.parent = rig
+    # Body is parented to the rig; local coords must be zero so it sits exactly
+    # on top of the armature (the rig already carries the world-space offset).
+    body.location = (0, 0, 0)
+    body.rotation_euler = (0, 0, 0)
 
-    img = bpy.data.images.new(name + "Tex", 8, 8)
-    img.pixels = list(texture_rgba) * 64
+    img = bpy.data.images.new(name + "Tex", 64, 64)
+    r0, g0, b0, _a = texture_rgba
+    base_hue, _s, _v = colorsys.rgb_to_hsv(r0, g0, b0)
+    pixels = []
+    for row in range(64):
+        v_frac = row / 63.0
+        for col in range(64):
+            u_frac = col / 63.0
+            h = (base_hue + u_frac * 0.5 + v_frac * 0.3) % 1.0
+            s = 0.85
+            v = 0.9 * (0.7 + 0.3 * math.sin(u_frac * 6 + v_frac * 4))
+            pr, pg, pb = colorsys.hsv_to_rgb(h, s, v)
+            pixels.extend([pr, pg, pb, 1.0])
+    img.pixels = pixels
     img.filepath = '//textures/' + name + '.png'
     mat = bpy.data.materials.new(name + "Mat")
     mat.use_nodes = True
@@ -161,6 +176,9 @@ def push(obj, act, start, tname):
     s = tr.strips.new(act.name, int(start), act)
     if act.slots:
         s.action_slot = act.slots[0]
+    # strips.new() sets animation_data.action as a side effect in Blender 5.0+,
+    # leaving an unpushed override strip that shadows the NLA in the viewport.
+    obj.animation_data.action = None
     return s
 
 
@@ -200,9 +218,18 @@ def make_camera_rig(scene):
                 (20, tuple(_look((0, -5.2, 1.72), both) @ Quaternion(Vector((0, 0, 1)), math.radians(1.5)))),
                 (48, tuple(_look((0, -4.2, 1.7), both)))],
         }),
+        # Each camera action keys rotation on frame 1 too - without it the
+        # orientation is undefined while the clip plays and the camera looks
+        # wherever the previous clip left it.
         'a': obj_action("AlphaCam_Drift", {
-            'location': [(1, (2.6, -1.2, 1.7)), (48, (2.45, -1.05, 1.74))]}),
+            'location': [(1, (2.6, -1.2, 1.7)), (48, (2.45, -1.05, 1.74))],
+            'rotation_quaternion': [
+                (1, tuple(_look((2.6, -1.2, 1.7), (-1, 0, 1.6)))),
+                (48, tuple(_look((2.45, -1.05, 1.74), (-1, 0, 1.6))))]}),
         'b': obj_action("BetaCam_Dutch", {
-            'location': [(1, (-2.6, -1.2, 1.7)), (48, (-2.5, -1.1, 1.72))]}),
+            'location': [(1, (-2.6, -1.2, 1.7)), (48, (-2.5, -1.1, 1.72))],
+            'rotation_quaternion': [
+                (1, tuple(_look((-2.6, -1.2, 1.7), (1, 0, 1.6), roll=14))),
+                (48, tuple(_look((-2.5, -1.1, 1.72), (1, 0, 1.6), roll=14)))]}),
     }
     return cams, actions

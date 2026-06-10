@@ -41,27 +41,81 @@ GODOT = os.environ.get('GODOT', 'godot')
 GODOT_TEMPLATE = Path(__file__).parent / 'godot'
 
 
-def run_godot_cutscene_check(out_dir):
-    """Create a Godot project in out_dir, then reconstruct and verify the cutscene."""
+def _ensure_godot_blender_path():
+    """Make sure Godot's editor settings point at a Blender executable, so the
+    editor can import .blend files."""
+    blender = shutil.which(BLENDER) or BLENDER
+    cfg_dir = Path(os.environ.get('XDG_CONFIG_HOME',
+                                  Path.home() / '.config')) / 'godot'
+    cfg = cfg_dir / 'editor_settings-4.6.tres'
+    key = 'filesystem/import/blender/blender_path'
+    if cfg.is_file():
+        text = cfg.read_text()
+        if key in text:
+            return
+        text = text.replace('[resource]\n',
+                            f'[resource]\n{key} = "{blender}"\n', 1)
+        cfg.write_text(text)
+    else:
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('[gd_resource type="EditorSettings" format=3]\n\n'
+                       f'[resource]\n{key} = "{blender}"\n')
+
+
+def _setup_godot_project(out_dir, project_name):
+    """Populate out_dir with the Godot template files + addon and write project.godot."""
     godot = shutil.which(GODOT) or (GODOT if os.path.isfile(GODOT) else None)
     if godot is None:
-        return True, f"(godot '{GODOT}' not found, skipping cutscene check)"
+        return None, f"(godot '{GODOT}' not found, skipping)"
+    _ensure_godot_blender_path()
     for f in GODOT_TEMPLATE.iterdir():
         if f.is_file():
             shutil.copy(f, os.path.join(out_dir, f.name))
+    shutil.copytree(os.path.join(REPO_DIR, 'addons', 'minigltf'),
+                    os.path.join(out_dir, 'addons', 'minigltf'),
+                    dirs_exist_ok=True)
     with open(os.path.join(out_dir, 'project.godot'), 'w') as f:
-        f.write('config_version=5\n\n[application]\n'
-                'config/name="minigltf cutscene"\nrun/main_scene="res://main.tscn"\n\n'
+        f.write(f'config_version=5\n\n[application]\n'
+                f'config/name="{project_name}"\nrun/main_scene="res://main.tscn"\n\n'
+                '[editor_plugins]\n'
+                'enabled=PackedStringArray("res://addons/minigltf/plugin.cfg")\n\n'
                 '[rendering]\nrenderer/rendering_method="gl_compatibility"\n')
+    imp = subprocess.run(
+        [godot, '--headless', '--path', out_dir, '--import'],
+        capture_output=True, text=True, timeout=300,
+    )
+    if imp.returncode != 0:
+        out = imp.stdout + imp.stderr
+        return None, "godot --import failed:\n" + '\n'.join(out.splitlines()[-25:])
+    return godot, "OK"
+
+
+def _run_godot_script(godot, out_dir, script, label):
     result = subprocess.run(
-        [godot, '--headless', '--path', out_dir, '--script', 'res://cutscene_check.gd'],
+        [godot, '--headless', '--path', out_dir, '--script', f'res://{script}'],
         capture_output=True, text=True, timeout=120,
     )
     out = result.stdout + result.stderr
     if 'RESULT: PASS' in out:
         return True, "OK"
     lines = [l for l in out.splitlines() if 'FAIL' in l or 'RESULT' in l]
-    return False, "godot cutscene check failed:\n" + '\n'.join(lines[-25:] or out.splitlines()[-25:])
+    return False, f"{label} failed:\n" + '\n'.join(lines[-25:] or out.splitlines()[-25:])
+
+
+def run_godot_cutscene_check(out_dir):
+    """Create a Godot project, import it (runs the addon), then verify the cutscene."""
+    godot, msg = _setup_godot_project(out_dir, "minigltf cutscene")
+    if godot is None:
+        return True, msg
+    return _run_godot_script(godot, out_dir, "cutscene_check.gd", "godot cutscene check")
+
+
+def run_godot_camera_orbit_check(out_dir):
+    """Create a Godot project for the camera_orbit scene and verify camera framing."""
+    godot, msg = _setup_godot_project(out_dir, "minigltf camera orbit")
+    if godot is None:
+        return True, msg
+    return _run_godot_script(godot, out_dir, "camera_orbit_check.gd", "godot camera orbit check")
 
 # Severity codes that are intentional deviations from the spec
 _FILTERED_VALIDATOR_CODES = {
@@ -93,6 +147,56 @@ def _prim_attrs(gltf, mesh_idx=0, prim_idx=0):
 
 def _acc(gltf, idx):
     return gltf['accessors'][idx]
+
+
+def _assert_skinned_mesh_under_armature(gltf):
+    """For every node that carries both a mesh and a skin, verify it is listed
+    as a child of the armature (the node whose children include the root bones
+    of that skin). Failing this means the mesh's parent-transform inheritance
+    is broken: Godot won't move the mesh with the rig."""
+    nodes = gltf.get('nodes', [])
+    skins = gltf.get('skins', [])
+    # Build set of root-bone node indices for each skin.
+    skin_joints = [set(s.get('joints', [])) for s in skins]
+    # For each skinned mesh node, its parent should be the armature node.
+    # We determine the armature node as the node whose children contain the
+    # skin's skeleton root (or any joint set overlap with its children).
+    children_of = {i: set(n.get('children', [])) for i, n in enumerate(nodes)}
+    for ni, node in enumerate(nodes):
+        if 'mesh' not in node or 'skin' not in node:
+            continue
+        skin_idx = node['skin']
+        joints = skin_joints[skin_idx]
+        # Find the node whose children list contains ni (the body node).
+        parents = [pi for pi, ch in children_of.items() if ni in ch]
+        assert len(parents) == 1, \
+            f"skinned mesh node {ni} ({node.get('name')!r}) should have exactly one parent, got {parents}"
+        parent_idx = parents[0]
+        parent = nodes[parent_idx]
+        assert parent.get('name', '').endswith(('Rig', 'Armature')) or \
+               bool(set(parent.get('children', [])) & joints), \
+            (f"skinned mesh node {ni} ({node.get('name')!r}) parent is node {parent_idx} "
+             f"({parent.get('name')!r}) which does not appear to be the armature "
+             f"(no joint children); hierarchy is broken")
+
+
+def _cutscene_data(gltf):
+    """The minigltf_cutscene schedule from the CutsceneData node's extras."""
+    node = next((n for n in gltf.get('nodes', []) if n.get('name') == 'CutsceneData'), None)
+    assert node is not None, "glb is missing the CutsceneData node"
+    assert gltf['nodes'].index(node) in gltf['scenes'][0]['nodes'], \
+        "CutsceneData node must be a scene root node"
+    data = node.get('extras', {}).get('minigltf_cutscene')
+    assert data is not None, "CutsceneData node has no minigltf_cutscene extras"
+    return data
+
+
+def _assert_glb_only(out_dir):
+    """The exporter must emit only the glb: no .tscn schedule, no .import
+    sidecar and no generated script (the addons/minigltf addon replaced them)."""
+    for leftover in ('scene.tscn', 'output.glb.import', 'minigltf_post_import.gd'):
+        assert not os.path.exists(os.path.join(out_dir, leftover)), \
+            f"{leftover} must no longer be written (the addon replaces it)"
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +866,39 @@ def validate_animated_cam_light(gltf, bin_data, out_dir):
     assert cv[3] == 1.0 and cv[4] == 0.0 and cv[5] == 0.0, f"last color {cv[3:6]}"
 
 
+@test('camera_orbit', 'camera_orbit.py')
+def validate_camera_orbit(gltf, bin_data, out_dir):
+    """A camera orbits a cube (radius 6, height 3, 13 keys every 30 degrees), always
+    aimed at it. Checks the glTF structure here; the full in-engine framing
+    check (static pose + every animated frame) runs in Godot via
+    camera_orbit_check.gd (triggered by run_one when a Camera node is present)."""
+    cam_nodes = [n for n in gltf['nodes'] if 'camera' in n]
+    assert len(cam_nodes) == 1, f"expected 1 camera node, got {len(cam_nodes)}"
+    cam_i = next(i for i, n in enumerate(gltf['nodes']) if 'camera' in n)
+
+    anim = next((a for a in gltf.get('animations', []) if a.get('name') == 'Orbit'), None)
+    assert anim is not None, "Orbit animation not found"
+    samplers = {}
+    for ch in anim['channels']:
+        if ch['target'].get('node') == cam_i:
+            samplers[ch['target']['path']] = anim['samplers'][ch['sampler']]
+    assert {'translation', 'rotation'} <= set(samplers), \
+        f"Orbit anim missing camera channels, got {sorted(samplers)}"
+    tv = read_accessor(gltf, bin_data, samplers['translation']['output'])
+    rv = read_accessor(gltf, bin_data, samplers['rotation']['output'])
+    n_keys = len(tv) // 3
+    assert n_keys == len(rv) // 4 == 13, \
+        f"expected 13 keys, got {n_keys} translation / {len(rv) // 4} rotation"
+    for k in range(n_keys):
+        p = tv[3 * k: 3 * k + 3]
+        r = (p[0] ** 2 + p[2] ** 2) ** 0.5
+        assert abs(r - 6.0) < 1e-3 and abs(p[1] - 3.0) < 1e-3, \
+            f"key {k}: camera at {tuple(p)} is off the orbit circle (r={r:.4f}, y={p[1]:.4f})"
+        mag = sum(c * c for c in rv[4 * k: 4 * k + 4]) ** 0.5
+        assert abs(mag - 1.0) < 1e-3, \
+            f"key {k}: rotation quaternion not unit length: mag={mag:.4f}"
+
+
 @test('shared_material_meshes', 'shared_material_meshes.py')
 def validate_shared_material_meshes(gltf, bin_data, out_dir):
     """Two meshes sharing one material - 2 meshes, 1 material."""
@@ -775,9 +912,10 @@ def validate_shared_material_meshes(gltf, bin_data, out_dir):
 @test('cutscene', 'cutscene.py')
 def validate_cutscene(gltf, bin_data, out_dir):
     """A four-shot, two-character cutscene. The glb carries the individual
-    animation pieces (a reused 'Talking' action exported per character); the
-    schedule lives in scene.tscn. The glb half is checked here; the schedule is
-    reconstructed and verified in Godot by run_one()'s cutscene check."""
+    animation pieces (a reused 'Talking' action exported per character) plus the
+    NLA schedule in the extras of a CutsceneData node. The glb half is checked
+    here; the Cutscene player the post-import script rebuilds from the schedule
+    is verified in Godot by run_one()'s cutscene check."""
     names = {a.get('name') for a in gltf.get('animations', [])}
     # The reused action is exported once per character (author once, export twice).
     assert 'Talking_AlphaRig' in names and 'Talking_BetaRig' in names, \
@@ -791,13 +929,25 @@ def validate_cutscene(gltf, bin_data, out_dir):
     assert len(gltf.get('skins', [])) == 2, "expected two rigged characters"
     assert len(gltf.get('meshes', [])) == 2, "expected two character meshes"
     assert len(gltf.get('materials', [])) == 2, "each character should have its own material"
+    _assert_skinned_mesh_under_armature(gltf)
 
-    tscn = os.path.join(out_dir, 'scene.tscn')
-    assert os.path.exists(tscn), "scene.tscn (cutscene schedule) was not written next to the .blend"
-    text = open(tscn, encoding='utf-8').read()
-    assert '&"cutscene":' in text, "tscn missing the 'cutscene' animation"
-    for player in ('AlphaRigPlayer', 'BetaRigPlayer'):
-        assert player in text, f"tscn missing per-actor playback track for {player}"
+    # The schedule lives in the glb now; no other artifact must be written.
+    _assert_glb_only(out_dir)
+    data = _cutscene_data(gltf)
+    assert data['version'] == 1, f"unexpected schedule version {data.get('version')}"
+    cut_cams = [c['camera'] for c in data['cuts']]
+    assert cut_cams == ['CamEstablish', 'CamAlpha', 'CamBeta', 'CamEstablish'], \
+        f"unexpected camera-cut order: {cut_cams}"
+    times = [c['time'] for c in data['cuts']]
+    assert times == sorted(times), f"cut times not sorted: {times}"
+    lanes = {l['actor']: [k[1] for k in l['keys']] for l in data['playback']}
+    assert lanes.get('AlphaRig') == ['Talking_AlphaRig', 'Happy',
+                                     'Talking_AlphaRig', 'Talking_AlphaRig'], \
+        f"unexpected AlphaRig lane: {lanes.get('AlphaRig')}"
+    assert lanes.get('BetaRig') == ['Talking_BetaRig', 'CrossedHands',
+                                    'Angry', 'Talking_BetaRig'], \
+        f"unexpected BetaRig lane: {lanes.get('BetaRig')}"
+    assert data['length'] > 0, "schedule length must be positive"
 
 
 @test('cutscene_linked', 'cutscene_linked.py')
@@ -828,12 +978,19 @@ def validate_cutscene_linked(gltf, bin_data, out_dir):
     assert {'Talking', 'Happy', 'CrossedHands', 'Angry'} <= canims, \
         f"char.glb missing bare-named clips, got {sorted(canims)}"
     assert len(cgltf.get('skins', [])) == 1, "char.glb should have one rigged character"
+    _assert_skinned_mesh_under_armature(cgltf)
 
-    # Schedule references the bare clip names (matching char.glb) on per-instance players.
-    text = open(os.path.join(out_dir, 'scene.tscn'), encoding='utf-8').read()
-    assert 'NodePath("AlphaPlayer")' in text and 'NodePath("BetaPlayer")' in text, \
-        "tscn missing per-instance playback tracks"
-    assert '"Talking", "Happy"' in text, "Alpha schedule should use bare clip names"
+    # Schedule references the bare clip names (matching char.glb) on the
+    # per-instance link nodes; no other artifact must be written.
+    _assert_glb_only(out_dir)
+    data = _cutscene_data(gltf)
+    lanes = {l['actor']: [k[1] for k in l['keys']] for l in data['playback']}
+    assert set(lanes) >= {'Alpha', 'Beta'}, f"expected Alpha/Beta lanes, got {set(lanes)}"
+    assert lanes['Alpha'][:2] == ['Talking', 'Happy'], \
+        f"Alpha schedule should use bare clip names, got {lanes['Alpha']}"
+    assert all(c in {'Talking', 'Happy', 'CrossedHands', 'Angry'}
+               for c in lanes['Alpha'] + lanes['Beta']), \
+        f"linked lanes must use bare clip names: {lanes}"
 
 
 # ---------------------------------------------------------------------------
@@ -913,10 +1070,18 @@ def run_one(name, scene, validator, output_base, timeout=120):
     if not ok:
         return False, msg, blender_elapsed
 
-    # If a cutscene was written next to the .blend, reconstruct and
-    # verify it in Godot.
-    if os.path.exists(os.path.join(out_dir, 'scene.tscn')):
+    # If the glb carries a cutscene (a CutsceneData schedule node), reconstruct
+    # and verify it in Godot via the addon.
+    if any(n.get('name') == 'CutsceneData' for n in gltf.get('nodes', [])):
         ok, msg = run_godot_cutscene_check(out_dir)
+        if not ok:
+            return False, msg, blender_elapsed
+
+    # If the glb has a camera and an Orbit animation, verify framing in Godot.
+    has_cam = any('camera' in n for n in gltf.get('nodes', []))
+    has_orbit = any(a.get('name') == 'Orbit' for a in gltf.get('animations', []))
+    if has_cam and has_orbit:
+        ok, msg = run_godot_camera_orbit_check(out_dir)
         if not ok:
             return False, msg, blender_elapsed
 

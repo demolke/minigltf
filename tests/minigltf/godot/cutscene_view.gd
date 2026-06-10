@@ -1,17 +1,13 @@
-# Main scene of the generated project. 
+# Main scene of the generated project: instances the imported cutscene glb
+# (the minigltf addon builds the "Cutscene" player inside it) and adds
+# light + environment so there is something to see.
 extends Node3D
-
-const Runtime = preload("res://cutscene_runtime.gd")
 
 var _cut: AnimationPlayer
 
 
 func _ready() -> void:
-	var info := Runtime.reconstruct(self)
-	if info.has("error"):
-		push_error(info["error"])
-		return
-	_cut = info["cut"]
+	_cut = get_node_or_null("output/Cutscene")
 
 	var sun := DirectionalLight3D.new()
 	sun.rotation = Vector3(deg_to_rad(-55), deg_to_rad(35), 0)
@@ -27,7 +23,8 @@ func _ready() -> void:
 	we.environment = env
 	add_child(we)
 
-	_cut.play("cutscene")
+	if _cut:
+		_cut.play("cutscene")
 
 
 func _process(_delta: float) -> void:

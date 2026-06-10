@@ -27,14 +27,17 @@ jobs:
           cp godot_minigltf_override/__init__.py           dist/godot_minigltf_override/
           cp godot_minigltf_override/blender_manifest.toml dist/godot_minigltf_override/
           cp minigltf.py                                   dist/godot_minigltf_override/
-          cp minitscn.py                                   dist/godot_minigltf_override/
           sed -i "s/^version = .*/version = \"$VERSION\"/" dist/godot_minigltf_override/blender_manifest.toml
           cd dist && zip -r godot_minigltf_override.zip godot_minigltf_override/
+
+      - name: Build Godot addon zip
+        run: zip -r dist/minigltf_godot_addon.zip addons/minigltf/
 
       - name: Create GitHub release
         run: |
           gh release create "$GITHUB_REF_NAME" \
             dist/godot_minigltf_override.zip \
+            dist/minigltf_godot_addon.zip \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
         env:

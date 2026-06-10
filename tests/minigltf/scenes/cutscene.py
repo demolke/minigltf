@@ -2,16 +2,16 @@
 
 Two stick-figure characters (AlphaRig / BetaRig, identical bone names so actions
 are reusable, each its own texture) talk to each other; three cameras cut between
-them. The NLA schedules both the glb animation pieces and the .tscn cutscene;
-camera-bound markers drive the cuts.
+them. The NLA schedules both the glb animation pieces and the CutsceneData
+schedule; camera-bound markers drive the cuts.
 
   Shot 1 (establishing, handheld push-in):  both play Talking
   Shot 2 (CamAlpha):                        Alpha Happy,  Beta CrossedHands
   Shot 3 (CamBeta, dutch angle):            Beta Angry,   Alpha Talking
   Shot 4 (establishing again):              both play Talking
 
-export_scene() writes output.glb (pieces) and, via minigltf -> minitscn,
-scene.tscn (the schedule) next to the saved .blend.
+export_scene() writes output.glb holding both the pieces and the schedule
+(as extras on a synthetic CutsceneData node).
 """
 
 import sys
@@ -52,7 +52,6 @@ def main():
     for fr, cam in [(S[0], cams['est']), (S[1], cams['a']), (S[2], cams['b']), (S[3], cams['est'])]:
         scene.timeline_markers.new(f"cut_{fr}", frame=fr).camera = cam
 
-    # Save the .blend first so minigltf writes the cutscene .tscn next to it.
     os.makedirs(args.output_dir, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=os.path.join(args.output_dir, 'scene.blend'))
     export_scene(args)
