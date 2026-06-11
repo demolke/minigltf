@@ -135,14 +135,6 @@ func _pre_drive(scene: Node, _players: Dictionary, clip_keys: Dictionary) -> voi
 		jaw_seen[head_name] = []
 
 
-# The Cutscene player's animation-playback tracks start the sub players; sub
-# players normally advance with the scene tree, which the synchronous drive
-# loop bypasses - advance them in lockstep explicitly.
-func _advance_subplayers(players: Dictionary, step: float) -> void:
-	for name in players:
-		(players[name] as AnimationPlayer).advance(step)
-
-
 func _per_step(t: float, prev_t: float) -> void:
 	# Sample blend-shape probes when the timeline crosses their times.
 	for probe in probes:

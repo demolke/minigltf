@@ -40,7 +40,8 @@ func _pre_drive(_scene: Node, _players: Dictionary, _clip_keys: Dictionary) -> v
 # subclass can advance the per-node sub players in lockstep (the synchronous
 # loop bypasses the scene tree which would normally advance them).
 func _advance_subplayers(_players: Dictionary, _step: float) -> void:
-	pass
+	for name in _players:
+		(_players[name] as AnimationPlayer).advance(_step)
 
 # Called every drive step after the cam/clip observation. The timeline has
 # just moved from `prev_t` to `t` (probe windows are `prev_t < probe.t <= t`).
