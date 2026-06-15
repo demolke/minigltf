@@ -184,6 +184,17 @@ def _cutscene_data(gltf):
     return data
 
 
+def _audio_data(gltf):
+    """The minigltf_audio schedule from the CutsceneData node's extras."""
+    node = next((n for n in gltf.get('nodes', []) if n.get('name') == 'CutsceneData'), None)
+    assert node is not None, "glb is missing the CutsceneData node"
+    assert gltf['nodes'].index(node) in gltf['scenes'][0]['nodes'], \
+        "CutsceneData node must be a scene root node"
+    data = node.get('extras', {}).get('minigltf_audio')
+    assert data is not None, "CutsceneData node has no minigltf_audio extras"
+    return data
+
+
 def _assert_glb_only(out_dir):
     """The exporter must emit only the glb: no .tscn schedule, no .import
     sidecar and no generated script (the addons/minigltf addon replaced them)."""
@@ -900,13 +911,14 @@ def validate_shared_material_meshes(gltf, bin_data, out_dir):
     assert mat_idx_a == mat_idx_b, "both meshes should reference the same material"
 
 
-@test('cutscene', 'cutscene.py', godot='cutscene_check.gd')
+@test('cutscene', 'cutscene.py', godot='cutscene_audio_check.gd')
 def validate_cutscene(gltf, bin_data, out_dir):
-    """A four-shot, two-character cutscene. The glb carries the individual
-    animation pieces (a reused 'Talking' action exported per character) plus the
-    NLA schedule in the extras of a CutsceneData node. The glb half is checked
-    here; the Cutscene player the post-import script rebuilds from the schedule
-    is verified in Godot by cutscene_check.gd."""
+    """A four-shot, two-character cutscene with spatial and non-spatial audio.
+    The glb carries the individual animation pieces (a reused 'Talking' action
+    exported per character) plus the NLA and audio schedules in the extras of a
+    CutsceneData node. The glb half is checked here; the Cutscene player and
+    audio nodes the post-import script rebuilds are verified in Godot by
+    cutscene_audio_check.gd."""
     names = {a.get('name') for a in gltf.get('animations', [])}
     # The reused action is exported once per character (author once, export twice).
     assert 'Talking_AlphaRig' in names and 'Talking_BetaRig' in names, \
@@ -939,6 +951,70 @@ def validate_cutscene(gltf, bin_data, out_dir):
                                     'Angry', 'Talking_BetaRig'], \
         f"unexpected BetaRig lane: {lanes.get('BetaRig')}"
     assert data['length'] > 0, "schedule length must be positive"
+
+    # Audio schedule.
+    audio = _audio_data(gltf)
+
+    emitters = {e['speaker']: e for e in audio.get('emitters', [])}
+    assert set(emitters) == {'AlphaSpeaker', 'BetaSpeaker'}, \
+        f"expected AlphaSpeaker and BetaSpeaker, got {set(emitters)}"
+
+    alpha_e = emitters['AlphaSpeaker']
+    assert alpha_e['file'].endswith('talking.wav'), \
+        f"AlphaSpeaker should reference talking.wav, got {alpha_e['file']!r}"
+    assert len(alpha_e['onsets']) == 2, \
+        f"AlphaSpeaker should have 2 onsets (shots 1 & 4), got {alpha_e['onsets']}"
+    assert alpha_e['onsets'] == sorted(alpha_e['onsets']), "onsets should be sorted"
+    assert 'volume_keys' in alpha_e, "AlphaSpeaker should have animated volume_keys"
+    vol_keys = alpha_e['volume_keys']
+    assert len(vol_keys) >= 3, f"expected at least 3 volume keyframes, got {len(vol_keys)}"
+    assert vol_keys[0][1] < 0.1, f"first volume key should be near 0 (fade in), got {vol_keys[0][1]}"
+    assert vol_keys[-1][1] < 0.1, f"last volume key should be near 0 (fade out), got {vol_keys[-1][1]}"
+    assert any(vk[1] > 0.5 for vk in vol_keys), \
+        f"AlphaSpeaker volume_keys should reach > 0.5 at peak, got {vol_keys}"
+    # Static 'volume' reflects Blender's evaluated value at export time and is
+    # superseded by volume_keys; don't assert a specific value for animated speakers.
+
+    beta_e = emitters['BetaSpeaker']
+    assert beta_e['file'].endswith('talking.wav'), \
+        f"BetaSpeaker should reference talking.wav, got {beta_e['file']!r}"
+    assert len(beta_e['onsets']) == 2, \
+        f"BetaSpeaker should have 2 onsets (shots 2 & 3), got {beta_e['onsets']}"
+    assert beta_e['onsets'] == sorted(beta_e['onsets']), "BetaSpeaker onsets should be sorted"
+    assert abs(beta_e['volume'] - 0.85) < 0.01, \
+        f"BetaSpeaker volume expected ~0.85, got {beta_e['volume']}"
+    assert 'volume_keys' not in beta_e, \
+        "BetaSpeaker has no volume animation - no volume_keys expected"
+    # BetaSpeaker onsets should be between AlphaSpeaker's two onsets.
+    assert alpha_e['onsets'][0] < beta_e['onsets'][0] < alpha_e['onsets'][1], \
+        f"BetaSpeaker first onset should be between AlphaSpeaker onsets: {beta_e['onsets']}"
+
+    node_names = [n.get('name') for n in gltf.get('nodes', [])]
+    assert 'AlphaSpeaker' in node_names, "AlphaSpeaker node missing"
+    assert 'BetaSpeaker' in node_names, "BetaSpeaker node missing"
+
+    tracks = audio.get('tracks', [])
+    assert len(tracks) == 2, f"expected exactly 2 non-spatial VSE tracks, got {len(tracks)}"
+    track_names = [t['name'] for t in tracks]
+    assert 'LaughTrack' in track_names, f"LaughTrack not in VSE tracks: {track_names}"
+    assert 'AngryTrack' in track_names, f"AngryTrack not in VSE tracks: {track_names}"
+
+    laugh = next(t for t in tracks if t['name'] == 'LaughTrack')
+    angry = next(t for t in tracks if t['name'] == 'AngryTrack')
+    assert laugh['file'].endswith('laughing.wav'), \
+        f"LaughTrack should reference laughing.wav, got {laugh['file']!r}"
+    assert angry['file'].endswith('angry.wav'), \
+        f"AngryTrack should reference angry.wav, got {angry['file']!r}"
+    assert abs(laugh['volume'] - 0.7) < 0.01, \
+        f"LaughTrack volume expected ~0.7, got {laugh['volume']}"
+    assert abs(angry['volume'] - 0.8) < 0.01, \
+        f"AngryTrack volume expected ~0.8, got {angry['volume']}"
+    assert laugh['onset'] > alpha_e['onsets'][0], \
+        "LaughTrack should start after AlphaSpeaker's first onset (shot 2 > shot 1)"
+    assert laugh['stop'] > laugh['onset'], \
+        f"LaughTrack stop {laugh['stop']} should be > onset {laugh['onset']}"
+    assert angry['onset'] > laugh['onset'], \
+        f"AngryTrack should start after LaughTrack (shot 3 > shot 2)"
 
 
 @test('cutscene_linked', 'cutscene_linked.py', godot='cutscene_check.gd')
@@ -1081,6 +1157,46 @@ def validate_cutscene_lipsync(gltf, bin_data, out_dir):
     assert cut_cams == ['CamEstablish', 'CamAlpha', 'CamBeta', 'CamEstablish'], \
         f"unexpected camera-cut order: {cut_cams}"
     assert data['length'] > 0, "schedule length must be positive"
+
+
+@test('audio_chirp', 'audio_chirp.py')
+def validate_audio_chirp(gltf, bin_data, out_dir):
+    """A single Speaker with one onset - exercises the bare audio export path
+    with no cutscene schedule present."""
+    # No meshes, no cameras in this scene.
+    assert len(gltf.get('meshes', [])) == 0, "audio-only scene should have no meshes"
+
+    audio = _audio_data(gltf)
+    emitters = audio.get('emitters', [])
+    assert len(emitters) == 1, f"expected 1 emitter, got {len(emitters)}"
+
+    e = emitters[0]
+    assert e['speaker'] == 'ChirpSpeaker', \
+        f"expected speaker 'ChirpSpeaker', got {e['speaker']!r}"
+    assert e['file'].endswith('chirp.wav'), \
+        f"expected chirp.wav file URI, got {e['file']!r}"
+    assert len(e['onsets']) == 1, f"expected 1 onset, got {e['onsets']}"
+    assert abs(e['onsets'][0] - 0.5) < 0.01, \
+        f"onset expected ~0.5 s, got {e['onsets'][0]}"
+    assert abs(e['volume'] - 0.8) < 0.01, \
+        f"volume expected ~0.8, got {e['volume']}"
+    assert abs(e['distance_reference'] - 3.0) < 0.01, \
+        f"distance_reference expected ~3.0, got {e['distance_reference']}"
+
+    # The Speaker node must be in the glb (as a regular transform node).
+    node_names = [n.get('name') for n in gltf.get('nodes', [])]
+    assert 'ChirpSpeaker' in node_names, \
+        f"ChirpSpeaker node missing from nodes: {node_names}"
+
+    # glb must have no cutscene schedule (audio-only).
+    cd_node = next((n for n in gltf.get('nodes', []) if n.get('name') == 'CutsceneData'), None)
+    assert cd_node is not None, "CutsceneData node required even for audio-only export"
+    assert 'minigltf_cutscene' not in cd_node.get('extras', {}), \
+        "audio-only scene must not have minigltf_cutscene in extras"
+
+    assert audio.get('tracks', []) == [], "audio-only scene should have no VSE tracks"
+
+
 
 
 # ---------------------------------------------------------------------------

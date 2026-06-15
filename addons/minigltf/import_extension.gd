@@ -29,7 +29,7 @@ func _import_post(state: GLTFState, root: Node) -> Error:
 		return OK
 	_resolve_links(root, root, state.base_path)
 	_split_master_player(root)
-	_build_cutscene(root)
+	_build_cutscene(root, state.base_path)
 	return OK
 
 
@@ -170,26 +170,29 @@ func _split_master_player(scene: Node) -> void:
 	master.free()
 
 
-# --- pass 3: rebuild the cutscene from the CutsceneData schedule --------------
-func _build_cutscene(scene: Node) -> void:
+# --- pass 3: rebuild the cutscene and audio from the CutsceneData schedule ----
+func _build_cutscene(scene: Node, base_path: String = "") -> void:
 	var holder := scene.find_child("CutsceneData", true, false)
 	if holder == null:
 		return
 	var extras = holder.get_meta("extras") if holder.has_meta("extras") else null
 	holder.get_parent().remove_child(holder)
 	holder.free()
-	if not (extras is Dictionary and extras.has("minigltf_cutscene")):
+	if not (extras is Dictionary):
 		return
-	var data: Dictionary = extras["minigltf_cutscene"]
+	var cutscene_data: Dictionary = extras.get("minigltf_cutscene", {})
+	var audio_data: Dictionary = extras.get("minigltf_audio", {})
+	if cutscene_data.is_empty() and audio_data.is_empty():
+		return
 
 	var anim := Animation.new()
-	anim.length = float(data.get("length", 0.0))
+	var anim_length := float(cutscene_data.get("length", 0.0))
 
 	# Camera cuts: one boolean value track per camera toggling its `current`
 	# at every cut time. CONTINUOUS + NEAREST holds the value between keys.
 	# Godot sanitizes glTF node names, so the schedule names must be too.
 	var cams: Array[String] = []
-	for cut in data.get("cuts", []):
+	for cut in cutscene_data.get("cuts", []):
 		var cam := String(cut["camera"]).validate_node_name()
 		if cam not in cams:
 			cams.append(cam)
@@ -198,13 +201,13 @@ func _build_cutscene(scene: Node) -> void:
 		anim.track_set_path(t, NodePath(cam + ":current"))
 		anim.value_track_set_update_mode(t, Animation.UPDATE_CONTINUOUS)
 		anim.track_set_interpolation_type(t, Animation.INTERPOLATION_NEAREST)
-		for cut in data.get("cuts", []):
+		for cut in cutscene_data.get("cuts", []):
 			anim.track_insert_key(t, float(cut["time"]),
 					String(cut["camera"]).validate_node_name() == cam)
 
 	# Per-actor playback tracks driving the per-node AnimationPlayers that
 	# passes 1 and 2 created.
-	for lane in data.get("playback", []):
+	for lane in cutscene_data.get("playback", []):
 		var t := anim.add_track(Animation.TYPE_ANIMATION)
 		# Actors are usually top-level nodes, but shape-key lanes name the mesh
 		# node itself, which the importer may have nested under a Skeleton3D.
@@ -216,6 +219,11 @@ func _build_cutscene(scene: Node) -> void:
 		for key in lane["keys"]:
 			anim.animation_track_insert_key(t, float(key[0]), String(key[1]))
 
+	# Audio: spatial emitters (Speaker to AudioStreamPlayer3D) and non-spatial
+	# VSE tracks (AudioStreamPlayer). Both are driven from this Cutscene player.
+	anim_length = _build_audio_tracks(scene, audio_data, anim, anim_length, base_path)
+
+	anim.length = anim_length
 	var lib := AnimationLibrary.new()
 	lib.add_animation("cutscene", anim)
 	var ap := AnimationPlayer.new()
@@ -224,3 +232,121 @@ func _build_cutscene(scene: Node) -> void:
 	ap.owner = scene
 	ap.add_animation_library("", lib)
 	ap.autoplay = "cutscene"
+
+
+# Create audio nodes and insert play/stop/volume tracks into `anim`.
+# Returns the updated animation length (extended by any audio cue times).
+# base_dir is state.base_path from _import_post (the GLB's on-disk directory).
+func _build_audio_tracks(scene: Node, data: Dictionary, anim: Animation,
+		anim_length: float, base_dir: String = "") -> float:
+	if data.is_empty():
+		return anim_length
+
+	# Fallback for runtime instantiation where state is not available.
+	if base_dir == "" and scene.scene_file_path != "":
+		base_dir = scene.scene_file_path.get_base_dir()
+
+	# --- Spatial emitters (Speaker objects → AudioStreamPlayer3D) --------------
+	for emitter in data.get("emitters", []):
+		var speaker_name := String(emitter["speaker"]).validate_node_name()
+		var speaker_node := _actor_node(scene, speaker_name)
+		if speaker_node == null:
+			push_warning("minigltf: audio emitter node not found: " + speaker_name)
+			continue
+
+		var asp := AudioStreamPlayer3D.new()
+		asp.name = "AudioStreamPlayer3D"
+		var file_uri := String(emitter.get("file", ""))
+		if file_uri != "" and base_dir != "":
+			var stream = load(base_dir.path_join(file_uri))
+			if stream:
+				asp.stream = stream
+			else:
+				push_warning("minigltf: could not load audio stream: " + base_dir.path_join(file_uri))
+		asp.volume_db = linear_to_db(clampf(float(emitter.get("volume", 1.0)), 0.0001, 1.0))
+		asp.unit_size = float(emitter.get("distance_reference", 1.0))
+		var dist_max := float(emitter.get("distance_max", 0.0))
+		if dist_max > 0.0:
+			asp.max_distance = dist_max
+		var cone_outer := float(emitter.get("cone_angle_outer", 360.0))
+		if cone_outer < 360.0:
+			asp.emission_angle_enabled = true
+			asp.emission_angle_degrees = cone_outer * 0.5
+			var outer_gain := float(emitter.get("cone_volume_outer", 0.0))
+			# outer_gain = 0.0 means fully muted; avoid log(0) by using -80 dB floor.
+			asp.emission_angle_filter_attenuation_db = \
+					-80.0 if outer_gain <= 0.0 else linear_to_db(minf(outer_gain, 1.0))
+		speaker_node.add_child(asp)
+		asp.owner = scene
+
+		var node_path := scene.get_path_to(asp)
+
+		# Play events: one key per onset time.
+		var onsets: Array = emitter.get("onsets", [])
+		if not onsets.is_empty():
+			var play_t := anim.add_track(Animation.TYPE_METHOD)
+			anim.track_set_path(play_t, node_path)
+			for onset in onsets:
+				anim.track_insert_key(play_t, float(onset),
+						{"method": &"play", "args": []})
+				var end_t := float(onset)
+				if asp.stream != null:
+					end_t += asp.stream.get_length()
+				anim_length = maxf(anim_length, end_t)
+
+		# Animated volume: linear [0,1] keyframes → volume_db value track.
+		var vol_keys: Array = emitter.get("volume_keys", [])
+		if not vol_keys.is_empty():
+			var vol_t := anim.add_track(Animation.TYPE_VALUE)
+			anim.track_set_path(vol_t, NodePath(String(node_path) + ":volume_db"))
+			anim.value_track_set_update_mode(vol_t, Animation.UPDATE_CONTINUOUS)
+			anim.track_set_interpolation_type(vol_t, Animation.INTERPOLATION_LINEAR)
+			for vk in vol_keys:
+				var linear := clampf(float(vk[1]), 0.0001, 1.0)
+				anim.track_insert_key(vol_t, float(vk[0]), linear_to_db(linear))
+
+	# --- Non-spatial VSE tracks (AudioStreamPlayer) ----------------------------
+	var track_idx := 0
+	for track in data.get("tracks", []):
+		var asp := AudioStreamPlayer.new()
+		asp.name = "VSETrack_" + str(track_idx)
+		var file_uri := String(track.get("file", ""))
+		if file_uri != "" and base_dir != "":
+			var stream = load(base_dir.path_join(file_uri))
+			if stream:
+				asp.stream = stream
+			else:
+				push_warning("minigltf: could not load audio stream: " + base_dir.path_join(file_uri))
+		asp.volume_db = linear_to_db(clampf(float(track.get("volume", 1.0)), 0.0001, 1.0))
+		# pan is [-2,2] in Blender (mono-source stereo pan); AudioStreamPlayer
+		# has no pan property - panning requires a bus, skip for now.
+		scene.add_child(asp)
+		asp.owner = scene
+
+		var node_path := scene.get_path_to(asp)
+		var src_offset := float(track.get("src_offset", 0.0))
+		var onset := float(track.get("onset", 0.0))
+		var stop_time := float(track.get("stop", 0.0))
+
+		# Play at onset, passing the in-file start offset.
+		var play_t := anim.add_track(Animation.TYPE_METHOD)
+		anim.track_set_path(play_t, node_path)
+		anim.track_insert_key(play_t, onset,
+				{"method": &"play", "args": [src_offset]})
+
+		# Stop at the end of the strip; extend length by stream duration as fallback.
+		if stop_time > onset:
+			var stop_t := anim.add_track(Animation.TYPE_METHOD)
+			anim.track_set_path(stop_t, node_path)
+			anim.track_insert_key(stop_t, stop_time,
+					{"method": &"stop", "args": []})
+			anim_length = maxf(anim_length, stop_time)
+		else:
+			var end_t := onset
+			if asp.stream != null:
+				end_t += asp.stream.get_length()
+			anim_length = maxf(anim_length, end_t)
+
+		track_idx += 1
+
+	return anim_length

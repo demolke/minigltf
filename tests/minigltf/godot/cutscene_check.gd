@@ -52,6 +52,11 @@ func _per_step(_t: float, _prev_t: float) -> void:
 func _post_drive() -> void:
 	pass
 
+# Called after the Cutscene AnimationPlayer is confirmed to exist. Subclasses
+# override this to add audio-node checks without duplicating the base pipeline.
+func _check_audio(_scene: Node, _anim: Animation) -> void:
+	pass
+
 
 func _main() -> void:
 	# Wait one frame so the root viewport is inside the tree: global transforms
@@ -77,6 +82,7 @@ func _main() -> void:
 		quit(1)
 		return
 	var anim := cut.get_animation("cutscene")
+	_check_audio(scene, anim)
 
 	# Resolve every track target inside the glb instance and collect the
 	# expected sequences straight from the authored schedule.
@@ -91,9 +97,8 @@ func _main() -> void:
 		match anim.track_get_type(i):
 			Animation.TYPE_VALUE:
 				var cam := scene.get_node_or_null(NodePath(node_path)) as Camera3D
-				ck(cam != null, "camera '%s' exists and is a Camera3D" % node_path)
 				if cam == null:
-					continue
+					continue  # non-camera value track (e.g. audio volume_db)
 				cameras[node_path] = cam
 				for k in anim.track_get_key_count(i):
 					if bool(anim.track_get_key_value(i, k)):

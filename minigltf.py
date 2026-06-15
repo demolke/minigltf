@@ -5,8 +5,10 @@ import math
 import mathutils
 import numpy as np
 import os
+import re
 import struct
 import time
+import warnings
 
 timings = {}
 
@@ -181,6 +183,121 @@ def _cutscene_schedule():
             'cuts': cuts, 'playback': playback}
 
 
+def _sound_uri(sound, output_file: str) -> str:
+    """Return a relative URI for an audio file, mirroring _image_uri."""
+    fp = sound.filepath
+    if not fp:
+        # Packed sounds with no on-disk path cannot be referenced by URI.
+        warnings.warn(f"minigltf: sound '{sound.name}' is packed with no filepath; skipping")
+        return ""
+    if getattr(sound, 'library', None):
+        lib_dir = os.path.dirname(bpy.path.abspath(sound.library.filepath))
+        rel_fp = fp[2:] if fp.startswith('//') else fp
+        abs_path = os.path.normpath(os.path.join(lib_dir, rel_fp))
+    else:
+        abs_path = bpy.path.abspath(fp)
+    glb_dir = os.path.dirname(os.path.abspath(output_file))
+    try:
+        rel = os.path.relpath(abs_path, glb_dir)
+    except ValueError:
+        rel = abs_path
+    return rel.replace('\\', '/')
+
+
+def _speaker_volume_keys(obj, fps):
+    """Keyframes on the Speaker data-block's volume property, [[time_sec, linear], ...].
+    Reads from obj.data.animation_data (the Speaker data-block action, not the object action)."""
+    ad = getattr(obj.data, 'animation_data', None)
+    if ad is None or ad.action is None:
+        return []
+    slot_handle = getattr(getattr(ad, 'action_slot', None), 'handle', None)
+    keys = []
+    for fc in _slot_fcurves(ad.action, slot_handle):
+        if fc.data_path == 'volume':
+            for kp in fc.keyframe_points:
+                keys.append([kp.co.x / fps, float(kp.co.y)])
+    keys.sort(key=lambda k: k[0])
+    return keys
+
+
+def _audio_schedule(output_file):
+    """Collect spatial (Speaker + VSE) and non-spatial (VSE) audio cues.
+    Returns None when the scene has no audio to export.
+
+    VSE sound strips drive audio.  A strip whose name matches a Speaker
+    object in the scene is treated as a spatial sound; the strip supplies the
+    timing while the Speaker object supplies the 3D properties (position,
+    volume, attenuation, cone).  Multiple strips with the same name trigger 
+    multiple clips on one emitter. Strips with no matching speaker are
+    non-spatial and each gets its own AudioStreamPlayer."""
+    scene = bpy.context.scene
+    fps = scene.render.fps * scene.render.fps_base
+
+    # Index Speaker objects by name
+    speakers = {obj.name: obj for obj in scene.objects if obj.type == 'SPEAKER'}
+
+    # Accumulate onsets per speaker name from VSE strips.
+    speaker_onsets: dict[str, list[float]] = {}
+    tracks = []
+
+    se = scene.sequence_editor
+    if se:
+        # Blender 5.x renamed sequences_all to strips_all
+
+        _all = se.strips_all if hasattr(se, 'strips_all') else se.sequences_all
+        for seq in sorted(_all, key=lambda s: s.frame_final_start):
+            if seq.type != 'SOUND' or getattr(seq, 'mute', False):
+                continue
+            if seq.sound is None:
+                continue
+            # Blender appends exactly .001/.002/.003 to keep VSE strip names
+            # unique. Strip that suffix before matching speaker object names.
+            base_name = re.sub(r'\.\d{3}$', '', seq.name)
+            sp_match = seq.name if seq.name in speakers else \
+                (base_name if base_name in speakers else None)
+            if sp_match:
+                speaker_onsets.setdefault(sp_match, []).append(
+                    seq.frame_final_start / fps)
+            else:
+                tracks.append({
+                    'name': seq.name,
+                    'file': _sound_uri(seq.sound, output_file),
+                    'onset': seq.frame_final_start / fps,
+                    'stop': seq.frame_final_end / fps,
+                    'src_offset': seq.animation_offset_start / fps,
+                    'volume': seq.volume,
+                    'pan': seq.pan,
+                })
+
+    emitters = []
+    for sp_name, onsets in speaker_onsets.items():
+        obj = speakers[sp_name]
+        sp = obj.data
+        if sp.sound is None:
+            warnings.warn(f"minigltf: speaker '{sp_name}' has VSE onset strips but no sound assigned; skipping")
+            continue
+        vol_keys = _speaker_volume_keys(obj, fps)
+        entry = {
+            'speaker': obj.name,
+            'file': _sound_uri(sp.sound, output_file),
+            'onsets': sorted(onsets),
+            'volume': sp.volume,
+            'attenuation': sp.attenuation,
+            'distance_reference': sp.distance_reference,
+            'distance_max': sp.distance_max,
+            'cone_angle_inner': sp.cone_angle_inner,
+            'cone_angle_outer': sp.cone_angle_outer,
+            'cone_volume_outer': sp.cone_volume_outer,
+        }
+        if vol_keys:
+            entry['volume_keys'] = vol_keys
+        emitters.append(entry)
+
+    if not emitters and not tracks:
+        return None
+    return {'emitters': emitters, 'tracks': tracks}
+
+
 # Watts -> lumens, matching Blender's glTF exporter (SPEC mode). Used for both the
 # static light intensity and its animation so the two stay consistent.
 _WATTS_TO_LUMENS = 683.0
@@ -253,7 +370,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
     _scene_objs = bpy.context.scene.objects
     objs = []
     for _o in _scene_objs:
-        if _o.type not in ('MESH', 'ARMATURE', 'CAMERA', 'LIGHT'):
+        if _o.type not in ('MESH', 'ARMATURE', 'CAMERA', 'LIGHT', 'SPEAKER'):
             continue
         if _o in _overridden_originals:
             continue
@@ -344,10 +461,16 @@ def mini_export(output_file: str, split: bool = True) -> None:
     bchunk = _BinWriter(_bin_size + 65536)
     _t = time.perf_counter()
 
-    # Cutscene schedule (NLA timeline) - stored in a synthetic CutsceneData
-    # node appended after the real nodes; must be known before the nodes
-    # section is streamed.
+    # Cutscene schedule (NLA timeline) and audio schedule - stored together in a
+    # synthetic CutsceneData node appended after the real nodes; must be known
+    # before the nodes section is streamed.
     _cutscene = _cutscene_schedule()
+    _audio = _audio_schedule(output_file)
+    _extra_node_data = {}
+    if _cutscene is not None:
+        _extra_node_data['minigltf_cutscene'] = _cutscene
+    if _audio is not None:
+        _extra_node_data['minigltf_audio'] = _audio
 
     # Nodes section
     jsn.write(b'"nodes":[')
@@ -470,12 +593,12 @@ def mini_export(output_file: str, split: bool = True) -> None:
         if i < len(objs) - 1:
             jsn.write(b',')
 
-    if _cutscene is not None:
+    if _extra_node_data:
         if objs:
             jsn.write(b',')
-        jsn.write(b'{"name":"CutsceneData","extras":{"minigltf_cutscene":')
-        jsn.write(json.dumps(_cutscene).encode())
-        jsn.write(b'}}')
+        jsn.write(b'{"name":"CutsceneData","extras":')
+        jsn.write(json.dumps(_extra_node_data).encode())
+        jsn.write(b'}')
 
     jsn.write(b'],')
     timings['nodes'] = time.perf_counter() - _t
@@ -1163,7 +1286,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
                         else:
                             corr = axis_basis_change @ _bone.matrix_local
                         transforms.append((_bone, CHANNEL_MAPPING[_channel], cs, pf, corr))
-                elif domain == 'xform' and target.type in ('CAMERA', 'LIGHT'):
+                elif domain == 'xform' and target.type in ('CAMERA', 'LIGHT', 'SPEAKER'):
                     for _dp, _path in CHANNEL_MAPPING.items():
                         cs = curves.get(_dp)
                         pf = next((fc for fc in cs if fc is not None), None) if cs else None
@@ -1427,7 +1550,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
         if i < len(root_objs) - 1:
             jsn.write(b',')
 
-    if _cutscene is not None:
+    if _extra_node_data:
         if root_objs:
             jsn.write(b',')
         jsn.write(str(len(objs)).encode())  # the synthetic CutsceneData node
