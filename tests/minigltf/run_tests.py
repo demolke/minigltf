@@ -591,11 +591,49 @@ def validate_warn_mixed_channels(gltf, bin_data, out_dir):
 
 @test('multi_material_mesh', 'multi_material_mesh.py')
 def validate_multi_material_mesh(gltf, bin_data, out_dir):
-    """One mesh with two material slots - at least 1 mesh exported with materials present."""
-    assert len(gltf.get('materials', [])) >= 1, f"expected at least 1 material, got {len(gltf.get('materials', []))}"
-    assert len(gltf.get('meshes', [])) >= 1, "expected at least 1 mesh"
+    """One cube mesh with two material slots assigned to different faces."""
+    materials = gltf.get('materials', [])
+    mat_by_name = {m.get('name'): i for i, m in enumerate(materials)}
+    assert 'MatFront' in mat_by_name, f"MatFront material missing, got {list(mat_by_name)}"
+    assert 'MatBack' in mat_by_name, f"MatBack material missing, got {list(mat_by_name)}"
+
+    assert len(gltf.get('meshes', [])) == 1, f"expected 1 mesh, got {len(gltf.get('meshes', []))}"
     mesh = gltf['meshes'][0]
-    assert len(mesh['primitives']) >= 1, "expected at least 1 primitive"
+    prims = mesh['primitives']
+    assert len(prims) == 2, (
+        f"expected 2 primitives (one per material slot), got {len(prims)} - "
+        "the mesh was likely collapsed onto materials[0], dropping MatBack"
+    )
+
+    # Every primitive must reference a material, and the two together must cover
+    # exactly MatFront and MatBack.
+    for pi, prim in enumerate(prims):
+        assert 'material' in prim, f"primitive {pi} missing a material reference"
+    prim_mats = {prim['material'] for prim in prims}
+    assert prim_mats == {mat_by_name['MatFront'], mat_by_name['MatBack']}, (
+        f"primitives reference materials {prim_mats}, expected "
+        f"{{{mat_by_name['MatFront']}, {mat_by_name['MatBack']}}} (MatFront + MatBack)"
+    )
+
+    # Geometry must be shared, not duplicated: both primitives point at the same
+    # POSITION accessor but have distinct index accessors.
+    pos_accessors = {prim['attributes']['POSITION'] for prim in prims}
+    assert len(pos_accessors) == 1, (
+        f"primitives should share one POSITION accessor, got {pos_accessors} "
+        "(geometry must not be duplicated per material)"
+    )
+    idx_accessors = [prim['indices'] for prim in prims]
+    assert len(set(idx_accessors)) == 2, \
+        f"each primitive needs its own index accessor, got {idx_accessors}"
+
+    # The index subsets must partition the whole cube: 6 quads -> 12 tris -> 36
+    # indices total, with MatBack covering the single face it was assigned.
+    counts = {prim['material']: _acc(gltf, prim['indices'])['count'] for prim in prims}
+    total = sum(counts.values())
+    assert total == 36, f"expected 36 indices across primitives (12 tris), got {total} ({counts})"
+    back_count = counts[mat_by_name['MatBack']]
+    assert back_count == 6, \
+        f"MatBack face should contribute 6 indices (2 tris), got {back_count}"
 
 
 @test('euler_bone_anim', 'euler_bone_anim.py')

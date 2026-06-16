@@ -613,7 +613,10 @@ def mini_export(output_file: str, split: bool = True) -> None:
                 m.calc_normals_split()
             jsn.write(b'{"name":')
             jsn.write(_je(m.name))
-            jsn.write(b',"primitives":[{"attributes":{')
+
+            # Shared vertex attributes accumulated, so that we can use them 
+            # by every primitive of this mesh per each material slot.
+            attr = bytearray()
 
             n_verts = len(m.vertices)
             n_loops = len(m.loops)
@@ -636,8 +639,8 @@ def mini_export(output_file: str, split: bool = True) -> None:
             _base_flat = _base_co.ravel()
 
             # Vertex position
-            jsn.write(b'"POSITION":')
-            jsn.write(str(len(accessors)).encode())
+            attr += b'"POSITION":'
+            attr += str(len(accessors)).encode()
             offset = bchunk.tell()
             _t = time.perf_counter()
 
@@ -657,8 +660,8 @@ def mini_export(output_file: str, split: bool = True) -> None:
             bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 3 * 4, 'target': 34962})
 
             # Normals
-            jsn.write(b',"NORMAL":')
-            jsn.write(str(len(accessors)).encode())
+            attr += b',"NORMAL":'
+            attr += str(len(accessors)).encode()
             offset = bchunk.tell()
             _t = time.perf_counter()
 
@@ -675,8 +678,8 @@ def mini_export(output_file: str, split: bool = True) -> None:
             bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 3 * 4, 'target': 34962})
 
             # UV coordinates
-            jsn.write(b',"TEXCOORD_0":')
-            jsn.write(str(len(accessors)).encode())
+            attr += b',"TEXCOORD_0":'
+            attr += str(len(accessors)).encode()
             offset = bchunk.tell()
             _t = time.perf_counter()
 
@@ -691,8 +694,8 @@ def mini_export(output_file: str, split: bool = True) -> None:
             bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 2 * 4, 'target': 34962})
 
             if len(m.uv_layers) > 1:
-                jsn.write(b',"TEXCOORD_1":')
-                jsn.write(str(len(accessors)).encode())
+                attr += b',"TEXCOORD_1":'
+                attr += str(len(accessors)).encode()
                 offset = bchunk.tell()
                 _uv1 = bchunk.view(n_loops * 2)
                 m.uv_layers[1].uv.foreach_get('vector', _uv1)
@@ -702,15 +705,15 @@ def mini_export(output_file: str, split: bool = True) -> None:
 
             # Joints and Weights - only for skinned meshes
             if meshes[i] in joints_index:
-                jsn.write(b',"JOINTS_0":')
-                jsn.write(str(len(accessors)).encode())
+                attr += b',"JOINTS_0":'
+                attr += str(len(accessors)).encode()
                 offset = bchunk.tell()
                 _jidx_loop = bchunk.view(n_loops * 4, dtype=np.uint16).reshape(n_loops, 4)
                 accessors.append({'type': '"VEC4"', 'componentType': 5123, 'count': n_loops})
                 bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 8, 'target': 34962})
 
-                jsn.write(b',"WEIGHTS_0":')
-                jsn.write(str(len(accessors)).encode())
+                attr += b',"WEIGHTS_0":'
+                attr += str(len(accessors)).encode()
                 offset = bchunk.tell()
                 _jwt_loop = bchunk.view(n_loops * 4, dtype=np.float32).reshape(n_loops, 4)
                 accessors.append({'type': '"VEC4"', 'componentType': 5126, 'count': n_loops})
@@ -747,22 +750,11 @@ def mini_export(output_file: str, split: bool = True) -> None:
 
                 timings['joints_weights'] = timings.get('joints_weights', 0.0) + time.perf_counter() - _t
 
-            # Face indices
-            jsn.write(b'},"indices":')
-            jsn.write(str(len(accessors)).encode())
-            offset = bchunk.tell()
-            _t = time.perf_counter()
-
-            _idx = bchunk.view(n_tris * 3, dtype=np.uint32)
-            m.loop_triangles.foreach_get('loops', _idx)
-
-            timings['indices'] = timings.get('indices', 0.0) + time.perf_counter() - _t
-            accessors.append({'type': '"SCALAR"', 'componentType': 5125, 'count': n_tris * 3})
-            bufferViews.append({'byteOffset': offset, 'byteLength': n_tris * 3 * 4, 'target': 34963})
-
-            # Blendshapes
+            # Morph targets (shape keys) are per-loop deltas shared by every
+            # primitive of this mesh, so build them once into `targets`.
+            targets = bytearray()
             if m.shape_keys and len(m.shape_keys.key_blocks) > 1:
-                jsn.write(b',"targets":[')
+                targets += b',"targets":['
                 _t = time.perf_counter()
                 # Scratch buffers reused across keys to avoid allocation
                 _sk_buf = np.empty(n_verts * 3, dtype=np.float32)
@@ -777,8 +769,8 @@ def mini_export(output_file: str, split: bool = True) -> None:
                 for j in range(1, len(m.shape_keys.key_blocks)):
                     m.shape_keys.key_blocks[j].data.foreach_get('co', _sk_buf)
 
-                    jsn.write(b'{"POSITION":')
-                    jsn.write(str(len(accessors)).encode())
+                    targets += b'{"POSITION":'
+                    targets += str(len(accessors)).encode()
                     offset = bchunk.tell()
                     _out_sk = bchunk.view(n_loops * 3).reshape(n_loops, 3)
 
@@ -801,19 +793,73 @@ def mini_export(output_file: str, split: bool = True) -> None:
 
                     accessors.append({'type': '"VEC3"', 'componentType': 5126, 'count': n_loops, 'min': minv, 'max': maxv})
                     bufferViews.append({'byteOffset': offset, 'byteLength': n_loops * 3 * 4, 'target': 34962})
-                    jsn.write(b'}')
+                    targets += b'}'
 
                     if j < len(m.shape_keys.key_blocks) - 1:
-                        jsn.write(b',')
+                        targets += b','
 
                 timings['shape_keys'] = timings.get('shape_keys', 0.0) + time.perf_counter() - _t
-                jsn.write(b']')
+                targets += b']'
 
-            # Material
-            if m.materials and m.materials[0] is not None:
-                jsn.write(b',"material":')
-                jsn.write(str(materials.index(m.materials[0])).encode())
-            jsn.write(b'}]')
+            # Face indices, grouped by material slot. glTF expresses "different
+            # materials on different faces" as one primitive per material slot:
+            # every primitive references the SAME vertex attributes and morph
+            # targets built above, and differs only in its own index accessor
+            # (the subset of triangles using that slot) and its material.
+            _t = time.perf_counter()
+            _mat_idx = np.empty(n_tris, dtype=np.int32)
+            if n_tris:
+                m.loop_triangles.foreach_get('material_index', _mat_idx)
+
+            def _gltf_material(slot):
+                """glTF material index for a Blender slot, or None for an empty
+                slot."""
+                if 0 <= slot < len(m.materials) and m.materials[slot] is not None:
+                    return materials.index(m.materials[slot])
+                return None
+
+            # Distinct slots actually used, ascending (deterministic output).
+            used_slots = [int(s) for s in np.unique(_mat_idx)] if n_tris else [0]
+            # Only the multi-slot case needs the loops in a numpy array to mask;
+            # the common single-slot mesh streams straight into the buffer.
+            _all_loops = None
+            if len(used_slots) > 1:
+                _all_loops = np.empty(n_tris * 3, dtype=np.uint32)
+                m.loop_triangles.foreach_get('loops', _all_loops)
+                _all_loops = _all_loops.reshape(n_tris, 3)
+            timings['indices'] = timings.get('indices', 0.0) + time.perf_counter() - _t
+
+            jsn.write(b',"primitives":[')
+            for _si, _slot in enumerate(used_slots):
+                if _si:
+                    jsn.write(b',')
+                jsn.write(b'{"attributes":{')
+                jsn.write(bytes(attr))
+                jsn.write(b'},"indices":')
+                jsn.write(str(len(accessors)).encode())
+                offset = bchunk.tell()
+                _t = time.perf_counter()
+                if _all_loops is None:
+                    _cnt = n_tris * 3
+                    _idx = bchunk.view(_cnt, dtype=np.uint32)
+                    m.loop_triangles.foreach_get('loops', _idx)
+                else:
+                    _sel = _all_loops[_mat_idx == _slot].reshape(-1)
+                    _cnt = _sel.shape[0]
+                    _idx = bchunk.view(_cnt, dtype=np.uint32)
+                    _idx[:] = _sel
+                timings['indices'] = timings.get('indices', 0.0) + time.perf_counter() - _t
+                accessors.append({'type': '"SCALAR"', 'componentType': 5125, 'count': _cnt})
+                bufferViews.append({'byteOffset': offset, 'byteLength': _cnt * 4, 'target': 34963})
+
+                jsn.write(targets)
+
+                _gm = _gltf_material(_slot)
+                if _gm is not None:
+                    jsn.write(b',"material":')
+                    jsn.write(str(_gm).encode())
+                jsn.write(b'}')
+            jsn.write(b']')
 
             # Blendshape names
             if m.shape_keys and len(m.shape_keys.key_blocks) > 1:
