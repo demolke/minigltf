@@ -981,10 +981,16 @@ def validate_cutscene(gltf, bin_data, out_dir):
     assert len(beta_e['onsets']) == 2, \
         f"BetaSpeaker should have 2 onsets (shots 2 & 3), got {beta_e['onsets']}"
     assert beta_e['onsets'] == sorted(beta_e['onsets']), "BetaSpeaker onsets should be sorted"
-    assert abs(beta_e['volume'] - 0.85) < 0.01, \
-        f"BetaSpeaker volume expected ~0.85, got {beta_e['volume']}"
-    assert 'volume_keys' not in beta_e, \
-        "BetaSpeaker has no volume animation - no volume_keys expected"
+    # Beta now fades out at each shot cut too, so it carries animated volume.
+    assert 'volume_keys' in beta_e, \
+        "BetaSpeaker should have animated volume_keys (fade out at each shot cut)"
+    beta_keys = beta_e['volume_keys']
+    assert beta_keys[0][1] < 0.1, \
+        f"BetaSpeaker first volume key should be near 0 (fade in), got {beta_keys[0][1]}"
+    assert beta_keys[-1][1] < 0.1, \
+        f"BetaSpeaker last volume key should be near 0 (fade out at cut), got {beta_keys[-1][1]}"
+    assert any(abs(vk[1] - 0.85) < 0.05 for vk in beta_keys), \
+        f"BetaSpeaker volume_keys should reach its ~0.85 peak, got {beta_keys}"
     # BetaSpeaker onsets should be between AlphaSpeaker's two onsets.
     assert alpha_e['onsets'][0] < beta_e['onsets'][0] < alpha_e['onsets'][1], \
         f"BetaSpeaker first onset should be between AlphaSpeaker onsets: {beta_e['onsets']}"
@@ -1015,6 +1021,17 @@ def validate_cutscene(gltf, bin_data, out_dir):
         f"LaughTrack stop {laugh['stop']} should be > onset {laugh['onset']}"
     assert angry['onset'] > laugh['onset'], \
         f"AngryTrack should start after LaughTrack (shot 3 > shot 2)"
+
+    # Non-spatial track durations are taken from the cut schedule: AngryTrack
+    # (~2.57 s) is longer than its 2 s shot, so it must be trimmed to end exactly
+    # at the shot-3 cut instead of bleeding into shot 4. LaughTrack is shorter
+    # than its shot and so ends naturally before the cut.
+    shot2_cut = data['cuts'][2]['time']  # CamBeta cut: shot 2 -> shot 3
+    shot3_cut = data['cuts'][3]['time']  # CamEstablish cut: shot 3 -> shot 4
+    assert abs(angry['stop'] - shot3_cut) < 0.02, \
+        f"AngryTrack should be trimmed to the shot-3 cut ({shot3_cut:.3f}s), got {angry['stop']:.3f}s"
+    assert laugh['stop'] <= shot2_cut + 0.02, \
+        f"LaughTrack should not extend past the shot-2 cut ({shot2_cut:.3f}s), got {laugh['stop']:.3f}s"
 
 
 @test('cutscene_linked', 'cutscene_linked.py', godot='cutscene_check.gd')

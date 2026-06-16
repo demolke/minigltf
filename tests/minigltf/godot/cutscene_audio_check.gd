@@ -56,5 +56,5 @@ func _check_audio(scene: Node, anim: Animation) -> void:
 	# AlphaSpeaker must have a volume_db track; BetaSpeaker must not.
 	var has_alpha_vol := vol_track_paths.any(func(p): return "AlphaSpeaker" in p)
 	var has_beta_vol  := vol_track_paths.any(func(p): return "BetaSpeaker" in p)
-	ck(has_alpha_vol, "Cutscene animation has a volume_db VALUE track for AlphaSpeaker")
-	ck(not has_beta_vol, "BetaSpeaker should have no volume_db VALUE track (no volume animation)")
+	ck(has_alpha_vol, "Cutscene animation has a volume_db VALUE track for AlphaSpeaker (fade at cuts)")
+	ck(has_beta_vol, "Cutscene animation has a volume_db VALUE track for BetaSpeaker (fade at cuts)")

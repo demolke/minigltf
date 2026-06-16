@@ -64,6 +64,7 @@ def main():
 
     fps = scene.render.fps
     t = [f / fps for f in S]  # shot times in seconds
+    FADE = 4  # frames; a quick volume ramp so dialogue fades out as the shot cuts
 
     # --- AlphaSpeaker: talks in shots 1 (t[0]) and 4 (t[3]) -------------------
     alpha_sp_data = bpy.data.speakers.new("AlphaSpeaker")
@@ -74,17 +75,22 @@ def main():
     alpha_sp_obj.location = (-1.0, 0.5, 1.8)
     scene.collection.objects.link(alpha_sp_obj)
 
-    # Animated volume: fade in at shot 1, dip at shot 2, full at shot 4, fade out.
+    # Animated volume: Alpha talks in shots 1 and 4. In each shot the volume
+    # fades up from silence and then fades back to silence as the shot cuts, so
+    # the dialogue never bleeds across a cut.
     alpha_sp_obj.data.animation_data_create()
     vol_action = bpy.data.actions.new("AlphaSpeakerVolume")
     fcs = action_fcurves(vol_action, 'SPEAKER')
     fc = fcs.new(data_path='volume')
     for frame, vol in [
-        (S[0],      0.0),
-        (S[0] + 6,  0.9),
-        (S[1] + 24, 0.5),
-        (S[3],      0.9),
-        (S[3] + 12, 0.0),
+        (S[0],                  0.0),
+        (S[0] + FADE,           0.9),
+        (S[1] - FADE,           0.9),
+        (S[1],                  0.0),   # fade out as shot 1 cuts to shot 2
+        (S[3],                  0.0),
+        (S[3] + FADE,           0.9),
+        (scene.frame_end - FADE, 0.9),
+        (scene.frame_end,       0.0),   # fade out at the end of shot 4
     ]:
         kp = fc.keyframe_points.insert(float(frame), vol)
         kp.interpolation = 'LINEAR'
@@ -99,10 +105,30 @@ def main():
     beta_sp_obj.location = (1.0, 0.5, 1.8)
     scene.collection.objects.link(beta_sp_obj)
 
+    # Beta talks in shots 2 and 3; like Alpha, fade up at each shot start and
+    # back to silence as the shot cuts.
+    beta_sp_obj.data.animation_data_create()
+    beta_vol_action = bpy.data.actions.new("BetaSpeakerVolume")
+    bfcs = action_fcurves(beta_vol_action, 'SPEAKER')
+    bfc = bfcs.new(data_path='volume')
+    for frame, vol in [
+        (S[1],          0.0),
+        (S[1] + FADE,   0.85),
+        (S[2] - FADE,   0.85),
+        (S[2],          0.0),   # fade out as shot 2 cuts to shot 3
+        (S[2] + FADE,   0.85),
+        (S[3] - FADE,   0.85),
+        (S[3],          0.0),   # fade out as shot 3 cuts to shot 4
+    ]:
+        kp = bfc.keyframe_points.insert(float(frame), vol)
+        kp.interpolation = 'LINEAR'
+    assign_action(beta_sp_obj.data.animation_data, beta_vol_action, 'SPEAKER')
+
     # --- VSE: speaker onsets (named after speaker object) + non-spatial strips --
-    # Each strip gets its own channel to avoid overlap (talking.wav is ~2.4 s /
-    # ~57 frames; shots 2 and 3 are only 48 frames apart so BetaSpeaker strips
-    # on the same channel would overlap and Blender would shift or reject them).
+    # Each strip gets its own channel so repeated onsets of the same clip stay
+    # independent: a strip placed on an occupied channel would overlap an earlier
+    # one and Blender would shift or reject it. Keeping one strip per channel
+    # makes the onset timing exact regardless of each clip's length.
     scene.sequence_editor_create()
     se = scene.sequence_editor
     _strips = se.strips if hasattr(se, 'strips') else se.sequences
@@ -116,6 +142,15 @@ def main():
     laugh.volume = 0.7
     angry_strip = _strips.new_sound("AngryTrack", wavs['angry'], channel=6, frame_start=S[2])
     angry_strip.volume = 0.8
+
+    # Take the non-spatial track durations from the cut schedule: clamp each
+    # strip's end to the next cut so a long clip is trimmed at the shot boundary
+    # rather than bleeding into the following shot. (Clips shorter than the shot
+    # are left untouched.)
+    if laugh.frame_final_end > S[2]:
+        laugh.frame_final_end = S[2]
+    if angry_strip.frame_final_end > S[3]:
+        angry_strip.frame_final_end = S[3]
 
     os.makedirs(args.output_dir, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=os.path.join(args.output_dir, 'scene.blend'))
