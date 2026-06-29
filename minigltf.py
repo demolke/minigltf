@@ -1090,14 +1090,23 @@ def mini_export(output_file: str, split: bool = True) -> None:
 
         jsn.write(b'],')
 
+    # Resolve image URIs once; WebP images are tagged with EXT_texture_webp on
+    # their texture. Format is taken from the URI extension (the consumer reads
+    # the same .webp file), matching the extension's external-URI convention.
+    _img_uris = [_image_uri(img, output_file) for img in images]
+    _img_webp = [u.lower().endswith('.webp') for u in _img_uris]
+    _used_webp = any(_img_webp)
+
     # Textures
     if images:
         jsn.write(b'"textures":[')
         for i in range(len(images)):
-            img = images[i]
-            jsn.write(b'{"source":')
-            jsn.write(str(i).encode())
-            jsn.write(b'}')
+            # EXT_texture_webp: with no PNG/JPEG fallback the texture carries only
+            # the extension (no top-level "source").
+            if _img_webp[i]:
+                jsn.write(b'{"extensions":{"EXT_texture_webp":{"source":%d}}}' % i)
+            else:
+                jsn.write(b'{"source":%d}' % i)
 
             if i < len(images) - 1:
                 jsn.write(b',')
@@ -1108,9 +1117,8 @@ def mini_export(output_file: str, split: bool = True) -> None:
     if images:
         jsn.write(b'"images":[')
         for i in range(len(images)):
-            img = images[i]
             jsn.write(b'{"uri":')  # GLB does not support external images, but godot fortunately doesn't care
-            jsn.write(_je(_image_uri(img, output_file)))
+            jsn.write(_je(_img_uris[i]))
             jsn.write(b'}')
 
             if i < len(images) - 1:
@@ -1585,10 +1593,15 @@ def mini_export(output_file: str, split: bool = True) -> None:
         _ext_used.append('KHR_materials_emissive_strength')
     if _used_anim_pointer:
         _ext_used.append('KHR_animation_pointer')
+    if _used_webp:
+        _ext_used.append('EXT_texture_webp')
     if _ext_used:
         jsn.write(b'"extensionsUsed":[')
         jsn.write(b','.join(_je(e) for e in _ext_used))
         jsn.write(b'],')
+    # EXT_texture_webp has no fallback image here, so a reader must support it.
+    if _used_webp:
+        jsn.write(b'"extensionsRequired":["EXT_texture_webp"],')
 
     # Lights (KHR_lights_punctual)
     if lights:

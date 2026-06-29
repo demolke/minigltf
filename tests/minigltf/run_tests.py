@@ -264,6 +264,29 @@ def validate_full_material(gltf, bin_data, out_dir):
     assert len({bc_idx, mr_idx, nm_idx}) == 3, "texture indices are not all distinct"
 
 
+@test('webp_texture', 'webp_texture.py', godot='webp_texture_check.gd')
+def validate_webp_texture(gltf, bin_data, out_dir):
+    """A WebP base-colour texture is tagged with EXT_texture_webp. With no
+    PNG/JPEG fallback, the texture carries only the extension (no top-level
+    'source') and the extension is listed in extensionsRequired. The .webp is
+    referenced as-is (not re-encoded). Visibility is verified in Godot by
+    webp_texture_check.gd."""
+    assert 'EXT_texture_webp' in gltf.get('extensionsUsed', []), \
+        "EXT_texture_webp missing from extensionsUsed"
+    assert 'EXT_texture_webp' in gltf.get('extensionsRequired', []), \
+        "no fallback provided, so EXT_texture_webp must be in extensionsRequired"
+    texs = gltf.get('textures', [])
+    assert len(texs) == 1, f"expected 1 texture, got {len(texs)}"
+    tex = texs[0]
+    assert 'source' not in tex, \
+        "no fallback: texture must not carry a top-level 'source'"
+    ext = tex.get('extensions', {}).get('EXT_texture_webp', {})
+    assert ext.get('source') == 0, \
+        f"texture must reference the webp image via EXT_texture_webp.source, got {ext}"
+    uri = gltf['images'][0]['uri']
+    assert uri.lower().endswith('.webp'), f"image uri should be .webp, got {uri}"
+
+
 @test('scalar_material', 'scalar_material.py')
 def validate_scalar_material(gltf, bin_data, out_dir):
     assert len(gltf.get('materials', [])) == 1, "expected 1 material"

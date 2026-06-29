@@ -13,6 +13,12 @@ dedication) -- see `cc0_license.txt` in this directory.
 
 https://filmicworlds.com/blog/solving-face-scans-for-arkit/
 
+## webp_texture.webp
+
+A 16x16 WebP image (left half orange, right half teal) used by the `webp_texture`
+test to verify `EXT_texture_webp` export and in-engine decode in Godot. Generated
+procedurally for the test suite (no external source); public domain.
+
 ## chirp.wav
 Origin: Wikimedia Commons — Lingua Libre, spoken English word "whoosh"
 Author: Arlo Barnes (speaker & recorder)
