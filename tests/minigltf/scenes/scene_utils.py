@@ -82,6 +82,51 @@ def assign_action(anim_data, action, id_type='OBJECT'):
         anim_data.action_slot = _ensure_slot(action, id_type)
 
 
+# --- Multi-slot helpers (Blender 5.0+) ---------------------------------------
+# A single layered action can carry several slots, each a separate channelbag
+# bound to a different ID. These helpers create/address a specific slot so a
+# test can drive several objects from one action, either by direct assignment
+# or through NLA strips bound to the matching slot.
+
+def new_slot(action, id_type='OBJECT', name='slot'):
+    """Create and return a new slot on a layered action."""
+    return action.slots.new(id_type=id_type, name=name)
+
+
+def slot_fcurves(action, slot):
+    """Return the writable fcurves of one slot's channelbag (Blender 5.0+)."""
+    if not action.layers:
+        action.layers.new(name="Layer")
+    if not action.layers[0].strips:
+        action.layers[0].strips.new(type='KEYFRAME')
+    strip = action.layers[0].strips[0]
+    bag = strip.channelbag(slot) or strip.channelbags.new(slot)
+    return bag.fcurves
+
+
+def assign_action_slot(anim_data, action, slot):
+    """Directly assign `action` and bind a specific `slot`."""
+    anim_data.action = action
+    anim_data.action_slot = slot
+
+
+def push_action_slot(obj, action, slot, start, name):
+    """Push `action` onto a new NLA track of `obj`, binding the given `slot`.
+    Mirrors a real push-down, which carries the active slot into the strip."""
+    if obj.animation_data is None:
+        obj.animation_data_create()
+    tr = obj.animation_data.nla_tracks.new()
+    tr.name = name
+    st = tr.strips.new(action.name, int(start), action)
+    if slot is not None:
+        st.action_slot = slot
+    st.extrapolation = 'HOLD_FORWARD'
+    # strips.new() leaves animation_data.action set as a side effect; clear it so
+    # the NLA strip (not a stray override) is what drives the object.
+    obj.animation_data.action = None
+    return st
+
+
 def save_textures(output_dir):
     """Write local (non-linked) textures to <output_dir>/textures so Godot can
     load them alongside the .glb. Linked-library images are skipped."""

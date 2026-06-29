@@ -56,6 +56,9 @@ mode or handles.
 - Animated light energy and color via the `KHR_animation_pointer` extension
   (Godot reads these as `light_energy` / `light_color` tracks)
 - Multiple actions per scene, each becomes a separate glTF animation
+- Multi-slot actions: one action driving several objects through different slots
+  exports as a single glTF animation (one clip name) when assigned directly, and
+  as one clip per target when scheduled through separate NLA strips
 
 **Cameras**
 - Perspective and orthographic cameras exported to the glTF `cameras` array

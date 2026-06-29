@@ -650,6 +650,42 @@ def validate_multi_armature_anim(gltf, bin_data, out_dir):
     assert len(channels) >= 1, "expected animation channels"
 
 
+@test('multi_slot_anim', 'multi_slot_anim.py', godot='multi_slot_check.gd')
+def validate_multi_slot_anim(gltf, bin_data, out_dir):
+    """One multi-slot action driving two armatures directly (no NLA) is a single
+    logical animation: it must export as ONE glTF animation named after the action
+    whose channels target both armatures' bones - not one suffixed clip per object.
+    The shared-name split is verified in Godot by multi_slot_check.gd."""
+    anims = gltf.get('animations', [])
+    names = [a.get('name') for a in anims]
+    assert names == ['Wave'], f"expected a single 'Wave' animation, got {names}"
+    # One animation, channels reaching both bone nodes (BoneA + BoneB).
+    bone_idx = {i for i, n in enumerate(gltf['nodes']) if n.get('name') in ('BoneA', 'BoneB')}
+    assert len(bone_idx) == 2, f"expected BoneA and BoneB nodes, got {bone_idx}"
+    targets = {ch['target'].get('node') for ch in anims[0]['channels']}
+    assert bone_idx <= targets, \
+        f"the single animation must drive both bones; targets={targets}, bones={bone_idx}"
+
+
+@test('multi_slot_nla_anim', 'multi_slot_nla_anim.py', godot='multi_slot_nla_check.gd')
+def validate_multi_slot_nla_anim(gltf, bin_data, out_dir):
+    """The same multi-slot action pushed to two armatures via NLA stays one clip
+    per target (each strip is an independently schedulable lane). Both targets must
+    resolve their own slot and survive - a strip whose slot was left unresolved used
+    to drop its target silently. The Cutscene wiring is verified by
+    multi_slot_nla_check.gd."""
+    names = sorted(a.get('name') for a in gltf.get('animations', []))
+    assert names == ['Wave_Armature1', 'Wave_Armature2'], \
+        f"expected per-target clips for both armatures, got {names}"
+    # Each clip drives exactly one distinct bone node.
+    nodes_driven = set()
+    for a in gltf['animations']:
+        tgts = {ch['target'].get('node') for ch in a['channels']}
+        assert len(tgts) == 1, f"clip '{a['name']}' should drive one node, got {tgts}"
+        nodes_driven |= tgts
+    assert len(nodes_driven) == 2, f"the two clips must drive distinct nodes, got {nodes_driven}"
+
+
 @test('dotted_bone_anim', 'dotted_bone_anim.py')
 def validate_dotted_bone_anim(gltf, bin_data, out_dir):
     """Bone named 'Bone.001' must not crash the animation channel split."""

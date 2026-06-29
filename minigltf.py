@@ -1239,148 +1239,162 @@ def mini_export(output_file: str, split: bool = True) -> None:
         _MISS = object()
 
         def _slot_used(ad, action):
-            """Slot handle in effect (direct or via any NLA strip), else _MISS.
-            None means "no/!slots" (Blender <= 4.4)."""
+            """(raw_slot_handle, via_nla) for how `ad` uses `action`, else (_MISS, False).
+            raw_slot_handle is None on Blender <= 4.4 (no slots) and 0 for an NLA
+            strip whose slot is unassigned; the caller resolves those."""
             if ad is None:
-                return _MISS
+                return _MISS, False
             if getattr(ad, 'action', None) is action:
-                return getattr(getattr(ad, 'action_slot', None), 'handle', None)
+                return getattr(getattr(ad, 'action_slot', None), 'handle', None), False
             for _tr in ad.nla_tracks:
                 for _st in _tr.strips:
                     if _st.action is action:
-                        return getattr(_st, 'action_slot_handle', None)
-            return _MISS
+                        return getattr(_st, 'action_slot_handle', None), True
+            return _MISS, False
 
         def _action_users(action):
-            """(target_obj, slot_handle, domain) for every object that uses `action`.
-            domain: 'xform' (armature bones / camera-light TRS), 'shapekey', 'lightprop'."""
+            """(target_obj, slot_handle, domain, via_nla) for every object that uses
+            `action`. domain: 'xform' (armature bones / camera-light TRS), 'shapekey',
+            'lightprop'. via_nla is True when the use is through an NLA strip.
+
+            A single (multi-slot) action drives several IDs through different slots;
+            the slot is resolved from the binding's own side - ActionSlot.users()
+            authoritatively maps each slot to the IDs bound to it (directly or via a
+            strip), which survives strips whose action_slot_handle reads as unassigned.
+            A sole slot is the fallback for a genuinely unbound strip."""
+            _slots = list(getattr(action, 'slots', None) or [])
+            slot_of = {}
+            for _sl in _slots:
+                try:
+                    for _u in _sl.users():
+                        slot_of[_u] = _sl.handle
+                except Exception:
+                    pass
+            _sole = _slots[0].handle if len(_slots) == 1 else None
+
             users = []
+
+            def _add(ad, holder_id, owner, domain):
+                raw, via_nla = _slot_used(ad, action)
+                if raw is _MISS:
+                    return
+                if raw not in (None, 0):
+                    handle = raw                    # explicit slot binding wins
+                elif raw is None:
+                    handle = None                   # Blender <= 4.4: all fcurves
+                else:                               # raw == 0: unassigned NLA slot
+                    handle = slot_of.get(holder_id, _sole)
+                    if handle is None:
+                        print(f"[minigltf] WARNING: action '{action.name}' used on "
+                              f"'{getattr(owner, 'name', owner)}' through an unassigned "
+                              f"slot; cannot choose among {len(_slots)} slots - skipping")
+                        return
+                users.append((owner, handle, domain, via_nla))
+
             for _o in objs:
                 if not isinstance(_o, bpy.types.Object):
                     continue
-                sh = _slot_used(_o.animation_data, action)
-                if sh is not _MISS:
-                    users.append((_o, sh, 'xform'))
+                _add(_o.animation_data, _o, _o, 'xform')
                 if _o.type == 'MESH' and _o.data.shape_keys:
-                    sh = _slot_used(_o.data.shape_keys.animation_data, action)
-                    if sh is not _MISS:
-                        users.append((_o, sh, 'shapekey'))
+                    _add(_o.data.shape_keys.animation_data, _o.data.shape_keys, _o, 'shapekey')
                 if _o.type == 'LIGHT':
-                    sh = _slot_used(_o.data.animation_data, action)
-                    if sh is not _MISS:
-                        users.append((_o, sh, 'lightprop'))
+                    _add(_o.data.animation_data, _o.data, _o, 'lightprop')
             return users
 
-        _anim_chunks = []
-        for a in _local_actions:
-            users = _action_users(a)
-            if not users:
-                # Loose action (created but never assigned): place it with the old
-                # heuristic so nothing is silently dropped.
-                _paths = {f.data_path for f in _action_fcurves(a)}
-                _tgt = a['armature'] if ('armature' in a and a['armature'] in objs) else None
-                if any(p.startswith('pose.bones') for p in _paths):
-                    if _tgt is None:
-                        _tgt = next((o for o in objs if isinstance(o, bpy.types.Object)
-                                     and o.type == 'ARMATURE'), None)
-                    if _tgt is not None:
-                        users = [(_tgt, None, 'xform')]
-                elif any(p.startswith('key_blocks[') for p in _paths):
-                    _tgt = next((o for o in meshes if o.data.shape_keys), None)
-                    if _tgt is not None:
-                        users = [(_tgt, None, 'shapekey')]
+        def _channel_set(a, target, slot_handle, domain):
+            """Resolve one (action, slot, target) usage into its drawable channels:
+            (transforms, pointers, sk_mesh_obj, shape_key_curves), or None when the
+            usage produces nothing. sk_mesh_obj is None unless shape-key weights apply."""
+            # Group this slot's fcurves by data path.
+            curves = {}
+            for f in _slot_fcurves(a, slot_handle):
+                curves.setdefault(f.data_path, [None, None, None, None])[f.array_index] = f
 
-            # An action reused on more than one target becomes several glTF
-            # animations; disambiguate their names (Godot keys animations by name).
-            multi = len(users) > 1
+            # Transform tracks. Bones and camera/light objects use the same path.
+            # Each entry: (node, gltf_path, curveset, primary_fc, correction)
+            transforms = []
+            pointers = []
+            shape_key_curves = {}
+            sk_mesh_obj = None
 
-            for (target, slot_handle, domain) in users:
-                # Group this slot's fcurves by data path.
-                curves = {}
-                for f in _slot_fcurves(a, slot_handle):
-                    curves.setdefault(f.data_path, [None, None, None, None])[f.array_index] = f
+            if domain == 'xform' and target.type == 'ARMATURE':
+                arm = target.data
+                for _bname in sorted(curves.keys()):
+                    if not _bname.startswith('pose.bones'):
+                        continue
+                    _stripped = _bname.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
+                    _parts = _stripped.rsplit('.', 1)
+                    if len(_parts) != 2:
+                        continue
+                    _bone_name, _channel = _parts
+                    if _channel not in CHANNEL_MAPPING:
+                        print(f"[minigltf] WARNING: bone '{_bone_name}' uses unsupported channel '{_channel}' - skipping")
+                        continue
+                    _bone = arm.bones.get(_bone_name)
+                    if _bone is None or _bone not in objs:
+                        continue
+                    cs = curves[_bname]
+                    pf = next((fc for fc in cs if fc is not None), None)
+                    if pf is None or len(pf.keyframe_points) == 0:
+                        continue
+                    if _bone.parent:
+                        corr = _bone.parent.matrix_local.inverted_safe() @ _bone.matrix_local
+                    else:
+                        corr = axis_basis_change @ _bone.matrix_local
+                    transforms.append((_bone, CHANNEL_MAPPING[_channel], cs, pf, corr))
+            elif domain == 'xform' and target.type in ('CAMERA', 'LIGHT', 'SPEAKER'):
+                for _dp, _path in CHANNEL_MAPPING.items():
+                    cs = curves.get(_dp)
+                    pf = next((fc for fc in cs if fc is not None), None) if cs else None
+                    if pf is None or len(pf.keyframe_points) == 0:
+                        continue
+                    transforms.append((target, _path, cs, pf, axis_basis_change))
+            elif domain == 'lightprop' and target.data in lights:
+                _li = lights.index(target.data)
+                _lt = target.data
+                base = f'/extensions/KHR_lights_punctual/lights/{_li}'
+                ecs = curves.get('energy')
+                if ecs and ecs[0] and len(ecs[0].keyframe_points):
+                    pointers.append((base + '/intensity', ecs[0], 1,
+                                     lambda t, fc=ecs[0], lt=_lt: [_light_intensity(lt, _fc_val(fc, t))]))
+                ccs = curves.get('color')
+                _cpf = next((fc for fc in ccs if fc is not None), None) if ccs else None
+                if _cpf is not None and len(_cpf.keyframe_points):
+                    pointers.append((base + '/color', _cpf, 3,
+                                     lambda t, cs=ccs: [_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t)]))
+            elif domain == 'shapekey':
+                for path, fcs in curves.items():
+                    if path.startswith('key_blocks[') and '.value' in path:
+                        shape_key_curves[path.split('"')[1]] = fcs[0]
+                sk_mesh_obj = target
 
-                # Transform tracks. Bones and camera/light objects use the same path.
-                # Each entry: (node, gltf_path, curveset, primary_fc, correction)
-                transforms = []
-                pointers = []
-                shape_key_curves = {}
-                sk_mesh_obj = None
+            _sk_first_fc = next(iter(shape_key_curves.values()), None) if shape_key_curves else None
+            _has_sk_anim = bool(
+                _sk_first_fc and sk_mesh_obj and sk_mesh_obj in meshes
+                and sk_mesh_obj.data.shape_keys
+                and len(sk_mesh_obj.data.shape_keys.key_blocks) > 1
+                and len(_sk_first_fc.keyframe_points) > 0
+            )
 
-                if domain == 'xform' and target.type == 'ARMATURE':
-                    arm = target.data
-                    for _bname in sorted(curves.keys()):
-                        if not _bname.startswith('pose.bones'):
-                            continue
-                        _stripped = _bname.removeprefix("pose.bones").translate(str.maketrans('', '', '[]"'))
-                        _parts = _stripped.rsplit('.', 1)
-                        if len(_parts) != 2:
-                            continue
-                        _bone_name, _channel = _parts
-                        if _channel not in CHANNEL_MAPPING:
-                            print(f"[minigltf] WARNING: bone '{_bone_name}' uses unsupported channel '{_channel}' - skipping")
-                            continue
-                        _bone = arm.bones.get(_bone_name)
-                        if _bone is None or _bone not in objs:
-                            continue
-                        cs = curves[_bname]
-                        pf = next((fc for fc in cs if fc is not None), None)
-                        if pf is None or len(pf.keyframe_points) == 0:
-                            continue
-                        if _bone.parent:
-                            corr = _bone.parent.matrix_local.inverted_safe() @ _bone.matrix_local
-                        else:
-                            corr = axis_basis_change @ _bone.matrix_local
-                        transforms.append((_bone, CHANNEL_MAPPING[_channel], cs, pf, corr))
-                elif domain == 'xform' and target.type in ('CAMERA', 'LIGHT', 'SPEAKER'):
-                    for _dp, _path in CHANNEL_MAPPING.items():
-                        cs = curves.get(_dp)
-                        pf = next((fc for fc in cs if fc is not None), None) if cs else None
-                        if pf is None or len(pf.keyframe_points) == 0:
-                            continue
-                        transforms.append((target, _path, cs, pf, axis_basis_change))
-                elif domain == 'lightprop' and target.data in lights:
-                    _li = lights.index(target.data)
-                    _lt = target.data
-                    base = f'/extensions/KHR_lights_punctual/lights/{_li}'
-                    ecs = curves.get('energy')
-                    if ecs and ecs[0] and len(ecs[0].keyframe_points):
-                        pointers.append((base + '/intensity', ecs[0], 1,
-                                         lambda t, fc=ecs[0], lt=_lt: [_light_intensity(lt, _fc_val(fc, t))]))
-                    ccs = curves.get('color')
-                    _cpf = next((fc for fc in ccs if fc is not None), None) if ccs else None
-                    if _cpf is not None and len(_cpf.keyframe_points):
-                        pointers.append((base + '/color', _cpf, 3,
-                                         lambda t, cs=ccs: [_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t)]))
-                elif domain == 'shapekey':
-                    for path, fcs in curves.items():
-                        if path.startswith('key_blocks[') and '.value' in path:
-                            shape_key_curves[path.split('"')[1]] = fcs[0]
-                    sk_mesh_obj = target
+            # Skip usages that produce no channels - an empty animation is invalid glTF.
+            if not transforms and not _has_sk_anim and not pointers:
+                return None
+            return (transforms, pointers, sk_mesh_obj if _has_sk_anim else None, shape_key_curves)
 
-                _sk_first_fc = next(iter(shape_key_curves.values()), None) if shape_key_curves else None
-                _has_sk_anim = bool(
-                    _sk_first_fc and sk_mesh_obj and sk_mesh_obj in meshes
-                    and sk_mesh_obj.data.shape_keys
-                    and len(sk_mesh_obj.data.shape_keys.key_blocks) > 1
-                    and len(_sk_first_fc.keyframe_points) > 0
-                )
-
-                # Skip usages that produce no channels - an empty animation is invalid glTF.
-                if not transforms and not _has_sk_anim and not pointers:
-                    continue
-                if pointers:
-                    _used_anim_pointer = True
-
-                _name = f"{a.name}_{target.name}" if multi else a.name
-                ab = BytesIO()
-                ab.write(b'{"name":' + _je(_name) + b',"channels":[')
-                _sidx = 0
+        def _write_animation(name, sets):
+            """Serialize one glTF animation named `name` whose channels come from a
+            list of channel-sets. Several sets (one per directly-bound slot of a
+            multi-slot action) merge into a single animation that drives several
+            nodes; the per-node split on the Godot side keeps the shared name."""
+            ab = BytesIO()
+            ab.write(b'{"name":' + _je(name) + b',"channels":[')
+            _sidx = 0
+            for (transforms, pointers, sk_mesh_obj, shape_key_curves) in sets:
                 for (node, path, cs, pf, corr) in transforms:
                     ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"node":%d,"path":"%s"}}'
                              % (_sidx, objs.index(node), path.encode()))
                     _sidx += 1
-                if _has_sk_anim:
+                if sk_mesh_obj is not None:
                     ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"node":%d,"path":"weights"}}'
                              % (_sidx, objs.index(sk_mesh_obj)))
                     _sidx += 1
@@ -1389,8 +1403,9 @@ def mini_export(output_file: str, split: bool = True) -> None:
                              % _sidx + _je(pointer) + b'}}}}')
                     _sidx += 1
 
-                ab.write(b'],"samplers":[')
-                _need_comma = False
+            ab.write(b'],"samplers":[')
+            _need_comma = False
+            for (transforms, pointers, sk_mesh_obj, shape_key_curves) in sets:
                 for (node, path, cs, pf, corr) in transforms:
                     if _need_comma:
                         ab.write(b',')
@@ -1410,10 +1425,11 @@ def mini_export(output_file: str, split: bool = True) -> None:
                             vals += (loc.x, loc.y, loc.z)
                     _emit_sampler(ab, times, vals, 4 if path == 'rotation' else 3)
 
-                if _has_sk_anim:
+                if sk_mesh_obj is not None:
                     if _need_comma:
                         ab.write(b',')
                     _need_comma = True
+                    _sk_first_fc = next(iter(shape_key_curves.values()))
                     morph_names = [kb.name for kb in sk_mesh_obj.data.shape_keys.key_blocks[1:]]
                     times = [kp.co.x / fps_val for kp in _sk_first_fc.keyframe_points]
                     weights = []
@@ -1433,8 +1449,49 @@ def mini_export(output_file: str, split: bool = True) -> None:
                         vals += vfn(t)
                     _emit_sampler(ab, times, vals, n)
 
-                ab.write(b']}')
-                _anim_chunks.append(ab.getvalue())
+            ab.write(b']}')
+            return ab.getvalue()
+
+        # Clip names must match the cutscene schedule, which suffixes any action
+        # used by more than one target (Godot keys animations by name).
+        _counts = _action_target_counts(bpy.context.scene)
+
+        _anim_chunks = []
+        for a in _local_actions:
+            users = _action_users(a)
+            if not users:
+                # Loose action (created but never assigned): place it with the old
+                # heuristic so nothing is silently dropped.
+                _paths = {f.data_path for f in _action_fcurves(a)}
+                _tgt = a['armature'] if ('armature' in a and a['armature'] in objs) else None
+                if any(p.startswith('pose.bones') for p in _paths):
+                    if _tgt is None:
+                        _tgt = next((o for o in objs if isinstance(o, bpy.types.Object)
+                                     and o.type == 'ARMATURE'), None)
+                    if _tgt is not None:
+                        users = [(_tgt, None, 'xform', False)]
+                elif any(p.startswith('key_blocks[') for p in _paths):
+                    _tgt = next((o for o in meshes if o.data.shape_keys), None)
+                    if _tgt is not None:
+                        users = [(_tgt, None, 'shapekey', False)]
+
+            # A multi-slot action assigned directly to several objects is one logical
+            # animation: its slots merge into a single glTF clip named after the action.
+            # NLA strips schedule each actor independently (cutscenes), so they stay
+            # one suffixed clip per target.
+            direct_sets = []
+            for (target, slot_handle, domain, via_nla) in users:
+                cs = _channel_set(a, target, slot_handle, domain)
+                if cs is None:
+                    continue
+                if cs[1]:
+                    _used_anim_pointer = True
+                if via_nla:
+                    _anim_chunks.append(_write_animation(_clip_name(a.name, target.name, _counts), [cs]))
+                else:
+                    direct_sets.append(cs)
+            if direct_sets:
+                _anim_chunks.append(_write_animation(a.name, direct_sets))
 
         if _anim_chunks:
             jsn.write(b'"animations":[' + b','.join(_anim_chunks) + b'],')
