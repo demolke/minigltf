@@ -28,9 +28,24 @@ func _import_post(state: GLTFState, root: Node) -> Error:
 	if _grafting:
 		return OK
 	_resolve_links(root, root, state.base_path)
-	_split_master_player(root)
+	_split_master_player(root, _read_clip_names(root))
 	_build_cutscene(root, state.base_path)
 	return OK
+
+
+# minigltf stores a { glTF animation name -> bare action name } map in the
+# CutsceneData extras. glTF needs globally-unique animation names, but once the
+# master player is split into one AnimationPlayer per actor each clip lives in
+# its own namespace, so it is renamed back to its bare action name there (unique
+# within that player). The cutscene schedule references those bare names.
+func _read_clip_names(scene: Node) -> Dictionary:
+	var holder := scene.find_child("CutsceneData", true, false)
+	if holder == null or not holder.has_meta("extras"):
+		return {}
+	var extras = holder.get_meta("extras")
+	if extras is Dictionary and extras.has("minigltf_clip_names"):
+		return extras["minigltf_clip_names"]
+	return {}
 
 
 # --- pass 1: linked-library collection instances ------------------------------
@@ -124,7 +139,7 @@ func _actor_node(scene: Node, target: String) -> Node:
 	return node
 
 
-func _split_master_player(scene: Node) -> void:
+func _split_master_player(scene: Node, clip_names: Dictionary = {}) -> void:
 	var master: AnimationPlayer = scene.get_node_or_null("AnimationPlayer")
 	if master == null:
 		return
@@ -159,7 +174,7 @@ func _split_master_player(scene: Node) -> void:
 					if _track_target(anim, i) != target:
 						anim.remove_track(i)
 				if anim.get_track_count() > 0:
-					lib.add_animation(anim_name, anim)
+					lib.add_animation(clip_names.get(anim_name, anim_name), anim)
 			if not lib.get_animation_list().is_empty():
 				ap.add_animation_library(lib_name, lib)
 		# Track paths are relative to the scene root; re-root the new player

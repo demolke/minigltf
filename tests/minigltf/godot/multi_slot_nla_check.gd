@@ -45,14 +45,15 @@ func _main() -> void:
 	get_root().add_child(scene)
 	await process_frame
 
-	# Each armature keeps its own per-target clip - both targets present.
-	var expect := {"Armature1": "Wave_Armature1", "Armature2": "Wave_Armature2"}
-	for arm in expect:
+	# Each armature keeps its own lane; after the per-node split each is renamed
+	# back to the bare action name ("Wave") on its own AnimationPlayer, so both
+	# targets survive and the name only has to be unique within one player.
+	for arm in ["Armature1", "Armature2"]:
 		var ap := _player_for(scene, arm)
 		ck(ap != null, "%s has an AnimationPlayer" % arm)
 		if ap != null:
-			ck(ap.has_animation(expect[arm]),
-				"%s/AnimationPlayer has '%s'" % [arm, expect[arm]])
+			ck(ap.has_animation("Wave"),
+				"%s/AnimationPlayer has 'Wave'" % arm)
 
 	# The NLA schedule rebuilds a Cutscene player that drives both lanes.
 	var cut := scene.get_node_or_null("Cutscene") as AnimationPlayer

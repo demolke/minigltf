@@ -138,12 +138,92 @@ def _clip_name(action_name, target_name, counts):
     return action_name if counts.get(action_name, 1) <= 1 else f"{action_name}_{target_name}"
 
 
+# Godot's glTF importer runs every animation name through
+# AnimationLibrary.validate_library_name, which replaces '/', ':', ',' and '['
+# with '_'. Sanitize the names we emit (and reference in the schedule) the same
+# way so a punctuated action name still round-trips: the glTF name Godot keeps
+# equals the map key the addon looks up, and the bare name the addon assigns is a
+# valid clip name the schedule can match.
+_GD_NAME_TRANS = str.maketrans('/:,[', '____')
+
+
+def _gd_clip_name(name):
+    return name.translate(_GD_NAME_TRANS)
+
+
+def _clip_name_registry(scene):
+    """Globally-unique glTF animation name for every clip the exporter emits.
+
+    The animation writer and the cutscene schedule must reference identical clip
+    names, and no two animations may share one. Godot's importer silently renames
+    duplicate animation names on import (``foo``, ``foo2``, ...), so if the name
+    the export generates for one lane (e.g. a multi-target ``crawl_rigB``) happens
+    to equal another action's name, the schedule ends up pointing a lane at the
+    renamed - i.e. wrong - clip. Which one gets renamed is import-order dependent,
+    so the breakage is intermittent. Assigning names here, once, and having both
+    callers look them up keeps them in agreement and every emitted name unique.
+
+    Returns (nla_names, direct_names):
+      nla_names[(object_name, action_name)] -> per-target NLA lane clip name
+      direct_names[action_name]             -> merged direct-assignment clip name
+    """
+    counts = _action_target_counts(scene)
+    used = set()
+
+    def _uniq(preferred):
+        name = preferred
+        i = 2
+        while name in used:
+            name = f"{preferred}_{i}"
+            i += 1
+        used.add(name)
+        return name
+
+    nla_names = {}
+    direct_names = {}
+
+    # Deterministic pass mirroring the export's direct-vs-NLA split: a holder's
+    # active action becomes one merged clip; every NLA strip whose action isn't
+    # that active action is its own per-target lane. First claimant of a name
+    # keeps it; any later collision (with another lane or a like-named action)
+    # gets a numeric suffix, identically for both callers.
+    # Keys stay the raw action/object names (the export and schedule look them up
+    # by those); the value is the Godot-sanitized, de-duplicated glTF name.
+    for obj in scene.objects:
+        for ad in _anim_data_holders(obj):
+            # In NLA tweak mode the active action is a strip being edited; treat
+            # it as its NLA lane (below), not as a direct/active-action clip.
+            active = (ad.action if (ad.action and not ad.action.library
+                                    and not getattr(ad, 'use_tweak_mode', False))
+                      else None)
+            if active is not None and active.name not in direct_names:
+                direct_names[active.name] = _uniq(_gd_clip_name(active.name))
+            for tr in ad.nla_tracks:
+                for st in tr.strips:
+                    act = st.action
+                    if act is None or act.library or act is active:
+                        continue
+                    key = (obj.name, act.name)
+                    if key not in nla_names:
+                        nla_names[key] = _uniq(_gd_clip_name(_clip_name(act.name, obj.name, counts)))
+
+    # Loose local actions (created but never assigned) still export as a bare
+    # merged clip; reserve their names too so nothing collides with them.
+    for a in bpy.data.actions:
+        if getattr(a, 'library', None) or a.name in direct_names:
+            continue
+        if any(k[1] == a.name for k in nla_names):
+            continue
+        direct_names[a.name] = _uniq(_gd_clip_name(a.name))
+
+    return nla_names, direct_names
+
+
 def _cutscene_schedule():
     """The NLA schedule for the current scene as a JSON-ready dict, or None
     when there is no cutscene (no camera-bound markers and no NLA strips)."""
     scene = bpy.context.scene
     fps = scene.render.fps * scene.render.fps_base
-    counts = _action_target_counts(scene)
 
     # Camera cuts from camera-bound markers.
     markers = sorted((m for m in scene.timeline_markers if m.camera is not None),
@@ -163,8 +243,11 @@ def _cutscene_schedule():
                 for st in tr.strips:
                     if st.mute or st.action is None:
                         continue
-                    keys.append([st.frame_start / fps,
-                                 _clip_name(st.action.name, obj.name, counts)])
+                    # The Godot addon renames each per-actor clip to its bare
+                    # action name, so the schedule references that (a lane clip
+                    # name only has to be unique within one actor's player).
+                    # Sanitize to match the name the addon assigns in Godot.
+                    keys.append([st.frame_start / fps, _gd_clip_name(st.action.name)])
                     end_sec = max(end_sec, st.frame_end / fps)
         if keys:
             keys.sort(key=lambda k: k[0])
@@ -464,6 +547,20 @@ def mini_export(output_file: str, split: bool = True) -> None:
     # Cutscene schedule (NLA timeline) and audio schedule - stored together in a
     # synthetic CutsceneData node appended after the real nodes; must be known
     # before the nodes section is streamed.
+    # Clip naming is resolved once here and shared by the schedule, the animation
+    # writer and the Godot addon. glTF animations live in one flat, name-keyed
+    # list (Godot renames duplicates on import), so each exported clip gets a
+    # globally-unique name from the registry. The addon splits the master player
+    # per actor - one AnimationPlayer per node, each its own namespace - and there
+    # each clip is renamed back to its bare action name via _clip_names, so two
+    # actors can both hold e.g. "crawl" and the schedule references bare names.
+    _reg_nla, _reg_direct = _clip_name_registry(bpy.context.scene)
+    _clip_names = {}
+    for (_on, _an), _uniq in _reg_nla.items():
+        _clip_names[_uniq] = _gd_clip_name(_an)
+    for _an, _uniq in _reg_direct.items():
+        _clip_names.setdefault(_uniq, _gd_clip_name(_an))
+
     _cutscene = _cutscene_schedule()
     _audio = _audio_schedule(output_file)
     _extra_node_data = {}
@@ -471,6 +568,12 @@ def mini_export(output_file: str, split: bool = True) -> None:
         _extra_node_data['minigltf_cutscene'] = _cutscene
     if _audio is not None:
         _extra_node_data['minigltf_audio'] = _audio
+    # The clip-name map only matters for a cutscene (per-target suffixed clips
+    # only arise from NLA, which always yields a schedule). Gating it here keeps
+    # plain-animation and linked-library glbs free of a CutsceneData node - a
+    # linked library's node would otherwise be grafted into the main scene.
+    if _clip_names and _cutscene is not None:
+        _extra_node_data['minigltf_clip_names'] = _clip_names
 
     # Nodes section
     jsn.write(b'"nodes":[')
@@ -1252,7 +1355,12 @@ def mini_export(output_file: str, split: bool = True) -> None:
             strip whose slot is unassigned; the caller resolves those."""
             if ad is None:
                 return _MISS, False
-            if getattr(ad, 'action', None) is action:
+            # In NLA tweak mode ("edit" a strip) the active action is the strip
+            # being edited - it also still lives in the stack, so let the strip
+            # loop below claim it as an NLA lane rather than exporting it as a
+            # direct/active action (which would merge it and drop it from the
+            # per-actor cutscene schedule).
+            if not getattr(ad, 'use_tweak_mode', False) and getattr(ad, 'action', None) is action:
                 return getattr(getattr(ad, 'action_slot', None), 'handle', None), False
             for _tr in ad.nla_tracks:
                 for _st in _tr.strips:
@@ -1460,9 +1568,11 @@ def mini_export(output_file: str, split: bool = True) -> None:
             ab.write(b']}')
             return ab.getvalue()
 
-        # Clip names must match the cutscene schedule, which suffixes any action
-        # used by more than one target (Godot keys animations by name).
-        _counts = _action_target_counts(bpy.context.scene)
+        # glTF animation names must be globally unique (Godot keys animations by
+        # name and renames duplicates on import). Reuse the registry resolved
+        # above; the addon renames each per-actor clip back to its bare action
+        # name (via minigltf_clip_names) after splitting the master player.
+        _nla_names, _direct_names = _reg_nla, _reg_direct
 
         _anim_chunks = []
         for a in _local_actions:
@@ -1495,11 +1605,14 @@ def mini_export(output_file: str, split: bool = True) -> None:
                 if cs[1]:
                     _used_anim_pointer = True
                 if via_nla:
-                    _anim_chunks.append(_write_animation(_clip_name(a.name, target.name, _counts), [cs]))
+                    _nm = _nla_names.get((target.name, a.name))
+                    if _nm is None:
+                        _nm = _direct_names.get(a.name, a.name)
+                    _anim_chunks.append(_write_animation(_nm, [cs]))
                 else:
                     direct_sets.append(cs)
             if direct_sets:
-                _anim_chunks.append(_write_animation(a.name, direct_sets))
+                _anim_chunks.append(_write_animation(_direct_names.get(a.name, a.name), direct_sets))
 
         if _anim_chunks:
             jsn.write(b'"animations":[' + b','.join(_anim_chunks) + b'],')

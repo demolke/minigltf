@@ -27,13 +27,13 @@ const ARKIT_SHAPES := [
 	"mouthStretch_L", "mouthStretch_R", "tongueOut",
 ]
 
-# Face clips and the head whose AnimationPlayer must hold them.
+# Face clips each head's AnimationPlayer must hold. After the per-node split each
+# clip is renamed to its bare action name on the head's own player, so the reused
+# TalkingFace shows up as bare "TalkingFace" on both heads (each player is its own
+# namespace).
 const FACE_CLIPS := {
-	"TalkingFace_AlphaHead": "AlphaHead",
-	"HappyFace": "AlphaHead",
-	"TalkingFace_BetaHead": "BetaHead",
-	"AngryFace": "BetaHead",
-	"CrossedHandsFace": "BetaHead",
+	"AlphaHead": ["TalkingFace", "HappyFace"],
+	"BetaHead": ["TalkingFace", "AngryFace", "CrossedHandsFace"],
 }
 
 const FPS := 24.0
@@ -78,20 +78,20 @@ func _pre_drive(scene: Node, _players: Dictionary, clip_keys: Dictionary) -> voi
 	# consist of blend-shape tracks targeting that head.
 	for head_name in heads:
 		head_players[head_name] = (heads[head_name] as Node).get_node_or_null("AnimationPlayer")
-	for clip in FACE_CLIPS:
-		var head_name: String = FACE_CLIPS[clip]
+	for head_name in FACE_CLIPS:
 		var ap: AnimationPlayer = head_players.get(head_name)
-		ck(ap != null and ap.has_animation(clip),
-			"face clip '%s' is on %s's AnimationPlayer" % [clip, head_name])
-		if ap == null or not ap.has_animation(clip):
-			continue
-		var sub := ap.get_animation(clip)
-		var bs_tracks := 0
-		for t in sub.get_track_count():
-			if sub.track_get_type(t) == Animation.TYPE_BLEND_SHAPE:
-				bs_tracks += 1
-		ck(bs_tracks == 52,
-			"face clip '%s' has 52 blend-shape tracks (got %d)" % [clip, bs_tracks])
+		for clip in FACE_CLIPS[head_name]:
+			ck(ap != null and ap.has_animation(clip),
+				"face clip '%s' is on %s's AnimationPlayer" % [clip, head_name])
+			if ap == null or not ap.has_animation(clip):
+				continue
+			var sub := ap.get_animation(clip)
+			var bs_tracks := 0
+			for t in sub.get_track_count():
+				if sub.track_get_type(t) == Animation.TYPE_BLEND_SHAPE:
+					bs_tracks += 1
+			ck(bs_tracks == 52,
+				"face clip '%s' has 52 blend-shape tracks (got %d)" % [clip, bs_tracks])
 
 	# --- timeline playback: blend-shape probes at known times ------------------
 	# Shot start times come straight from the schedule's animation-track keys.
@@ -165,12 +165,12 @@ func _post_drive() -> void:
 		var bh: MeshInstance3D = heads["BetaHead"]
 		var aap: AnimationPlayer = head_players["AlphaHead"]
 		var bap: AnimationPlayer = head_players["BetaHead"]
-		var v := sample_clip(aap, "TalkingFace_AlphaHead", 8.0 / FPS, ah, "jawOpen")
-		ck(absf(v - 0.6) < 0.05, "TalkingFace_AlphaHead jawOpen@frame8 ~ 0.6 (got %.3f)" % v)
-		v = sample_clip(aap, "TalkingFace_AlphaHead", 1.0 / FPS, ah, "jawOpen")
-		ck(absf(v) < 0.05, "TalkingFace_AlphaHead jawOpen@frame1 ~ 0.0 (got %.3f)" % v)
-		v = sample_clip(bap, "TalkingFace_BetaHead", 8.0 / FPS, bh, "jawOpen")
-		ck(absf(v - 0.6) < 0.05, "TalkingFace_BetaHead jawOpen@frame8 ~ 0.6 (got %.3f)" % v)
+		var v := sample_clip(aap, "TalkingFace", 8.0 / FPS, ah, "jawOpen")
+		ck(absf(v - 0.6) < 0.05, "AlphaHead TalkingFace jawOpen@frame8 ~ 0.6 (got %.3f)" % v)
+		v = sample_clip(aap, "TalkingFace", 1.0 / FPS, ah, "jawOpen")
+		ck(absf(v) < 0.05, "AlphaHead TalkingFace jawOpen@frame1 ~ 0.0 (got %.3f)" % v)
+		v = sample_clip(bap, "TalkingFace", 8.0 / FPS, bh, "jawOpen")
+		ck(absf(v - 0.6) < 0.05, "BetaHead TalkingFace jawOpen@frame8 ~ 0.6 (got %.3f)" % v)
 		v = sample_clip(aap, "HappyFace", 24.0 / FPS, ah, "mouthSmile_L")
 		ck(absf(v - 0.9) < 0.05, "HappyFace mouthSmile_L@frame24 ~ 0.9 (got %.3f)" % v)
 		v = sample_clip(bap, "AngryFace", 24.0 / FPS, bh, "browDown_L")
