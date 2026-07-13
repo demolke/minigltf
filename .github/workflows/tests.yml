@@ -34,14 +34,14 @@ jobs:
           chmod +x gltf_validator
           mv gltf_validator validator
 
-      - name: Install Godot 4.6
+      - name: Install Godot 4.7
         run: |
           curl -fsSL \
-            https://github.com/godotengine/godot/releases/download/4.6-stable/Godot_v4.6-stable_linux.x86_64.zip \
+            https://github.com/godotengine/godot/releases/download/4.7-stable/Godot_v4.7-stable_linux.x86_64.zip \
             -o /tmp/godot.zip
           unzip -o /tmp/godot.zip -d /tmp
-          chmod +x /tmp/Godot_v4.6-stable_linux.x86_64
-          sudo mv /tmp/Godot_v4.6-stable_linux.x86_64 /usr/local/bin/godot
+          chmod +x /tmp/Godot_v4.7-stable_linux.x86_64
+          sudo mv /tmp/Godot_v4.7-stable_linux.x86_64 /usr/local/bin/godot
           godot --headless --version
 
       - name: Run minigltf tests
