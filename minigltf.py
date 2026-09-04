@@ -1124,7 +1124,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
             alphaCutoff = None
             srm = getattr(m, 'surface_render_method', None)
             blend = getattr(m, 'blend_method', 'OPAQUE')
-            if srm == 'BLENDED' or blend == 'BLEND':
+            if srm == 'BLENDED' or blend in ('BLEND', 'HASHED'):
                 alphaMode = 'BLEND'
             elif blend == 'CLIP':
                 alphaMode = 'MASK'
