@@ -325,8 +325,8 @@ def validate_alpha_material(gltf, bin_data, out_dir):
     # Blender 5.x removed CLIP as a distinct mode (maps to HASHED/DITHERED), so
     # MaskMat may export as MASK (Blender 4.x) or have no alphaMode (Blender 5.x).
     mask_alpha = mask_mat.get('alphaMode')
-    assert mask_alpha in ('MASK', None), \
-        f"MaskMat alphaMode expected MASK or None, got {mask_alpha}"
+    assert mask_alpha in ('MASK', 'BLEND'), \
+        f"MaskMat alphaMode expected MASK or BLEND, got {mask_alpha}"
     if mask_alpha == 'MASK':
         assert 'alphaCutoff' in mask_mat, "MaskMat missing alphaCutoff"
         assert abs(mask_mat['alphaCutoff'] - 0.25) < 0.01, \
