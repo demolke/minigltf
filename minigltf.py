@@ -51,6 +51,41 @@ def _slot_fcurves(action, slot_handle):
                     result.extend(bag.fcurves)
     return result
 
+def _alpha_mode(material, albedo):
+    """Return alphamode to use."""
+    alphaMode = None
+    alphaCutoff = None
+
+    # We do not have albedo or the albedo is explicitly marked as not transparent
+    if not albedo or albedo.alpha_mode == 'NONE':
+        return (alphaMode, alphaCutoff)
+
+    # We have albedo, but it does not have 4 channels
+    if albedo.channels != 4:
+        return (alphaMode, alphaCutoff)
+
+    # Do we have any transparent pixels?
+    w, h = albedo.size
+    arr = np.empty(w*h*4, dtype=np.float32)
+    albedo.pixels.foreach_get(arr)
+    alphas = arr[3::4]
+
+    has_transparency = np.any(alphas < 1.0)
+    if not has_transparency:
+        return (alphaMode, alphaCutoff)
+
+    # Alpha mode from Blender material transparency settings.
+    # Blender 5.x uses surface_render_method (BLENDED/DITHERED).
+    # Blender 4.x uses blend_method (BLEND/CLIP/OPAQUE/HASHED).
+    srm = getattr(material, 'surface_render_method', None)
+    blend = getattr(material, 'blend_method', 'OPAQUE')
+    if srm == 'BLENDED' or blend == 'BLEND':
+        alphaMode = 'BLEND'
+    elif blend == 'CLIP':
+        alphaMode = 'MASK'
+        alphaCutoff = round(float(getattr(m, 'alpha_threshold', 0.5)), 4)
+    return (alphaMode, alphaCutoff)
+
 class _BinWriter:
     """Append-only binary buffer backed by a single pre-allocated bytearray."""
 
@@ -1117,18 +1152,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
 
             doubleSided = not m.use_backface_culling
 
-            # Alpha mode from Blender material transparency settings.
-            # Blender 5.x uses surface_render_method (BLENDED/DITHERED).
-            # Blender 4.x uses blend_method (BLEND/CLIP/OPAQUE/HASHED).
-            alphaMode = None
-            alphaCutoff = None
-            srm = getattr(m, 'surface_render_method', None)
-            blend = getattr(m, 'blend_method', 'OPAQUE')
-            if srm == 'BLENDED' or blend == 'BLEND':
-                alphaMode = 'BLEND'
-            elif blend == 'CLIP':
-                alphaMode = 'MASK'
-                alphaCutoff = round(float(getattr(m, 'alpha_threshold', 0.5)), 4)
+            alphaMode, alphaCutoff = _alpha_mode(m, baseColor)
 
             jsn.write(b'{"name":')
             jsn.write(_je(m.name))
