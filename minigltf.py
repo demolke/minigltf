@@ -79,11 +79,11 @@ def _alpha_mode(material, albedo):
     # Blender 4.x uses blend_method (BLEND/CLIP/OPAQUE/HASHED).
     srm = getattr(material, 'surface_render_method', None)
     blend = getattr(material, 'blend_method', 'OPAQUE')
-    if srm == 'BLENDED' or blend == 'BLEND':
-        alphaMode = 'BLEND'
-    elif blend == 'CLIP':
+    if blend == 'CLIP':
         alphaMode = 'MASK'
         alphaCutoff = round(float(getattr(m, 'alpha_threshold', 0.5)), 4)
+    else:
+        alphaMode = 'BLEND'
     return (alphaMode, alphaCutoff)
 
 class _BinWriter:
