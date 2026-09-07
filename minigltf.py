@@ -1066,7 +1066,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
                 alpha_node, _ = _direct_src('Alpha')
                 if alpha_node and alpha_node.type == 'TEX_IMAGE':
                     bc_node, _ = _direct_src('Base Color')
-                    if alpha_node is not bc_node:
+                    if alpha_node != bc_node:
                         print(f'[minigltf] WARNING material "{m.name}": separate alpha texture '
                               f'cannot be expressed in glTF - alpha channel will not be exported')
 
