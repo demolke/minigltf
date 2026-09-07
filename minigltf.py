@@ -21,6 +21,15 @@ def _fc_val(fc, t):
     return kps[t].co.y if t < len(kps) else 0.0
 
 
+def _curves_time_mismatch(cs):
+    """GLTF expects keyframe value on every curve in loc/rot/scale."""
+    present = [fc for fc in cs if fc is not None and len(fc.keyframe_points)]
+    if len(present) < 2:
+        return False
+    ref = [kp.co.x for kp in present[0].keyframe_points]
+    return any([kp.co.x for kp in fc.keyframe_points] != ref for fc in present[1:])
+
+
 def _action_fcurves(action):
     """Return all fcurves for an action, compatible with Blender 4.3 and 4.4+/5.x."""
     if hasattr(action, 'fcurves'):
@@ -1477,6 +1486,10 @@ def mini_export(output_file: str, split: bool = True) -> None:
                     pf = next((fc for fc in cs if fc is not None), None)
                     if pf is None or len(pf.keyframe_points) == 0:
                         continue
+                    if _curves_time_mismatch(cs):
+                        print(f"[minigltf] WARNING: action '{a.name}' bone '{_bone_name}' "
+                              f"channel '{_channel}' has mismatched keyframe times across "
+                              f"axes - exported animation may be missing or have incorrect keyframes")
                     if _bone.parent:
                         corr = _bone.parent.matrix_local.inverted_safe() @ _bone.matrix_local
                     else:
@@ -1488,6 +1501,10 @@ def mini_export(output_file: str, split: bool = True) -> None:
                     pf = next((fc for fc in cs if fc is not None), None) if cs else None
                     if pf is None or len(pf.keyframe_points) == 0:
                         continue
+                    if _curves_time_mismatch(cs):
+                        print(f"[minigltf] WARNING: action '{a.name}' on '{target.name}' "
+                              f"channel '{_dp}' has mismatched keyframe times across axes - "
+                              f"exported animation may be missing or have incorrect keyframes")
                     transforms.append((target, _path, cs, pf, axis_basis_change))
             elif domain == 'lightprop' and target.data in lights:
                 _li = lights.index(target.data)
@@ -1500,6 +1517,10 @@ def mini_export(output_file: str, split: bool = True) -> None:
                 ccs = curves.get('color')
                 _cpf = next((fc for fc in ccs if fc is not None), None) if ccs else None
                 if _cpf is not None and len(_cpf.keyframe_points):
+                    if _curves_time_mismatch(ccs):
+                        print(f"[minigltf] WARNING: action '{a.name}' light '{_lt.name}' "
+                              f"color channel has mismatched keyframe times across RGB - "
+                              f"exported animation may be missing or have incorrect keyframes")
                     pointers.append((base + '/color', _cpf, 3,
                                      lambda t, cs=ccs: [_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t)]))
             elif domain == 'shapekey':
@@ -1507,6 +1528,10 @@ def mini_export(output_file: str, split: bool = True) -> None:
                     if path.startswith('key_blocks[') and '.value' in path:
                         shape_key_curves[path.split('"')[1]] = fcs[0]
                 sk_mesh_obj = target
+                if _curves_time_mismatch(list(shape_key_curves.values())):
+                    print(f"[minigltf] WARNING: action '{a.name}' shape keys on "
+                          f"'{target.name}' have mismatched keyframe times across keys - "
+                          f"exported animation may be missing or have incorrect keyframes")
 
             _sk_first_fc = next(iter(shape_key_curves.values()), None) if shape_key_curves else None
             _has_sk_anim = bool(
