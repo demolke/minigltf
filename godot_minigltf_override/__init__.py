@@ -12,6 +12,7 @@ only filepath is forwarded to minigltf.
 
 import bpy
 from . import minigltf
+from . import gltf_keyframe_check
 
 _original_execute = None
 
@@ -26,6 +27,7 @@ def register():
     from io_scene_gltf2 import ExportGLTF2
     _original_execute = ExportGLTF2.execute
     ExportGLTF2.execute = _patched_execute
+    gltf_keyframe_check.register()
 
 
 def unregister():
@@ -34,3 +36,4 @@ def unregister():
         from io_scene_gltf2 import ExportGLTF2
         ExportGLTF2.execute = _original_execute
         _original_execute = None
+    gltf_keyframe_check.unregister()
