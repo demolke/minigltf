@@ -27,7 +27,7 @@ def main():
     arm_local = link_and_localize(lib_blend)
     add_walk_action(arm_local)
 
-    export_scene(args, split=False)
+    export_scene(args)
 
 
 main()

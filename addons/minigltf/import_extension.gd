@@ -1,43 +1,28 @@
-# Godot half of minigltf's cutscene/linked-library support. minigltf.py emits
-# plain glbs; this extension reshapes them right after GLTFDocument builds the
-# scene (_import_post), for editor imports and runtime loads alike:
-#
-#  1. Linked-library collection instances export as empties carrying an
-#     extras.link = "<library.blend>:<Collection>" hint. The sibling
-#     <library>.glb scene is grafted under each one, and the empty gets an
-#     AnimationPlayer holding the library clips (track paths prefixed with the
-#     instance name, re-rooted at this scene's root).
-#  2. Godot's importer puts every clip in one master AnimationPlayer; it is
-#     split into one AnimationPlayer per animated top-level node (per Blender
-#     animation target), each clip pruned to the tracks that drive that node,
-#     so a cutscene can play different clips on different actors at once.
-#  3. The NLA schedule glTF cannot express travels as JSON in the extras of a
-#     synthetic "CutsceneData" node. It is read back here and turned into a
-#     "Cutscene" AnimationPlayer: value tracks toggle <Camera>:current at the
-#     marker times, animation-playback tracks drive <Actor>/AnimationPlayer.
+# Post-process: links to instances, split player, graft clips, build cutscene.
 @tool
 extends GLTFDocumentExtension
 
-# Registered extensions apply to every GLTFDocument, including the one pass 1
-# uses to load a linked glb - which must stay a raw import (master player
-# intact, no recursion). True while that nested load runs.
+# Flag for per-collection nodes.
+const COLLECTION_KEY := "minigltf_collection"
+
+# True during nested linked-glb loads (those stay raw).
 static var _grafting := false
+# Cache: "lib|collection" -> {clip: Animation}.
+static var _clip_cache := {}
 
 
 func _import_post(state: GLTFState, root: Node) -> Error:
 	if _grafting:
 		return OK
+	_clip_cache.clear()
 	_resolve_links(root, root, state.base_path)
 	_split_master_player(root, _read_clip_names(root))
+	_merge_foreign_clips(root, state.base_path)
 	_build_cutscene(root, state.base_path)
 	return OK
 
 
-# minigltf stores a { glTF animation name -> bare action name } map in the
-# CutsceneData extras. glTF needs globally-unique animation names, but once the
-# master player is split into one AnimationPlayer per actor each clip lives in
-# its own namespace, so it is renamed back to its bare action name there (unique
-# within that player). The cutscene schedule references those bare names.
+# Map of glTF clip name to bare action name from CutsceneData.
 func _read_clip_names(scene: Node) -> Dictionary:
 	var holder := scene.find_child("CutsceneData", true, false)
 	if holder == null or not holder.has_meta("extras"):
@@ -48,15 +33,105 @@ func _read_clip_names(scene: Node) -> Dictionary:
 	return {}
 
 
-# --- pass 1: linked-library collection instances ------------------------------
+# --- pass 1: linked collections ---
 func _resolve_links(scene: Node, node: Node, base_dir: String) -> void:
 	for child in node.get_children():
 		_resolve_links(scene, child, base_dir)
 	var link := _link_meta(node)
 	if node == scene or link == "":
 		return
-	var glb := base_dir.path_join(link.get_slice(":", 0).get_basename() + ".glb")
+	var parts := _split_link(link)
+	var glb := base_dir.path_join(parts[0].get_basename() + ".glb").simplify_path()
+	if _instance_subtree(scene, node, glb, parts[1]):
+		return
+	# Blend-only projects resolve against the source .blend.
+	var blend := base_dir.path_join(parts[0]).simplify_path()
+	if blend != glb and _instance_subtree(scene, node, blend, parts[1]):
+		return
+	# No sub-tree yet: embed a copy.
+	push_warning("minigltf: no importable sub-tree '%s' in %s; embedding a copy of the library scene (re-import after the library is imported to get a live reference)" % [parts[1], glb])
+	_graft_library(scene, node, glb, blend)
+
+
+# Split "<path>.blend:<Collection>"; ".blend:" keeps Windows drive letters.
+static func _split_link(link: String) -> PackedStringArray:
+	var i := link.find(".blend:")
+	if i < 0:
+		return PackedStringArray([link.get_slice(":", 0), ""])
+	return PackedStringArray([link.substr(0, i + 6), link.substr(i + 7)])
+
+
+# Match a collection by path (names are unique per Blender file).
+static func _find_subroot(state: SceneState, collection: String) -> NodePath:
+	var want := String(collection).validate_node_name()
+	var fallback := NodePath()
+	for i in state.get_node_count():
+		var p := String(state.get_node_path(i)).trim_prefix("./")
+		if p == collection or p.ends_with("/" + collection):
+			return NodePath(p)
+		# Importer suffixes a collection colliding with the file root.
+		var leaf := p.get_file()
+		var tail := leaf.trim_prefix(want)
+		if leaf == want or (leaf.begins_with(want) and tail.is_valid_int()):
+			if fallback.is_empty():
+				fallback = NodePath(p)
+			else:
+				push_warning("minigltf: ambiguous sub-tree match for " + collection)
+				break
+	return fallback
+
+
+# Swap the link empty for a live "<lib>@subroot=<Collection>" instance.
+func _instance_subtree(scene: Node, link_node: Node, glb: String, collection: String) -> bool:
+	if collection == "" or not ResourceLoader.exists(glb):
+		return false
+	var src := load(glb) as PackedScene
+	if src == null:
+		return false
+	# Probe first; instantiate_root() errors on missing nodes.
+	var subroot := _find_subroot(src.get_state(), collection)
+	if subroot.is_empty():
+		return false
+	# Editor edit-state keeps the packed scene as an instance reference.
+	var edit_state := PackedScene.GEN_EDIT_STATE_INSTANCE if Engine.is_editor_hint() \
+			else PackedScene.GEN_EDIT_STATE_DISABLED
+	var inst: Node = src.instantiate_root(subroot, edit_state)
+	if inst == null:
+		return false
+	_replace_with_instance(scene, link_node, inst)
+	return true
+
+
+func _replace_with_instance(scene: Node, old: Node, inst: Node) -> void:
+	var parent := old.get_parent()
+	var index := old.get_index()
+	var node_name := old.name
+	if inst is Node3D and old is Node3D:
+		inst.transform = old.transform
+	if old.has_meta("extras"):
+		inst.set_meta("extras", old.get_meta("extras"))
+	parent.remove_child(old)
+	parent.add_child(inst)
+	inst.name = node_name
+	parent.move_child(inst, index)
+	# Own only the root; owning children would save them inline too.
+	inst.owner = scene
+	# Keep Blender children (props) following the instance.
+	for child in old.get_children():
+		old.remove_child(child)
+		_own(child, null)
+		inst.add_child(child)
+		_own(child, scene)
+	old.free()
+
+
+# Baked-copy fallback when no live sub-tree is importable yet.
+func _graft_library(scene: Node, node: Node, glb: String, blend: String = "") -> void:
 	var inst := _load_linked_scene(glb)
+	if inst == null and blend != "" and blend != glb and ResourceLoader.exists(blend):
+		var lib := load(blend) as PackedScene
+		if lib != null:
+			inst = lib.instantiate()
 	if inst == null:
 		push_warning("minigltf: cannot resolve link to " + glb)
 		return
@@ -87,8 +162,7 @@ func _resolve_links(scene: Node, node: Node, base_dir: String) -> void:
 	ap.add_animation_library("", lib)
 
 
-# Parse the linked glb directly: at import time the sibling glb may not have
-# been imported as a resource yet, so load() cannot be relied on.
+# Parse the glb directly; load() may fail before the sibling is imported.
 static func _load_linked_scene(glb: String) -> Node:
 	var doc := GLTFDocument.new()
 	var state := GLTFState.new()
@@ -115,12 +189,9 @@ func _own(node: Node, scene: Node) -> void:
 		_own(child, scene)
 
 
-# --- pass 2: split the master AnimationPlayer per animated node ---------------
+# --- pass 2: split master player per node ---
 
-# The actor a track belongs to. Transform/bone tracks belong to the top-level
-# node (the rig or camera); blend-shape tracks belong to the mesh node itself
-# (its last path name) - the importer may nest a skinned MeshInstance3D under
-# the rig's Skeleton3D, yet its shape-key clips form their own schedule lane.
+# Actor owning a track; blend-shape tracks belong to the mesh itself.
 func _track_target(anim: Animation, i: int) -> String:
 	var p := anim.track_get_path(i)
 	if p.get_name_count() == 0:
@@ -130,8 +201,20 @@ func _track_target(anim: Animation, i: int) -> String:
 	return String(p.get_name(0))
 
 
-# Resolve an actor name to its node: top-level first (the common case), then
-# anywhere in the tree (skinned meshes get reparented under their Skeleton3D).
+# Player holding the actor's clip; searches the actor subtree, then parents.
+static func _lane_player(scene: Node, actor_node: Node, clip: String) -> AnimationPlayer:
+	var n := actor_node
+	while n != null:
+		for c in n.find_children("*", "AnimationPlayer", true, false):
+			if (c as AnimationPlayer).has_animation(clip):
+				return c as AnimationPlayer
+		if n == scene:
+			break
+		n = n.get_parent()
+	return null
+
+
+# Actor node: top-level first, then anywhere (meshes move under Skeleton3D).
 func _actor_node(scene: Node, target: String) -> Node:
 	var node := scene.get_node_or_null(NodePath(target))
 	if node == null:
@@ -139,12 +222,42 @@ func _actor_node(scene: Node, target: String) -> Node:
 	return node
 
 
+func _is_collection(node: Node) -> bool:
+	if not node.has_meta("extras"):
+		return false
+	var extras = node.get_meta("extras")
+	return extras is Dictionary and extras.get(COLLECTION_KEY, false) == true
+
+
+# Nearest collection at or above node; tracks must not depend above it.
+func _collection_base(scene: Node, node: Node) -> Node:
+	var n := node
+	while n != null and n != scene:
+		if _is_collection(n):
+			return n
+		n = n.get_parent()
+	return null
+
+
+# Strip the first skip path names (rebase under a collection).
+static func _rebase_track(anim: Animation, i: int, skip: int) -> void:
+	var p := anim.track_get_path(i)
+	var names := PackedStringArray()
+	for n in range(skip, p.get_name_count()):
+		names.append(String(p.get_name(n)))
+	var path := "/".join(names) if not names.is_empty() else "."
+	var subnames := p.get_concatenated_subnames()
+	if subnames != "":
+		path += ":" + subnames
+	anim.track_set_path(i, NodePath(path))
+
+
 func _split_master_player(scene: Node, clip_names: Dictionary = {}) -> void:
 	var master: AnimationPlayer = scene.get_node_or_null("AnimationPlayer")
 	if master == null:
 		return
 
-	# Animated actor name for every track in every clip.
+	# Actor per track.
 	var targets := {}
 	for lib_name in master.get_animation_library_list():
 		var lib := master.get_animation_library(lib_name)
@@ -159,12 +272,13 @@ func _split_master_player(scene: Node, clip_names: Dictionary = {}) -> void:
 		var node := _actor_node(scene, target)
 		if node == null:
 			continue
+		# Rebase collection clips onto it for later re-rooting.
+		var base := _collection_base(scene, node)
+		var skip := scene.get_path_to(base).get_name_count() if base != null else 0
 		var ap := AnimationPlayer.new()
 		ap.name = "AnimationPlayer"
 		node.add_child(ap)
-		# Nodes created here must be owned by the scene root, otherwise the
-		# editor importer does not save them into the imported scene.
-		ap.owner = scene
+		ap.owner = scene  # owned players are saved by the importer.
 		for lib_name in master.get_animation_library_list():
 			var src := master.get_animation_library(lib_name)
 			var lib := AnimationLibrary.new()
@@ -173,16 +287,201 @@ func _split_master_player(scene: Node, clip_names: Dictionary = {}) -> void:
 				for i in range(anim.get_track_count() - 1, -1, -1):
 					if _track_target(anim, i) != target:
 						anim.remove_track(i)
+				if skip > 0:
+					for i in anim.get_track_count():
+						_rebase_track(anim, i, skip)
 				if anim.get_track_count() > 0:
 					lib.add_animation(clip_names.get(anim_name, anim_name), anim)
 			if not lib.get_animation_list().is_empty():
 				ap.add_animation_library(lib_name, lib)
-		# Track paths are relative to the scene root; re-root the new player
-		# there so the duplicated tracks keep resolving.
-		ap.root_node = ap.get_path_to(scene)
+		# Tracks are root- (or collection-) relative; re-root to match.
+		ap.root_node = ap.get_path_to(base if base != null else scene)
 
 	master.get_parent().remove_child(master)
 	master.free()
+
+
+# Copy foreign clips missing from instance players; same-file clips too.
+func _merge_foreign_clips(scene: Node, base_dir: String) -> void:
+	var holder := scene.find_child("CutsceneData", true, false)
+	if holder == null or not holder.has_meta("extras"):
+		return
+	var extras = holder.get_meta("extras")
+	if not (extras is Dictionary):
+		return
+	var sources: Dictionary = extras.get("minigltf_cutscene", {}).get("sources", {})
+	var lanes: Array = extras.get("minigltf_cutscene", {}).get("playback", [])
+	for lane in lanes:
+		var actor := String(lane.get("actor", ""))
+		var node := _actor_node(scene, actor)
+		if node == null:
+			continue
+		var player: AnimationPlayer = null
+		var live := "@subroot=" in node.scene_file_path
+		if live:
+			player = _instance_player(node)
+		else:
+			for key in lane.get("keys", []):
+				var owner := _lane_player(scene, node, String(key[1]))
+				if owner != null:
+					player = owner
+					break
+		var missing: Array = []
+		for key in lane.get("keys", []):
+			var clip := String(key[1])
+			if (player == null or not player.has_animation(clip)) and not missing.has(clip):
+				missing.append(clip)
+		if missing.is_empty():
+			continue
+		if player == null:
+			player = _instance_player(node)
+		# Edits to library nodes don't pack; use a scene-owned copy.
+		if live:
+			player = _localize_player(scene, node, player)
+		for clip in missing:
+			if sources.has(clip):
+				_graft_foreign_clip(player, clip, sources[clip], base_dir)
+			else:
+				_graft_local_clip(scene, player, clip)
+
+
+# Same-file lane clip: copy from the split player into the instance player.
+static func _graft_local_clip(scene: Node, player: AnimationPlayer, clip: String) -> void:
+	var inst := player.get_parent()
+	if inst != null:
+		for p in inst.find_children("*", "AnimationPlayer", true, false):
+			var src := p as AnimationPlayer
+			if src != null and src != player and src.has_animation(clip):
+				_copy_clip(player, clip, src)
+				return
+	# Scene fallback only when the name is unambiguous.
+	var hits: Array = []
+	for p in scene.find_children("*", "AnimationPlayer", true, false):
+		var src := p as AnimationPlayer
+		if src != null and src != player and src.has_animation(clip):
+			hits.append(src)
+	if hits.size() == 1:
+		_copy_clip(player, clip, hits[0])
+		return
+	if hits.size() > 1:
+		push_warning("minigltf: ambiguous local clip '%s'; skipping" % clip)
+		return
+	push_warning("minigltf: cannot resolve lane clip '%s' for grafting" % clip)
+
+
+static func _copy_clip(dst: AnimationPlayer, clip: String, src: AnimationPlayer) -> void:
+	if not dst.has_animation_library(""):
+		dst.add_animation_library("", AnimationLibrary.new())
+	dst.get_animation_library("").add_animation(clip, (src.get_animation(clip) as Animation).duplicate())
+
+
+# Scene-owned copy of a library player (same spot/root); avoids shared libs.
+static func _localize_player(scene: Node, node: Node, player: AnimationPlayer) -> AnimationPlayer:
+	var parent := player.get_parent()
+	var index := player.get_index()
+	var dup := player.duplicate(true) as AnimationPlayer
+	dup.name = player.name
+	parent.remove_child(player)
+	player.free()
+	parent.add_child(dup)
+	parent.move_child(dup, index)
+	dup.owner = scene
+	return dup
+
+
+# First player under the node, else a new one rooted there.
+func _instance_player(node: Node) -> AnimationPlayer:
+	var found := node.find_children("*", "AnimationPlayer", true, false)
+	if not found.is_empty():
+		return found[0]
+	var ap := AnimationPlayer.new()
+	ap.name = "AnimationPlayer"
+	node.add_child(ap)
+	ap.owner = node.owner if node.owner != null else node
+	ap.root_node = ap.get_path_to(node)
+	return ap
+
+
+# Rebase grafted bone tracks onto a skeleton under root (layout may differ).
+static func _rebase_to_skeleton(root: Node, anim: Animation) -> void:
+	var skels: Array[Node] = []
+	for n in root.find_children("*", "Skeleton3D", true, false):
+		skels.append(n)
+	if skels.is_empty():
+		return
+	for i in anim.get_track_count():
+		if anim.track_get_type(i) not in [Animation.TYPE_POSITION_3D, Animation.TYPE_ROTATION_3D, Animation.TYPE_SCALE_3D]:
+			continue
+		var tp := anim.track_get_path(i)
+		if tp.get_subname_count() == 0:
+			continue
+		var bone := String(tp.get_subname(0))
+		for sk in skels:
+			if (sk as Skeleton3D).find_bone(bone) < 0:
+				continue
+			var rel := String(root.get_path_to(sk))
+			anim.track_set_path(i, NodePath(rel + ":" + tp.get_concatenated_subnames()))
+			break
+
+
+func _graft_foreign_clip(player: AnimationPlayer,
+		clip: String, info: Dictionary, base_dir: String) -> void:
+	var rel := String(info.get("file", ""))
+	var collection := String(info.get("collection", ""))
+	var glb := base_dir.path_join(rel.get_basename() + ".glb").simplify_path()
+	var blend := base_dir.path_join(rel).simplify_path()
+	var anim: Animation = null
+	for lib_path in [glb, blend]:
+		anim = _foreign_clip(lib_path, collection, clip)
+		if anim != null:
+			break
+	if anim == null:
+		push_warning("minigltf: cannot resolve foreign clip '%s' from %s" % [clip, glb])
+		return
+	var proot: Node = player.get_node_or_null(player.root_node)
+	if proot != null:
+		_rebase_to_skeleton(proot, anim)
+	if not player.has_animation_library(""):
+		player.add_animation_library("", AnimationLibrary.new())
+	player.get_animation_library("").add_animation(clip, anim)
+
+
+# Load clip from the library's collection player (cached per library).
+static func _foreign_clip(lib_path: String, collection: String, clip: String) -> Animation:
+	if not ResourceLoader.exists(lib_path):
+		return null
+	var key := lib_path + "|" + collection
+	if not _clip_cache.has(key):
+		_clip_cache[key] = _read_lib_clips(lib_path, collection)
+	var clips: Dictionary = _clip_cache.get(key, {})
+	var found: Animation = clips.get(clip, null)
+	return found.duplicate() as Animation if found != null else null
+
+
+# Read all clips from a library sub-tree (or whole file when unknown).
+static func _read_lib_clips(lib_path: String, collection: String) -> Dictionary:
+	var out := {}
+	var src := load(lib_path) as PackedScene
+	if src == null:
+		return out
+	var inst: Node = null
+	if collection != "":
+		var subroot := _find_subroot(src.get_state(), collection)
+		if not subroot.is_empty():
+			inst = src.instantiate_root(subroot, PackedScene.GEN_EDIT_STATE_DISABLED)
+	if inst == null:
+		inst = src.instantiate(PackedScene.GEN_EDIT_STATE_DISABLED)
+		if inst == null:
+			return out
+	for p in inst.find_children("*", "AnimationPlayer", true, false):
+		var player := p as AnimationPlayer
+		if player == null:
+			continue
+		for name in player.get_animation_list():
+			if not out.has(name):
+				out[name] = (player.get_animation(name) as Animation).duplicate()
+	inst.free()
+	return out
 
 
 # --- pass 3: rebuild the cutscene and audio from the CutsceneData schedule ----
@@ -228,10 +527,14 @@ func _build_cutscene(scene: Node, base_path: String = "") -> void:
 		# node itself, which the importer may have nested under a Skeleton3D.
 		var actor := String(lane["actor"]).validate_node_name()
 		var actor_node := _actor_node(scene, actor)
-		var prefix := actor if actor_node == null \
-				else String(scene.get_path_to(actor_node))
-		anim.track_set_path(t, NodePath(prefix + "/AnimationPlayer"))
-		for key in lane["keys"]:
+		var keys: Array = lane.get("keys", [])
+		var player_path := NodePath(actor + "/AnimationPlayer")
+		if actor_node != null and not keys.is_empty():
+			var owner := _lane_player(scene, actor_node, String(keys[0][1]))
+			player_path = scene.get_path_to(owner) if owner != null \
+				else NodePath(String(scene.get_path_to(actor_node)) + "/AnimationPlayer")
+		anim.track_set_path(t, player_path)
+		for key in keys:
 			anim.animation_track_insert_key(t, float(key[0]), String(key[1]))
 
 	# Audio: spatial emitters (Speaker to AudioStreamPlayer3D) and non-spatial

@@ -1424,6 +1424,143 @@ def validate_cutscene_lipsync(gltf, bin_data, out_dir):
     assert data['length'] > 0, "schedule length must be positive"
 
 
+@test('robot_cutscene', 'robot_cutscene.py', timeout=300, godot='robot_cutscene_check.gd')
+def validate_robot_cutscene(gltf, bin_data, out_dir):
+    """Animation-library workflow: rig + override-authored clips in separate files,
+    cutscene schedules the foreign clips with sources provenance on a live instance."""
+    cams = {n['name'] for n in gltf.get('nodes', []) if 'camera' in n}
+    assert cams == {'CamWide', 'CamClose'}, f"unexpected cameras: {cams}"
+    link_nodes = {n['name']: n['extras']['link'] for n in gltf.get('nodes', [])
+                  if 'extras' in n and 'link' in n['extras']}
+    assert set(link_nodes) == {'Performer'},         f'expected Performer link node, got {set(link_nodes)}'
+    assert link_nodes['Performer'].endswith('lib/robot.blend:Robot'),         f'Performer link should target the Robot collection: {link_nodes["Performer"]}'
+    assert len(gltf.get('skins', [])) == 0, 'linked instances must not inline skins'
+    assert len(gltf.get('meshes', [])) == 0, 'linked instances must not inline meshes'
+    assert len(gltf.get('animations', [])) == 0,         'linked strip actions must not export clips into the cutscene glb'
+
+    _assert_glb_only(out_dir)
+    data = _cutscene_data(gltf)
+    lanes = {l['actor']: [k[1] for k in l['keys']] for l in data['playback']}
+    assert lanes.get('Performer') == ['Dance', 'Death'],         f'Performer lane should play Dance then Death, got {lanes}'
+    cuts = [(c['camera']) for c in data['cuts']]
+    assert cuts == ['CamWide', 'CamClose'], f'expected camera cuts in order, got {cuts}'
+    sources = data.get('sources', {})
+    assert set(sources) == {'Dance', 'Death'},         f'schedule must record foreign-clip provenance, got {sources}'
+    assert sources['Dance']['collection'] == 'Robot', sources['Dance']
+    assert sources['Death']['collection'] == 'Robot', sources['Death']
+    assert sources['Dance']['file'].endswith('anims/dance.blend'), sources['Dance']
+    assert sources['Death']['file'].endswith('anims/death.blend'), sources['Death']
+
+    # Each library glb holds the shared Robot collection node + its bare clip.
+    libs = {os.path.join('lib', 'robot.glb'): 'Pickup',
+            os.path.join('anims', 'dance.glb'): 'Dance',
+            os.path.join('anims', 'death.glb'): 'Death'}
+    for glb_name, clip in libs.items():
+        path = os.path.join(out_dir, glb_name)
+        assert os.path.exists(path), f'{glb_name} was not exported'
+        lgltf, _ = parse_glb(path)
+        cnodes = [n for n in lgltf.get('nodes', [])
+                  if n.get('extras', {}).get('minigltf_collection')]
+        assert [n['name'] for n in cnodes] == ['Robot'],             f'{glb_name} should stage a single Robot collection node, got {[n["name"] for n in cnodes]}'
+        anims = {a.get('name'): len(a.get('channels', [])) for a in lgltf.get('animations', [])}
+        assert clip in anims, f'{glb_name} missing bare clip {clip!r}, got {sorted(anims)}'
+        assert anims[clip] == 5,             f'{clip} should drive all 5 bones, got {anims[clip]} channels'
+        assert len(lgltf.get('skins', [])) == 1, f'{glb_name} should have one skin'
+        _assert_skinned_mesh_under_armature(lgltf)
+
+
+@test('nested_collections', 'nested_collections.py', godot='nested_collections_check.gd')
+def validate_nested_collections(gltf, bin_data, out_dir):
+    """Nested assets stay addressable: hierarchy mirrored as collection nodes,
+    level links the nested collections for live sub-tree instances."""
+    link_nodes = {n['name']: n['extras']['link'] for n in gltf.get('nodes', [])
+                  if 'extras' in n and 'link' in n['extras']}
+    assert set(link_nodes) == {'TableInstance', 'HeroInstance'},         f'expected Table/Hero link nodes, got {set(link_nodes)}'
+    assert link_nodes['TableInstance'].endswith('lib/nested.blend:Table'), link_nodes
+    assert link_nodes['HeroInstance'].endswith('lib/nested.blend:Hero'), link_nodes
+    assert len(gltf.get('meshes', [])) == 0, 'linked instances must not inline meshes'
+    assert 'CutsceneData' not in {n.get('name') for n in gltf.get('nodes', [])},         'no schedule expected without NLA strips or markers'
+
+    path = os.path.join(out_dir, 'lib', 'nested.glb')
+    assert os.path.exists(path), 'nested.glb (linked library) was not exported'
+    lgltf, _ = parse_glb(path)
+    cnodes = {n['name']: n for n in lgltf.get('nodes', [])
+              if n.get('extras', {}).get('minigltf_collection')}
+    assert set(cnodes) == {'Props', 'Table', 'Characters', 'Hero'},         f'expected mirrored hierarchy nodes, got {set(cnodes)}'
+    meshes = {m.get('name') for m in lgltf.get('meshes', [])}
+    assert meshes == {'TableTop', 'TableLeg', 'HeroBody', 'HeroHead'}, meshes
+    midx = {n['name']: i for i, n in enumerate(lgltf['nodes']) if 'mesh' in n}
+    # Assets parent their meshes; folders parent only the asset nodes.
+    _kids = lambda name: cnodes[name].get('children', [])
+    assert sorted(_kids('Table')) == sorted(midx[m] for m in ('TableTop', 'TableLeg')),         _kids('Table')
+    assert sorted(_kids('Hero')) == sorted(midx[m] for m in ('HeroBody', 'HeroHead')),         _kids('Hero')
+    all_nodes = {n['name']: i for i, n in enumerate(lgltf['nodes'])}
+    assert _kids('Props') == [all_nodes['Table']], _kids('Props')
+    assert _kids('Characters') == [all_nodes['Hero']], _kids('Characters')
+    assert lgltf['scenes'][0]['nodes'] == [all_nodes['Props'], all_nodes['Characters']],         lgltf['scenes'][0]['nodes']
+    _assert_glb_only(out_dir)
+
+
+@test('bone_rest_frame', 'bone_rest_frame.py')
+def validate_bone_rest_frame(gltf, bin_data, out_dir):
+    """Rest-frame regression (B1): a +X chain makes armature-space and
+    parent-relative rest frames disagree; joint values must be converted lives."""
+    nodes = {n.get('name'): n for n in gltf.get('nodes', [])}
+    assert {'Parent', 'Child'} <= set(nodes), sorted(nodes)
+
+    def close(got, want, tol=1e-3):
+        return all(abs(a - b) < tol for a, b in zip(got, want))
+
+    # Converted parent-relative rests (rotation and translation converted).
+    assert close(nodes['Parent']['rotation'], (0, -0.70711, 0, 0.70711)), \
+        nodes['Parent']['rotation']
+    assert close(nodes['Child']['rotation'], (0, 0, 0, 1)), \
+        nodes['Child']['rotation']
+    assert close(nodes['Child']['translation'], (0, 0, -1)), \
+        nodes['Child']['translation']
+
+    anims = {a.get('name'): a for a in gltf.get('animations', [])}
+    assert 'Probe' in anims, sorted(anims)
+    anim = anims['Probe']
+    assert len(anim['channels']) == 2, len(anim['channels'])
+    for ch in anim['channels']:
+        tgt = gltf['nodes'][ch['target']['node']]['name']
+        assert ch['target']['path'] == 'rotation', ch['target']
+        sampler = anim['samplers'][ch['sampler']]
+        vals = read_accessor(gltf, bin_data, sampler['output'])
+        q = tuple(vals[-4:])
+        if tgt == 'Child':
+            # Authored Qz90 converts to RotY90; the armature-space sandwich
+            # wrote RotZ90 (0, 0, 0.70711, 0.70711) instead (120 degrees off).
+            assert close(q, (0, 0.70711, 0, 0.70711)), (tgt, q)
+        else:
+            assert close(q, (0.18301, -0.68301, -0.18301, 0.68301)), (tgt, q)
+
+    skins = gltf.get('skins', [])
+    assert len(skins) == 1, len(skins)
+    assert [gltf['nodes'][j]['name'] for j in skins[0]['joints']] == ['Parent', 'Child']
+    ibm = list(read_accessor(gltf, bin_data, skins[0]['inverseBindMatrices']))
+    want_ibm = [0, 0, -1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1,
+                0, 0, -1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1]
+    assert close(ibm, want_ibm), ibm
+
+
+@test('anchor_skeleton', 'anchor_skeleton.py', godot='anchor_skeleton_check.gd')
+def validate_anchor_skeleton(gltf, bin_data, out_dir):
+    """Meshless rig keeps bone-space tracks via one anchor triangle."""
+    meshes = [m.get('name') for m in gltf.get('meshes', [])]
+    assert meshes == ['__minigltf_AnimAnchor'], f"expected only the anchor mesh, got {meshes}"
+    skins = gltf.get('skins', [])
+    assert len(skins) == 1, f"expected one skin, got {len(skins)}"
+    assert [gltf['nodes'][j]['name'] for j in skins[0]['joints']] == ['Base', 'Tip']
+    anims = {a.get('name'): a for a in gltf.get('animations', [])}
+    assert 'Nod' in anims, sorted(anims)
+    assert len(anims['Nod']['channels']) == 1, len(anims['Nod']['channels'])
+    assert 'CutsceneData' in {n.get('name') for n in gltf.get('nodes', [])}, \
+        "schedule expected (camera marker drives it)"
+    _assert_glb_only(out_dir)
+
+
 @test('audio_chirp', 'audio_chirp.py')
 def validate_audio_chirp(gltf, bin_data, out_dir):
     """A single Speaker with one onset - exercises the bare audio export path

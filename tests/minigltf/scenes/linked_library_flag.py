@@ -29,7 +29,7 @@ def main():
     bpy.context.scene.world = world
     world["export_non_linked_only"] = True
 
-    export_scene(args, split=False)
+    export_scene(args)
 
 
 main()

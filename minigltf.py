@@ -251,6 +251,16 @@ def _clip_name_registry(scene):
                     if key not in nla_names:
                         nla_names[key] = _uniq(_gd_clip_name(_clip_name(act.name, obj.name, counts)))
 
+    # Reserve linked strip-action names so no local clip claims a name the
+    # schedule resolves from another file (direct assignments still win ties).
+    for obj in scene.objects:
+        for ad in _anim_data_holders(obj):
+            for tr in ad.nla_tracks:
+                for st in tr.strips:
+                    act = st.action
+                    if act is not None and getattr(act, 'library', None):
+                        _uniq(_gd_clip_name(act.name))
+
     # Loose local actions (created but never assigned) still export as a bare
     # merged clip; reserve their names too so nothing collides with them.
     for a in bpy.data.actions:
@@ -263,23 +273,28 @@ def _clip_name_registry(scene):
     return nla_names, direct_names
 
 
-def _cutscene_schedule():
+def _cutscene_schedule(output_file: str):
     """The NLA schedule for the current scene as a JSON-ready dict, or None
     when there is no cutscene (no camera-bound markers and no NLA strips)."""
     scene = bpy.context.scene
     fps = scene.render.fps * scene.render.fps_base
+    _glb_dir = os.path.dirname(os.path.abspath(output_file))
 
     # Camera cuts from camera-bound markers.
     markers = sorted((m for m in scene.timeline_markers if m.camera is not None),
                      key=lambda m: m.frame)
     cuts = [{'time': m.frame / fps, 'camera': m.camera.name} for m in markers]
 
-    # Per-actor playback schedule: actor object name -> [[start_sec, clip_name]],
-    # plus the end of the last strip so the cutscene runs to completion.
+    # Per-actor playback schedule plus `sources` provenance for strips driven
+    # by a foreign-library action (same-library clips need no entry).
     playback = []
+    sources = {}
     end_sec = 0.0
     for obj in scene.objects:
         keys = []
+        _inst_col = None
+        if obj.type == 'EMPTY' and getattr(obj, 'instance_type', None) == 'COLLECTION':
+            _inst_col = obj.instance_collection
         for ad in _anim_data_holders(obj):
             for tr in ad.nla_tracks:
                 if tr.mute:
@@ -291,8 +306,27 @@ def _cutscene_schedule():
                     # action name, so the schedule references that (a lane clip
                     # name only has to be unique within one actor's player).
                     # Sanitize to match the name the addon assigns in Godot.
-                    keys.append([st.frame_start / fps, _gd_clip_name(st.action.name)])
+                    _clip = _gd_clip_name(st.action.name)
+                    keys.append([st.frame_start / fps, _clip])
                     end_sec = max(end_sec, st.frame_end / fps)
+                    _lib = getattr(st.action, 'library', None)
+                    if _lib is not None and _clip not in sources:
+                        _same = False
+                        if _inst_col is not None and getattr(_inst_col, 'library', None) is not None:
+                            try:
+                                _same = (os.path.abspath(bpy.path.abspath(_inst_col.library.filepath))
+                                         == os.path.abspath(bpy.path.abspath(_lib.filepath)))
+                            except ValueError:
+                                _same = False
+                        if not _same:
+                            try:
+                                _rel = os.path.relpath(bpy.path.abspath(_lib.filepath), _glb_dir)
+                            except ValueError:
+                                _rel = bpy.path.abspath(_lib.filepath)
+                            sources[_clip] = {
+                                'file': _rel.replace('\\', '/'),
+                                'collection': _inst_col.name if _inst_col is not None else '',
+                            }
         if keys:
             keys.sort(key=lambda k: k[0])
             playback.append({'actor': obj.name, 'keys': keys})
@@ -307,7 +341,15 @@ def _cutscene_schedule():
         length = max(length, lane['keys'][-1][0])
 
     return {'version': 1, 'fps': fps, 'length': length,
-            'cuts': cuts, 'playback': playback}
+            'cuts': cuts, 'playback': playback,
+            **({'sources': sources} if sources else {})}
+
+
+def _sound_missing(sound) -> bool:
+    try:
+        return not sound.filepath or not os.path.isfile(bpy.path.abspath(sound.filepath))
+    except Exception:
+        return True
 
 
 def _sound_uri(sound, output_file: str) -> str:
@@ -377,6 +419,9 @@ def _audio_schedule(output_file):
                 continue
             if seq.sound is None:
                 continue
+            if _sound_missing(seq.sound):
+                warnings.warn(f"minigltf: VSE strip '{seq.name}' sound file is missing on disk; skipping")
+                continue
             # Blender appends exactly .001/.002/.003 to keep VSE strip names
             # unique. Strip that suffix before matching speaker object names.
             base_name = re.sub(r'\.\d{3}$', '', seq.name)
@@ -402,6 +447,9 @@ def _audio_schedule(output_file):
         sp = obj.data
         if sp.sound is None:
             warnings.warn(f"minigltf: speaker '{sp_name}' has VSE onset strips but no sound assigned; skipping")
+            continue
+        if _sound_missing(sp.sound):
+            warnings.warn(f"minigltf: speaker '{sp_name}' sound file is missing on disk; skipping")
             continue
         vol_keys = _speaker_volume_keys(obj, fps)
         entry = {
@@ -460,7 +508,125 @@ def _image_uri(img, output_file: str) -> str:
         rel = abs_tex
     return rel.replace('\\', '/')
 
-def mini_export(output_file: str, split: bool = True) -> None:
+
+_ANCHOR_NAME = '__minigltf_AnimAnchor'
+
+
+def _has_cutscene() -> bool:
+    # True when a schedule will be exported (markers or NLA strips).
+    sc = bpy.context.scene
+    if any(m.camera is not None for m in sc.timeline_markers):
+        return True
+    for o in sc.objects:
+        ad = getattr(o, 'animation_data', None)
+        if ad is not None and any(not t.mute and any(not s.mute and s.action is not None for s in t.strips) for t in ad.nla_tracks):
+            return True
+    return False
+
+
+def _is_unedited_shell(obj, instanced_cols) -> bool:
+    # Unedited override mesh inside a live-linked collection (authoring shell).
+    if obj.type != 'MESH':
+        return False
+    ref = getattr(getattr(obj, 'override_library', None), 'reference', None)
+    data = getattr(obj, 'data', None)
+    if ref is None or data is None:
+        return False
+    if getattr(data, 'override_library', None) is not None:
+        return False
+    if getattr(data, 'library', None) is None:
+        return False
+    return any(ref == m for c in instanced_cols for m in c.objects)
+
+
+def _has_edited_duplicate(col, objs) -> bool:
+    # True when an edited mesh override of this collection exports.
+    for m in col.objects:
+        if m.type != 'MESH':
+            continue
+        for ob in objs:
+            if not isinstance(ob, bpy.types.Object):
+                continue
+            ref = getattr(getattr(ob, 'override_library', None), 'reference', None)
+            data = getattr(ob, 'data', None)
+            if ref is not None and ref == m and data is not None \
+                    and getattr(data, 'override_library', None) is not None:
+                return True
+    return False
+
+
+def _rig_for_instance(inst_col, objs):
+    # Armature in objs backing a collection instance (direct or override).
+    for a in objs:
+        if not isinstance(a, bpy.types.Object) or a.type != 'ARMATURE':
+            continue
+        for m in inst_col.objects:
+            if a == m:
+                return a
+            ref = getattr(getattr(a, 'override_library', None), 'reference', None)
+            if ref is not None and ref == m:
+                return a
+    return None
+
+
+def _uses_bone_anim(rig) -> bool:
+    # True when a local action keys one of the rig's bones.
+    names = {b.name for b in rig.data.bones}
+    if not names:
+        return False
+    for a in bpy.data.actions:
+        if getattr(a, 'library', None):
+            continue
+        for f in _action_fcurves(a):
+            if f.data_path.startswith('pose.bones["') and f.data_path.split('"')[1] in names:
+                return True
+    return False
+
+
+def _has_skin(rig, objs) -> bool:
+    # True when a skinned mesh already drives this rig.
+    for m in objs:
+        if not isinstance(m, bpy.types.Object) or m.type != 'MESH':
+            continue
+        if any(md.type == 'ARMATURE' and md.object is rig for md in m.modifiers):
+            return True
+    return False
+
+
+def _remove_stale_anchors():
+    # Drop orphan anchors left by a prior run.
+    for o in list(bpy.data.objects):
+        if o.name == _ANCHOR_NAME and not o.library and not list(o.users_collection):
+            md = o.data
+            bpy.data.objects.remove(o, do_unlink=True)
+            if md is not None and md.users == 0:
+                bpy.data.meshes.remove(md)
+
+
+def _make_anchor(rig):
+    # Degenerate skinned triangle forcing a Skeleton3D; never visible.
+    names = sorted(b.name for b in rig.data.bones)
+    me = bpy.data.meshes.new(_ANCHOR_NAME)
+    me.from_pydata([(0, 0, 0)] * 3, [], [(0, 1, 2)])
+    me.update()
+    ob = bpy.data.objects.new(_ANCHOR_NAME, me)
+    ob.vertex_groups.new(name=names[0]).add([0, 1, 2], 1.0, 'REPLACE')
+    ob.modifiers.new('Armature', 'ARMATURE').object = rig
+    ob.parent = rig
+    return ob, me
+
+
+def _clear_anchors(anchors):
+    # Remove temp anchors from the Blender session.
+    for ao, ame in anchors:
+        try:
+            bpy.data.objects.remove(ao, do_unlink=True)
+            if ame.users == 0:
+                bpy.data.meshes.remove(ame)
+        except Exception:
+            pass
+
+def mini_export(output_file: str) -> None:
     # If we're in Edit Mode, we have to switch to object mode first.
     edited = []
     for o in bpy.context.scene.objects:
@@ -474,6 +640,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
         (0.0, 0.0, 1.0, 0.0),
         (0.0, -1.0, 0.0, 0.0),
         (0.0, 0.0, 0.0, 1.0)))
+    _basis_inv = axis_basis_change.inverted_safe()
 
     _t = time.perf_counter()
 
@@ -495,6 +662,13 @@ def mini_export(output_file: str, split: bool = True) -> None:
             _overridden_originals.add(_ovlib.reference)
 
     _scene_objs = bpy.context.scene.objects
+    # Live-linked collections need no authoring-shell duplicates.
+    _instanced_cols = []
+    for _e in _scene_objs:
+        if _e.type == 'EMPTY' and getattr(_e, 'instance_type', None) == 'COLLECTION':
+            _c = _e.instance_collection
+            if _c is not None and getattr(_c, 'library', None) is not None:
+                _instanced_cols.append(_c)
     objs = []
     for _o in _scene_objs:
         if _o.type not in ('MESH', 'ARMATURE', 'CAMERA', 'LIGHT', 'SPEAKER'):
@@ -503,10 +677,11 @@ def mini_export(output_file: str, split: bool = True) -> None:
             continue
         if _non_linked_only and _o.library is not None:
             continue
+        if _is_unedited_shell(_o, _instanced_cols):
+            continue
         objs.append(_o)
 
-    # For linked assets (instanced collections empties) export as a transform
-    # node with a `linked` extras hint
+    # Linked collection empties export as transform nodes with a link hint.
     _collection_instances = []
     for _o in _scene_objs:
         if _o.type != 'EMPTY' or getattr(_o, 'instance_type', None) != 'COLLECTION':
@@ -514,9 +689,8 @@ def mini_export(output_file: str, split: bool = True) -> None:
         _col = _o.instance_collection
         if _col is None or getattr(_col, 'library', None) is None:
             continue
-        # If any object in the collection is already overridden, real objects
-        # export instead - don't also emit a scene-reference node.
-        if any(_obj in _overridden_originals for _obj in _col.objects):
+        # Edited duplicates render instead; shells and bare rigs don't hide it.
+        if _has_edited_duplicate(_col, objs):
             continue
         _collection_instances.append(_o)
     objs += _collection_instances
@@ -528,6 +702,53 @@ def mini_export(output_file: str, split: bool = True) -> None:
             _scene_armatures.add(_o.data)
             objs += list(_o.data.bones)
 
+    # Bone-only rigs in cutscenes get an anchor so grafts stay in bone space.
+    _has_schedule = _has_cutscene()
+    _remove_stale_anchors()
+    _anchors = []
+    for _o in [x for x in objs if isinstance(x, bpy.types.Object) and x.type == 'ARMATURE']:
+        if not _has_schedule or not _uses_bone_anim(_o) or _has_skin(_o, objs):
+            continue
+        _ao, _ame = _make_anchor(_o)
+        objs.append(_ao)
+        _anchors.append((_ao, _ame))
+
+    # Collection nodes mirror the collection hierarchy (nested included); each
+    # parentless object goes to its deepest direct home. Appended after real nodes.
+    _coll_pre = []   # [(collection, depth)] in pre-order
+    def _walk(_c, _depth):
+        _coll_pre.append((_c, _depth))
+        for _sub in _c.children:
+            _walk(_sub, _depth + 1)
+    for _top in bpy.context.scene.collection.children:
+        _walk(_top, 0)
+    _direct = {id(_c): set(_c.objects) for _c, _ in _coll_pre}
+    # Deepest directly-containing collection wins each parentless object.
+    _owner_of = {}   # id(obj) -> collection
+    for _o in objs:
+        if not (isinstance(_o, bpy.types.Object) and _o.parent is None):
+            continue
+        _best_c, _best_d = None, -1
+        for _c, _d in _coll_pre:
+            if _o in _direct[id(_c)] and _d > _best_d:
+                _best_c, _best_d = _c, _d
+        if _best_c is not None:
+            _owner_of[id(_o)] = _best_c
+    _members_of = {id(_c): [] for _c, _ in _coll_pre}
+    _claimed = set()
+    for _o in objs:   # objs order keeps member order deterministic
+        if id(_o) in _owner_of:
+            _members_of[id(_owner_of[id(_o)])].append(_o)
+            _claimed.add(_o)
+    # A collection is contentful with members or contentful children
+    # (reverse pre-order visits children before parents).
+    _contentful = set()
+    for _c, _d in reversed(_coll_pre):
+        if _members_of[id(_c)] or any(id(_s) in _contentful for _s in _c.children):
+            _contentful.add(id(_c))
+    _coll_nodes = [(_c, _members_of[id(_c)]) for _c, _ in _coll_pre
+                   if id(_c) in _contentful]
+
     world_matrix = {}
 
     for a in _scene_objs:
@@ -537,7 +758,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
         for b in armature.bones:
             # Armature-space, NOT world: bone nodes are children of the armature
             # node, which already carries the object's world transform.
-            world_matrix[b] = b.matrix_local @ axis_basis_change
+            world_matrix[b] = b.matrix_local
 
     accessors = []
     bufferViews = []
@@ -605,7 +826,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
     for _an, _uniq in _reg_direct.items():
         _clip_names.setdefault(_uniq, _gd_clip_name(_an))
 
-    _cutscene = _cutscene_schedule()
+    _cutscene = _cutscene_schedule(output_file)
     _audio = _audio_schedule(output_file)
     _extra_node_data = {}
     if _cutscene is not None:
@@ -740,8 +961,21 @@ def mini_export(output_file: str, split: bool = True) -> None:
         if i < len(objs) - 1:
             jsn.write(b',')
 
+    _coll_index = {id(_c): len(objs) + _k for _k, (_c, _m) in enumerate(_coll_nodes)}
+    for _k, (_c, _members) in enumerate(_coll_nodes):
+        if objs or _k > 0:
+            jsn.write(b',')
+        jsn.write(b'{"name":')
+        jsn.write(_je(_c.name))
+        jsn.write(b',"extras":{"minigltf_collection":true},"children":[')
+        _kids = [str(objs.index(_m)) for _m in _members]
+        _kids += [str(_coll_index[id(_s)]) for _s in _c.children
+                   if id(_s) in _contentful]
+        jsn.write(','.join(_kids).encode())
+        jsn.write(b']}')
+
     if _extra_node_data:
-        if objs:
+        if objs or _coll_nodes:
             jsn.write(b',')
         jsn.write(b'{"name":"CutsceneData","extras":')
         jsn.write(json.dumps(_extra_node_data).encode())
@@ -1338,7 +1572,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
                 # IBMs transform from bone-local space to mesh space.  The
                 # armature node is the mesh's parent in the exported hierarchy,
                 # so the engine already applies the armature's world transform;
-                matrix = (axis_basis_change @ bone.matrix_local).inverted_safe()
+                matrix = (axis_basis_change @ bone.matrix_local @ _basis_inv).inverted_safe()
                 # glTF stores MAT4 column-major; numpy sees the matrix row-major, so transpose.
                 bchunk.view(16).reshape(4, 4)[:] = np.array(matrix, dtype=np.float32).T
 
@@ -1448,6 +1682,16 @@ def mini_export(output_file: str, split: bool = True) -> None:
                     _add(_o.data.shape_keys.animation_data, _o.data.shape_keys, _o, 'shapekey')
                 if _o.type == 'LIGHT':
                     _add(_o.data.animation_data, _o.data, _o, 'lightprop')
+            # Empty collection instances drive their rig; bind to that armature.
+            for _e in _scene_objs:
+                if _e.type != 'EMPTY' or getattr(_e, 'instance_type', None) != 'COLLECTION':
+                    continue
+                if _e.animation_data is None or _e.instance_collection is None:
+                    continue
+                _rig = _rig_for_instance(_e.instance_collection, objs)
+                if _rig is None:
+                    continue
+                _add(_e.animation_data, _e, _rig, 'xform')
             return users
 
         def _channel_set(a, target, slot_handle, domain):
@@ -1459,8 +1703,8 @@ def mini_export(output_file: str, split: bool = True) -> None:
             for f in _slot_fcurves(a, slot_handle):
                 curves.setdefault(f.data_path, [None, None, None, None])[f.array_index] = f
 
-            # Transform tracks. Bones and camera/light objects use the same path.
-            # Each entry: (node, gltf_path, curveset, primary_fc, correction)
+            # Transform tracks: bone entries are relative (converted live
+            # matrices); node replacements convert left only.
             transforms = []
             pointers = []
             shape_key_curves = {}
@@ -1490,11 +1734,9 @@ def mini_export(output_file: str, split: bool = True) -> None:
                         print(f"[minigltf] WARNING: action '{a.name}' bone '{_bone_name}' "
                               f"channel '{_channel}' has mismatched keyframe times across "
                               f"axes - exported animation may be missing or have incorrect keyframes")
-                    if _bone.parent:
-                        corr = _bone.parent.matrix_local.inverted_safe() @ _bone.matrix_local
-                    else:
-                        corr = axis_basis_change @ _bone.matrix_local
-                    transforms.append((_bone, CHANNEL_MAPPING[_channel], cs, pf, corr))
+                    # Bone tracks drive Skeleton3D pose offsets: only the basis
+                    # change applies, never the rest orientation.
+                    transforms.append((_bone, CHANNEL_MAPPING[_channel], cs, pf, True))
             elif domain == 'xform' and target.type in ('CAMERA', 'LIGHT', 'SPEAKER'):
                 for _dp, _path in CHANNEL_MAPPING.items():
                     cs = curves.get(_dp)
@@ -1505,7 +1747,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
                         print(f"[minigltf] WARNING: action '{a.name}' on '{target.name}' "
                               f"channel '{_dp}' has mismatched keyframe times across axes - "
                               f"exported animation may be missing or have incorrect keyframes")
-                    transforms.append((target, _path, cs, pf, axis_basis_change))
+                    transforms.append((target, _path, cs, pf, False))
             elif domain == 'lightprop' and target.data in lights:
                 _li = lights.index(target.data)
                 _lt = target.data
@@ -1555,7 +1797,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
             ab.write(b'{"name":' + _je(name) + b',"channels":[')
             _sidx = 0
             for (transforms, pointers, sk_mesh_obj, shape_key_curves) in sets:
-                for (node, path, cs, pf, corr) in transforms:
+                for (node, path, cs, pf, _rel) in transforms:
                     ab.write((b',' if _sidx else b'') + b'{"sampler":%d,"target":{"node":%d,"path":"%s"}}'
                              % (_sidx, objs.index(node), path.encode()))
                     _sidx += 1
@@ -1571,22 +1813,38 @@ def mini_export(output_file: str, split: bool = True) -> None:
             ab.write(b'],"samplers":[')
             _need_comma = False
             for (transforms, pointers, sk_mesh_obj, shape_key_curves) in sets:
-                for (node, path, cs, pf, corr) in transforms:
+                for (node, path, cs, pf, _rel) in transforms:
                     if _need_comma:
                         ab.write(b',')
                     _need_comma = True
                     times = [k.co.x / fps_val for k in pf.keyframe_points]
                     vals = []
+                    if _rel:
+                        # Parent-relative rest the offset applies in.
+                        _rr = node.parent.matrix_local.inverted_safe() @ node.matrix_local \
+                            if node.parent is not None else node.matrix_local
+                    if _rel and path == 'rotation':
+                        # Hoisted per track (was per key): file value is the
+                        # converted live matrix, so chains telescope in Godot.
+                        _pre = axis_basis_change @ _rr
                     for t in range(len(times)):
                         if path == 'rotation':
                             q = mathutils.Quaternion((_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t), _fc_val(cs[3], t)))
-                            r = (corr @ q.to_matrix().to_4x4()).to_quaternion()
+                            if _rel:
+                                r = (_pre @ q.to_matrix().to_4x4() @ _basis_inv).to_quaternion()
+                            else:
+                                # Node replacements only convert left.
+                                r = (axis_basis_change @ q.to_matrix().to_4x4()).to_quaternion()
                             vals += (r.x, r.y, r.z, r.w)
                         elif path == 'scale':
-                            vals += (_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t))
+                            _sv = (_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t))
+                            # Bone scale factors map axes like positions.
+                            vals += ((_sv[0], _sv[2], _sv[1]) if _rel else _sv)
                         else:  # translation
                             v = mathutils.Vector((_fc_val(cs[0], t), _fc_val(cs[1], t), _fc_val(cs[2], t)))
-                            loc = (corr @ mathutils.Matrix.Translation(v).to_4x4()).to_translation()
+                            # Bone offsets add onto the rest position.
+                            lv = (_rr.to_3x3() @ v) + _rr.translation if _rel else v
+                            loc = (axis_basis_change @ mathutils.Matrix.Translation(lv).to_4x4()).to_translation()
                             vals += (loc.x, loc.y, loc.z)
                     _emit_sampler(ab, times, vals, 4 if path == 'rotation' else 3)
 
@@ -1821,17 +2079,17 @@ def mini_export(output_file: str, split: bool = True) -> None:
     jsn.write(b'"scene":0,\n')
     jsn.write(b'"scenes":[{"name":"Scene","nodes":[')
 
-    root_objs = [o for o in objs if isinstance(o, bpy.types.Object) and o.parent is None]
-    for i in range(len(root_objs)):
-        o = root_objs[i]
-        jsn.write(str(objs.index(o)).encode())
-        if i < len(root_objs) - 1:
-            jsn.write(b',')
-
+    root_objs = [o for o in objs if isinstance(o, bpy.types.Object) and o.parent is None
+                 and o not in _claimed]
+    _root_ids = [objs.index(o) for o in root_objs]
+    # Only top-level collection nodes are scene roots; nested ones are
+    # reachable through their parents.
+    _top_ids = {id(_c) for _c in bpy.context.scene.collection.children}
+    _root_ids += [len(objs) + k for k, (_c, _m) in enumerate(_coll_nodes)
+                  if id(_c) in _top_ids]
     if _extra_node_data:
-        if root_objs:
-            jsn.write(b',')
-        jsn.write(str(len(objs)).encode())  # the synthetic CutsceneData node
+        _root_ids.append(len(objs) + len(_coll_nodes))  # the synthetic CutsceneData node
+    jsn.write(','.join(str(i) for i in _root_ids).encode())
 
     jsn.write(b']}]\n')
     jsn.write(b'}')
@@ -1855,6 +2113,7 @@ def mini_export(output_file: str, split: bool = True) -> None:
         f.write(_bin_chunk)
     timings['file_io'] = time.perf_counter() - _t
 
+    _clear_anchors(_anchors)
     for o in edited:
         bpy.context.view_layer.objects.active = o
         bpy.ops.object.mode_set(mode='EDIT')
