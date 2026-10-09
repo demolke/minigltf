@@ -546,6 +546,50 @@ def validate_partial_anim(gltf, bin_data, out_dir):
         assert abs(z_val) < 1e-5, f"frame {fi} Z should be 0, got {z_val}"
 
 
+@test('bake_mismatched', 'bake_mismatched.py')
+def validate_bake_mismatched(gltf, bin_data, out_dir):
+    """Sparse curves in a group are baked with the values Blender displays.
+
+    Regression: values were sampled while inserting, so every key after the
+    first insert was read from an already-mutated curve and came out wrong."""
+    with open(os.path.join(out_dir, 'truth.json')) as fh:
+        truth = json.load(fh)
+    fps = truth['fps']
+    anims = {a['name']: a for a in gltf['animations']}
+    assert {'CamBake', 'MorphBake'} <= set(anims), f"missing animations, got {sorted(anims)}"
+
+    # Camera location: Blender (x, y, 0) -> glTF (x, z, -y).
+    anim = anims['CamBake']
+    cam_node = next(i for i, n in enumerate(gltf['nodes']) if n['name'] == 'Cam')
+    ch = next(c for c in anim['channels']
+              if c['target'].get('node') == cam_node and c['target']['path'] == 'translation')
+    sampler = anim['samplers'][ch['sampler']]
+    times = read_accessor(gltf, bin_data, sampler['input'])
+    vals = read_accessor(gltf, bin_data, sampler['output'])
+    assert len(times) == len(truth['cam']), \
+        f"expected {len(truth['cam'])} keyframes (union of X and Y), got {len(times)}"
+    for k, (frame, x, y) in enumerate(truth['cam']):
+        assert abs(times[k] - frame / fps) < 1e-4, f"key {k}: time {times[k]} != {frame / fps}"
+        got = vals[k * 3:k * 3 + 3]
+        want = (x, 0.0, -y)
+        assert all(abs(g - w) < 1e-4 for g, w in zip(got, want)), \
+            f"frame {frame}: translation {tuple(round(g, 4) for g in got)} != {tuple(round(w, 4) for w in want)}"
+
+    # Shape key weights, in targetNames order (A, B).
+    anim = anims['MorphBake']
+    ch = next(c for c in anim['channels'] if c['target']['path'] == 'weights')
+    sampler = anim['samplers'][ch['sampler']]
+    times = read_accessor(gltf, bin_data, sampler['input'])
+    weights = read_accessor(gltf, bin_data, sampler['output'])
+    assert gltf['meshes'][0]['extras']['targetNames'] == ['A', 'B']
+    assert len(times) == len(truth['morph']), \
+        f"expected {len(truth['morph'])} weight keyframes, got {len(times)}"
+    for k, (frame, a, b) in enumerate(truth['morph']):
+        got = weights[k * 2:k * 2 + 2]
+        assert abs(got[0] - a) < 1e-4 and abs(got[1] - b) < 1e-4, \
+            f"frame {frame}: weights {tuple(round(g, 4) for g in got)} != {(round(a, 4), round(b, 4))}"
+
+
 @test('multiple_meshes', 'multiple_meshes.py')
 def validate_multiple_meshes(gltf, bin_data, out_dir):
     assert len(gltf.get('meshes', [])) == 3, f"expected 3 meshes, got {len(gltf.get('meshes', []))}"

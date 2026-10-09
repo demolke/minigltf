@@ -7,6 +7,7 @@ import numpy as np
 import os
 import re
 import struct
+import bisect
 import time
 import warnings
 
@@ -59,6 +60,71 @@ def _slot_fcurves(action, slot_handle):
                 if slot_handle is None or bag.slot_handle == slot_handle:
                     result.extend(bag.fcurves)
     return result
+
+
+def _bake_mismatched(action):
+    """Insert keys so every curve in a channel group shares keyframe time"""
+    if hasattr(action, 'fcurves'):
+        _bake_curve_groups([list(action.fcurves)])
+        return
+    by_slot = {}
+    for _layer in action.layers:
+        for _strip in _layer.strips:
+            for _bag in getattr(_strip, 'channelbags', []):
+                by_slot.setdefault(_bag.slot_handle, []).extend(_bag.fcurves)
+    for _fcs in by_slot.values():
+        _bake_curve_groups(_fcs)
+
+
+def _bake_curve_groups(fcs):
+    groups = {}
+    for fc in fcs:
+        last = fc.data_path.rsplit('.', 1)[-1]
+        if last in ('location', 'rotation_quaternion', 'scale', 'color'):
+            groups.setdefault(fc.data_path, []).append(fc)
+    sk = [fc for fc in fcs
+          if fc.data_path.startswith('key_blocks[') and fc.data_path.endswith('.value')]
+    if len(sk) >= 2:
+        groups['__shapekeys__'] = sk
+    for key, flist in groups.items():
+        if len(flist) < 2:
+            continue
+        frames = sorted({kp.co.x for fc in flist for kp in fc.keyframe_points})
+
+        plan = []
+        for fc in flist:
+            existing = sorted((kp.co.x, kp.interpolation) for kp in fc.keyframe_points)
+            xs = [x for x, _ in existing]
+            have = set(xs)
+            samples = []
+            for f in frames:
+                if f in have:
+                    continue
+                i = bisect.bisect_left(xs, f)
+                interp = existing[i - 1][1] if i else None
+                samples.append((f, fc.evaluate(f), interp))
+            if samples:
+                plan.append((fc, samples))
+        if not plan:
+            continue
+
+        inserted = failed = 0
+        for fc, samples in plan:
+            for f, value, interp in samples:
+                try:
+                    kp = fc.keyframe_points.insert(f, value, options={'FAST'})
+                    if interp is not None:
+                        kp.interpolation = interp
+                    inserted += 1
+                except Exception:
+                    failed += 1
+            fc.update()
+        label = "shape key weights" if key == '__shapekeys__' else key
+        if inserted:
+            print(f"[minigltf] baked {inserted} matching keyframe(s) into '{label}'")
+        if failed:
+            print(f"[minigltf] WARNING: could not bake {failed} keyframe(s) into "
+                  f"'{label}' - exported animation may have incorrect keyframes")
 
 def _alpha_mode(material, albedo):
     """Return alphamode to use."""
@@ -782,6 +848,12 @@ def mini_export(output_file: str) -> None:
                 materials.append(m)
 
     timings['setup'] = time.perf_counter() - _t
+    # Bake matching keys into mismatched channel groups first, so the
+    # index-based reader below sees correct values (local actions only;
+    # linked ones belong to their own file's export).
+    for _a in bpy.data.actions:
+        if not getattr(_a, 'library', None):
+            _bake_mismatched(_a)
     # Pre-scan to size the binary buffer accurately and avoid costly reallocs in
     # Blender's allocator (observed 29x slowdown vs a single pre-allocated buffer).
     _bin_size = 0
