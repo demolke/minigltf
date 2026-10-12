@@ -113,9 +113,14 @@ Disable or remove the extension from *Edit → Preferences → Extensions*. The 
 **Run the test suite** (requires Blender on `$PATH` or set `BLENDER=`):
 
 ```bash
-python tests/run_tests.py
-# or against a specific Blender build:
-BLENDER=/opt/blender-5.1.0-linux-x64/blender python tests/run_tests.py
+pip install -r tests/requirements.txt
+python -m pytest tests
+# only one suite:
+python -m pytest tests/minigltf
+python -m pytest tests/materializer
+# a single test
+BLENDER=/opt/blender-5.1.0-linux-x64/blender python -m pytest tests/minigltf -k basic_mesh
+BLENDER=/opt/blender-5.1.0-linux-x64/blender python -m pytest tests/materializer -k basecolor_only
 ```
 
 **Cut a release**

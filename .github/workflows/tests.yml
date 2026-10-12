@@ -44,11 +44,18 @@ jobs:
           sudo mv /tmp/Godot_v4.7-stable_linux.x86_64 /usr/local/bin/godot
           godot --headless --version
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
       - name: Run minigltf tests
-        run: python tests/minigltf/run_tests.py
+        run: python -m pytest tests/minigltf
 
       - name: Run materializer tests
-        run: python tests/materializer/run_tests.py
+        run: python -m pytest tests/materializer
 
       - name: Benchmark
         run: |
