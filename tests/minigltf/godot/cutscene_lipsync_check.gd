@@ -95,8 +95,8 @@ func _pre_drive(scene: Node, _players: Dictionary, clip_keys: Dictionary) -> voi
 
 	# --- timeline playback: blend-shape probes at known times ------------------
 	# Shot start times come straight from the schedule's animation-track keys.
-	# Within a shot, a sub clip plays from 0, so the global probe time is
-	# shot start + keyframe frame / 24 (cushioned by one 60 Hz step below).
+	# Within a shot, a sub clip plays from its action start (frame 1), as
+	# Blender's strip does, so action frame N shows at shot start + (N - 1) / 24.
 	for head_name in heads:
 		var keys: Array = []
 		for name in clip_keys:
@@ -106,10 +106,10 @@ func _pre_drive(scene: Node, _players: Dictionary, clip_keys: Dictionary) -> voi
 		if keys.size() != 4:
 			continue
 		# Shot 1 (Talking): jawOpen rises to ~0.6 at frame 8, back near 0 at frame 16.
-		probes.append({"t": float(keys[0][0]) + 8.0 / FPS, "head": head_name,
+		probes.append({"t": float(keys[0][0]) + 7.0 / FPS, "head": head_name,
 			"shape": "jawOpen", "expected": 0.6, "tol": 0.1,
 			"label": "shot 1: %s jawOpen ~ 0.6 near frame 8" % head_name})
-		probes.append({"t": float(keys[0][0]) + 16.0 / FPS, "head": head_name,
+		probes.append({"t": float(keys[0][0]) + 15.0 / FPS, "head": head_name,
 			"shape": "jawOpen", "expected": 0.1, "tol": 0.1,
 			"label": "shot 1: %s jawOpen ~ 0.1 near frame 16" % head_name})
 	if clip_keys.size() > 0 and heads.size() == 2:
@@ -122,12 +122,12 @@ func _pre_drive(scene: Node, _players: Dictionary, clip_keys: Dictionary) -> voi
 				beta_keys = clip_keys[name]
 		if alpha_keys.size() == 4:
 			# Shot 2 (Happy): mouthSmile_L peaks at 0.9, held frames 24-36.
-			probes.append({"t": float(alpha_keys[1][0]) + 30.0 / FPS, "head": "AlphaHead",
+			probes.append({"t": float(alpha_keys[1][0]) + 29.0 / FPS, "head": "AlphaHead",
 				"shape": "mouthSmile_L", "expected": 0.9, "tol": 0.1,
 				"label": "shot 2: AlphaHead mouthSmile_L ~ 0.9 at its held peak"})
 		if beta_keys.size() == 4:
 			# Shot 3 (Angry): browDown_L is 0.8 from frame 12 to frame 48.
-			probes.append({"t": float(beta_keys[2][0]) + 24.0 / FPS, "head": "BetaHead",
+			probes.append({"t": float(beta_keys[2][0]) + 23.0 / FPS, "head": "BetaHead",
 				"shape": "browDown_L", "expected": 0.8, "tol": 0.1,
 				"label": "shot 3: BetaHead browDown_L ~ 0.8 mid-scowl"})
 
@@ -156,8 +156,9 @@ func _post_drive() -> void:
 			"%s (expected %.2f +/- %.2f, got %s)"
 			% [probe.label, probe.expected, probe.tol, str(probe.get("got", "never sampled"))])
 	# Direct clip sampling (play + seek with update): the authored keyframe
-	# values must come through the imported blend-shape tracks. Keyframe times
-	# are Blender frames / 24 fps (the importer keeps the glTF timestamps).
+	# values must come through the imported blend-shape tracks. Each lane
+	# player holds its clip shifted to start at the strip's action start
+	# (frame 1 for these actions), so Blender frame N sits at (N - 1) / 24 s.
 	# Done after the timeline drive so playing clips here cannot pollute the
 	# assigned_animation sequences recorded above.
 	if heads.size() == 2:
@@ -165,15 +166,15 @@ func _post_drive() -> void:
 		var bh: MeshInstance3D = heads["BetaHead"]
 		var aap: AnimationPlayer = head_players["AlphaHead"]
 		var bap: AnimationPlayer = head_players["BetaHead"]
-		var v := sample_clip(aap, "TalkingFace", 8.0 / FPS, ah, "jawOpen")
+		var v := sample_clip(aap, "TalkingFace", 7.0 / FPS, ah, "jawOpen")
 		ck(absf(v - 0.6) < 0.05, "AlphaHead TalkingFace jawOpen@frame8 ~ 0.6 (got %.3f)" % v)
-		v = sample_clip(aap, "TalkingFace", 1.0 / FPS, ah, "jawOpen")
+		v = sample_clip(aap, "TalkingFace", 0.0, ah, "jawOpen")
 		ck(absf(v) < 0.05, "AlphaHead TalkingFace jawOpen@frame1 ~ 0.0 (got %.3f)" % v)
-		v = sample_clip(bap, "TalkingFace", 8.0 / FPS, bh, "jawOpen")
+		v = sample_clip(bap, "TalkingFace", 7.0 / FPS, bh, "jawOpen")
 		ck(absf(v - 0.6) < 0.05, "BetaHead TalkingFace jawOpen@frame8 ~ 0.6 (got %.3f)" % v)
-		v = sample_clip(aap, "HappyFace", 24.0 / FPS, ah, "mouthSmile_L")
+		v = sample_clip(aap, "HappyFace", 23.0 / FPS, ah, "mouthSmile_L")
 		ck(absf(v - 0.9) < 0.05, "HappyFace mouthSmile_L@frame24 ~ 0.9 (got %.3f)" % v)
-		v = sample_clip(bap, "AngryFace", 24.0 / FPS, bh, "browDown_L")
+		v = sample_clip(bap, "AngryFace", 23.0 / FPS, bh, "browDown_L")
 		ck(absf(v - 0.8) < 0.05, "AngryFace browDown_L@frame24 ~ 0.8 (got %.3f)" % v)
 
 	for head_name in jaw_seen:

@@ -65,7 +65,7 @@ def _slot_fcurves(action, slot_handle):
 def _bake_mismatched(action):
     """Insert keys so every curve in a channel group shares keyframe time"""
     if hasattr(action, 'fcurves'):
-        _bake_curve_groups([list(action.fcurves)])
+        _bake_curve_groups(list(action.fcurves))
         return
     by_slot = {}
     for _layer in action.layers:
@@ -339,6 +339,43 @@ def _clip_name_registry(scene):
     return nla_names, direct_names
 
 
+def _source_collection(obj):
+    if obj.type == 'EMPTY' and getattr(obj, 'instance_type', None) == 'COLLECTION':
+        return obj.instance_collection
+    ref = getattr(getattr(obj, 'override_library', None), 'reference', None)
+    lib = getattr(ref, 'library', None)
+    if lib is None:
+        return None
+    return next((c for c in ref.users_collection if getattr(c, 'library', None) == lib), None)
+
+
+def _linked_clip_name(name, lib_path, taken):
+    if name not in taken:
+        return name
+    base = f"{name}_{_gd_clip_name(os.path.splitext(os.path.basename(lib_path))[0])}"
+    out, i = base, 2
+    while out in taken:
+        out = f"{base}_{i}"
+        i += 1
+    return out
+
+
+def _frame_num(f):
+    """A frame number for the JSON schedule: int when whole, else float."""
+    f = float(f)
+    return int(f) if f.is_integer() else round(f, 4)
+
+
+def _offset_clip_name(name, frame, taken):
+    f = int(frame) if float(frame).is_integer() else frame
+    base = _gd_clip_name(f"{name}_f{f}".replace('.', '_').replace('-', 'm'))
+    out, i = base, 2
+    while out in taken:
+        out = f"{base}_{i}"
+        i += 1
+    return out
+
+
 def _cutscene_schedule(output_file: str):
     """The NLA schedule for the current scene as a JSON-ready dict, or None
     when there is no cutscene (no camera-bound markers and no NLA strips)."""
@@ -349,19 +386,31 @@ def _cutscene_schedule(output_file: str):
     # Camera cuts from camera-bound markers.
     markers = sorted((m for m in scene.timeline_markers if m.camera is not None),
                      key=lambda m: m.frame)
-    cuts = [{'time': m.frame / fps, 'camera': m.camera.name} for m in markers]
+    cuts = [{'frame': _frame_num(m.frame), 'camera': m.camera.name} for m in markers]
 
     # Per-actor playback schedule plus `sources` provenance for strips driven
     # by a foreign-library action (same-library clips need no entry).
     playback = []
-    sources = {}
-    end_sec = 0.0
+    end_frame = 0.0
+    # A linked clip never takes a local action's name: the addon would find the
+    # local clip in the lane player and skip grafting the linked one.
+    _local_names = {_gd_clip_name(a.name) for a in bpy.data.actions
+                    if getattr(a, 'library', None) is None}
     for obj in scene.objects:
         keys = []
+        sources = {}
+        aliases = {}
+        _raw = []    # [strip start frame, base lane clip, action start frame, direct?]
+        _linked = {}  # (library path, action name) -> lane clip name
+        _src_col = _source_collection(obj)
         _inst_col = None
         if obj.type == 'EMPTY' and getattr(obj, 'instance_type', None) == 'COLLECTION':
             _inst_col = obj.instance_collection
         for ad in _anim_data_holders(obj):
+            # The holder's direct clip (mirrors _clip_name_registry).
+            _active = (ad.action if (ad.action and not ad.action.library
+                                     and not getattr(ad, 'use_tweak_mode', False))
+                       else None)
             for tr in ad.nla_tracks:
                 if tr.mute:
                     continue
@@ -373,42 +422,73 @@ def _cutscene_schedule(output_file: str):
                     # name only has to be unique within one actor's player).
                     # Sanitize to match the name the addon assigns in Godot.
                     _clip = _gd_clip_name(st.action.name)
-                    keys.append([st.frame_start / fps, _clip])
-                    end_sec = max(end_sec, st.frame_end / fps)
                     _lib = getattr(st.action, 'library', None)
-                    if _lib is not None and _clip not in sources:
+                    if _lib is not None:
+                        _lib_path = os.path.abspath(bpy.path.abspath(_lib.filepath))
+                        _key = (_lib_path, st.action.name)
+                        if _key not in _linked:
+                            _linked[_key] = _linked_clip_name(
+                                _clip, _lib_path, _local_names | set(_linked.values()))
+                        _renamed = _linked[_key] != _clip
+                        _clip = _linked[_key]
                         _same = False
-                        if _inst_col is not None and getattr(_inst_col, 'library', None) is not None:
+                        if not _renamed and _inst_col is not None \
+                                and getattr(_inst_col, 'library', None) is not None:
                             try:
                                 _same = (os.path.abspath(bpy.path.abspath(_inst_col.library.filepath))
-                                         == os.path.abspath(bpy.path.abspath(_lib.filepath)))
+                                         == _lib_path)
                             except ValueError:
                                 _same = False
-                        if not _same:
+                        if not _same and _clip not in sources:
                             try:
-                                _rel = os.path.relpath(bpy.path.abspath(_lib.filepath), _glb_dir)
+                                _rel = os.path.relpath(_lib_path, _glb_dir)
                             except ValueError:
-                                _rel = bpy.path.abspath(_lib.filepath)
+                                _rel = _lib_path
                             sources[_clip] = {
                                 'file': _rel.replace('\\', '/'),
-                                'collection': _inst_col.name if _inst_col is not None else '',
+                                'collection': _src_col.name if _src_col is not None else '',
+                                'clip': _gd_clip_name(st.action.name),
                             }
+                    _raw.append([st.frame_start, _clip, st.action_frame_start,
+                                 st.action is _active])
+                    end_frame = max(end_frame, st.frame_end)
+        _raw.sort(key=lambda r: r[0])
+        _taken = _local_names | set(_linked.values()) | {r[1] for r in _raw}
+        _start_of = {}   # lane clip -> its (rounded) action start frame
+        _variant = {}    # (base clip, action start) -> lane clip
+        for _f0, _clip, _afs, _direct in _raw:
+            _a = round(_afs, 3)
+            if not _direct and _start_of.setdefault(_clip, _a) == _a:
+                _name = _clip
+            elif (_clip, _a) in _variant:
+                _name = _variant[(_clip, _a)]
+            else:
+                _name = _offset_clip_name(_clip, _a, _taken)
+                _taken.add(_name)
+                _variant[(_clip, _a)] = _name
+                if _clip in sources:
+                    sources[_name] = dict(sources[_clip])
+                else:
+                    aliases[_name] = _clip
+            keys.append([_frame_num(_f0), _name, _frame_num(_afs)])
         if keys:
-            keys.sort(key=lambda k: k[0])
-            playback.append({'actor': obj.name, 'keys': keys})
+            lane = {'actor': obj.name, 'keys': keys}
+            if sources:
+                lane['sources'] = sources
+            if aliases:
+                lane['aliases'] = aliases
+            playback.append(lane)
 
     if not cuts and not playback:
         return None
 
-    length = end_sec
     for c in cuts:
-        length = max(length, c['time'])
+        end_frame = max(end_frame, c['frame'])
     for lane in playback:
-        length = max(length, lane['keys'][-1][0])
+        end_frame = max(end_frame, lane['keys'][-1][0])
 
-    return {'version': 1, 'fps': fps, 'length': length,
-            'cuts': cuts, 'playback': playback,
-            **({'sources': sources} if sources else {})}
+    return {'version': 1, 'fps': fps, 'end_frame': _frame_num(end_frame),
+            'cuts': cuts, 'playback': playback}
 
 
 def _sound_missing(sound) -> bool:
@@ -709,6 +789,12 @@ def mini_export(output_file: str) -> None:
     _basis_inv = axis_basis_change.inverted_safe()
 
     _t = time.perf_counter()
+
+    _scene_fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
+    if abs(_scene_fps - 30.0) > 1e-6:
+        print(f"[minigltf] WARNING: scene frame rate is {_scene_fps:g} fps; Godot imports "
+              f"animation baked at 30 fps, so keys off the 30 fps grid get resampled "
+              f"(set Blender's frame rate to 30)")
 
     jsn = BytesIO()
     jsn.write(b'{')

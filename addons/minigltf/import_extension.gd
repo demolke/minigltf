@@ -18,6 +18,7 @@ func _import_post(state: GLTFState, root: Node) -> Error:
 	_resolve_links(root, root, state.base_path)
 	_split_master_player(root, _read_clip_names(root))
 	_merge_foreign_clips(root, state.base_path)
+	_apply_lane_offsets(root)
 	_build_cutscene(root, state.base_path)
 	return OK
 
@@ -203,13 +204,14 @@ func _track_target(anim: Animation, i: int) -> String:
 
 # Player holding the actor's clip; searches the actor subtree, then parents.
 static func _lane_player(scene: Node, actor_node: Node, clip: String) -> AnimationPlayer:
-	var n := actor_node
-	while n != null:
-		for c in n.find_children("*", "AnimationPlayer", true, false):
-			if (c as AnimationPlayer).has_animation(clip):
+	for c in actor_node.find_children("*", "AnimationPlayer", true, false):
+		if (c as AnimationPlayer).has_animation(clip):
+			return c as AnimationPlayer
+	var n := actor_node.get_parent()
+	while n != null and n != scene:
+		for c in n.get_children():
+			if c is AnimationPlayer and (c as AnimationPlayer).has_animation(clip):
 				return c as AnimationPlayer
-		if n == scene:
-			break
 		n = n.get_parent()
 	return null
 
@@ -301,18 +303,35 @@ func _split_master_player(scene: Node, clip_names: Dictionary = {}) -> void:
 	master.free()
 
 
-# Copy foreign clips missing from instance players; same-file clips too.
-func _merge_foreign_clips(scene: Node, base_dir: String) -> void:
+# The CutsceneData schedule (minigltf.py _cutscene_schedule), {} when none.
+static func _schedule(scene: Node) -> Dictionary:
 	var holder := scene.find_child("CutsceneData", true, false)
 	if holder == null or not holder.has_meta("extras"):
-		return
+		return {}
 	var extras = holder.get_meta("extras")
 	if not (extras is Dictionary):
-		return
-	var sources: Dictionary = extras.get("minigltf_cutscene", {}).get("sources", {})
-	var lanes: Array = extras.get("minigltf_cutscene", {}).get("playback", [])
-	for lane in lanes:
-		var actor := String(lane.get("actor", ""))
+		return {}
+	var data = extras.get("minigltf_cutscene", {})
+	return data if data is Dictionary else {}
+
+
+static func _schedule_lanes(scene: Node) -> Array:
+	return _schedule(scene).get("playback", [])
+
+
+# Schedule frame -> seconds
+static func _sched_sec(schedule: Dictionary, frame) -> float:
+	var fps := float(schedule.get("fps", 30.0))
+	return float(frame) / (fps if fps > 0.0 else 30.0)
+
+
+# Copy foreign clips missing from instance players; same-file clips too.
+func _merge_foreign_clips(scene: Node, base_dir: String) -> void:
+	for lane in _schedule_lanes(scene):
+		# Same named clips may come from different files.
+		var sources: Dictionary = lane.get("sources", {})
+		var aliases: Dictionary = lane.get("aliases", {})
+		var actor := String(lane.get("actor", "")).validate_node_name()
 		var node := _actor_node(scene, actor)
 		if node == null:
 			continue
@@ -321,15 +340,18 @@ func _merge_foreign_clips(scene: Node, base_dir: String) -> void:
 		if live:
 			player = _instance_player(node)
 		else:
-			for key in lane.get("keys", []):
-				var owner := _lane_player(scene, node, String(key[1]))
+			var names: Array = lane.get("keys", []).map(func(k): return String(k[1]))
+			names.append_array(aliases.values())
+			for clip in names:
+				var owner := _lane_player(scene, node, String(clip))
 				if owner != null:
 					player = owner
 					break
 		var missing: Array = []
 		for key in lane.get("keys", []):
 			var clip := String(key[1])
-			if (player == null or not player.has_animation(clip)) and not missing.has(clip):
+			if (player == null or not player.has_animation(clip) or sources.has(clip)
+					or aliases.has(clip)) and not missing.has(clip):
 				missing.append(clip)
 		if missing.is_empty():
 			continue
@@ -340,9 +362,121 @@ func _merge_foreign_clips(scene: Node, base_dir: String) -> void:
 			player = _localize_player(scene, node, player)
 		for clip in missing:
 			if sources.has(clip):
-				_graft_foreign_clip(player, clip, sources[clip], base_dir)
+				_graft_foreign_clip(player, node, clip, sources[clip], base_dir)
+			elif aliases.has(clip):
+				_graft_alias_clip(scene, player, clip, String(aliases[clip]))
 			else:
 				_graft_local_clip(scene, player, clip)
+
+
+static func _graft_alias_clip(scene: Node, player: AnimationPlayer, clip: String, base: String) -> void:
+	if not player.has_animation(base):
+		_graft_local_clip(scene, player, base)
+	if not player.has_animation(base):
+		push_warning("minigltf: cannot resolve base clip '%s' of lane clip '%s'" % [base, clip])
+		return
+	if not player.has_animation_library(""):
+		player.add_animation_library("", AnimationLibrary.new())
+	var lib := player.get_animation_library("")
+	if lib.has_animation(clip):
+		lib.remove_animation(clip)
+	lib.add_animation(clip, (player.get_animation(base) as Animation).duplicate(true))
+
+
+# Godot starts animation at 0, but blender might have an action start specified
+func _apply_lane_offsets(scene: Node) -> void:
+	var schedule := _schedule(scene)
+	var applied := {}
+	for lane in schedule.get("playback", []):
+		var keys: Array = lane.get("keys", [])
+		var node := _actor_node(scene, String(lane.get("actor", "")).validate_node_name())
+		if node == null or keys.is_empty():
+			continue
+		# Same player _build_cutscene points the lane track at.
+		var player := _lane_player(scene, node, String(keys[0][1]))
+		if player == null:
+			continue
+		for key in keys:
+			var clip := String(key[1])
+			var offset := _sched_sec(schedule, key[2])
+			var done: Dictionary = applied.get_or_add(player.get_instance_id(), {})
+			if done.has(clip):
+				if not is_equal_approx(float(done[clip]), offset):
+					push_warning("minigltf: lane clip '%s' of '%s' is scheduled from two action starts (%.3fs, %.3fs); keeping the first"
+						% [clip, lane.get("actor", ""), done[clip], offset])
+				continue
+			done[clip] = offset
+			if is_zero_approx(offset) or not player.has_animation(clip):
+				continue
+			# Edits to library (instance) nodes don't pack; use a scene-owned copy.
+			if player.owner != scene:
+				applied.erase(player.get_instance_id())
+				player = _localize_player(scene, node, player)
+				applied[player.get_instance_id()] = done
+			_replace_lane_clip(player, clip, _shifted_clip(player.get_animation(clip), offset))
+
+
+static func _shifted_clip(src: Animation, offset: float) -> Animation:
+	const EPS := 1e-5
+	var a := src.duplicate(true) as Animation
+	var last := 0.0
+	for i in a.get_track_count():
+		if a.track_is_compressed(i):
+			push_warning("minigltf: cannot shift compressed animation track %s" % a.track_get_path(i))
+			continue
+		if a.track_get_key_count(i) == 0:
+			continue
+		var type := a.track_get_type(i)
+		var v0 = null
+		match type:
+			Animation.TYPE_POSITION_3D:
+				v0 = a.position_track_interpolate(i, offset)
+			Animation.TYPE_ROTATION_3D:
+				v0 = a.rotation_track_interpolate(i, offset)
+			Animation.TYPE_SCALE_3D:
+				v0 = a.scale_track_interpolate(i, offset)
+			Animation.TYPE_BLEND_SHAPE:
+				v0 = a.blend_shape_track_interpolate(i, offset)
+			Animation.TYPE_VALUE:
+				v0 = a.value_track_interpolate(i, offset)
+			Animation.TYPE_BEZIER:
+				v0 = a.bezier_track_interpolate(i, offset)
+		for k in range(a.track_get_key_count(i) - 1, -1, -1):
+			if a.track_get_key_time(i, k) < offset - EPS:
+				a.track_remove_key(i, k)
+		# track_set_key_time re-sorts; walk so a moved key never passes an unmoved one.
+		var n := a.track_get_key_count(i)
+		var order := range(n) if offset > 0.0 else range(n - 1, -1, -1)
+		for k in order:
+			a.track_set_key_time(i, k, maxf(a.track_get_key_time(i, k) - offset, 0.0))
+		if v0 != null and (n == 0 or a.track_get_key_time(i, 0) > EPS):
+			if type == Animation.TYPE_BEZIER:
+				a.bezier_track_insert_key(i, 0.0, v0)
+			else:
+				a.track_insert_key(i, 0.0, v0)
+		n = a.track_get_key_count(i)
+		if n > 0:
+			last = maxf(last, a.track_get_key_time(i, n - 1))
+	a.length = maxf(src.length - offset, last)
+	return a
+
+
+# Put `anim` in player as `clip`, in a fresh copy of the library holding it
+# (libraries may be shared with a library scene or another player).
+static func _replace_lane_clip(player: AnimationPlayer, clip: String, anim: Animation) -> void:
+	for lib_name in player.get_animation_library_list():
+		var key := clip if lib_name == &"" else clip.trim_prefix(String(lib_name) + "/")
+		if lib_name != &"" and key == clip:
+			continue
+		var lib := player.get_animation_library(lib_name)
+		if not lib.has_animation(key):
+			continue
+		var fresh := AnimationLibrary.new()
+		for name in lib.get_animation_list():
+			fresh.add_animation(name, anim if name == StringName(key) else lib.get_animation(name))
+		player.remove_animation_library(lib_name)
+		player.add_animation_library(lib_name, fresh)
+		return
 
 
 # Same-file lane clip: copy from the split player into the instance player.
@@ -403,10 +537,15 @@ func _instance_player(node: Node) -> AnimationPlayer:
 
 
 # Rebase grafted bone tracks onto a skeleton under root (layout may differ).
-static func _rebase_to_skeleton(root: Node, anim: Animation) -> void:
+static func _rebase_to_skeleton(root: Node, anim: Animation, actor: Node = null) -> void:
 	var skels: Array[Node] = []
+	if actor != null:
+		if actor is Skeleton3D:
+			skels.append(actor)
+		skels.append_array(actor.find_children("*", "Skeleton3D", true, false))
 	for n in root.find_children("*", "Skeleton3D", true, false):
-		skels.append(n)
+		if not skels.has(n):
+			skels.append(n)
 	if skels.is_empty():
 		return
 	for i in anim.get_track_count():
@@ -424,26 +563,30 @@ static func _rebase_to_skeleton(root: Node, anim: Animation) -> void:
 			break
 
 
-func _graft_foreign_clip(player: AnimationPlayer,
+func _graft_foreign_clip(player: AnimationPlayer, actor: Node,
 		clip: String, info: Dictionary, base_dir: String) -> void:
 	var rel := String(info.get("file", ""))
 	var collection := String(info.get("collection", ""))
+	var lib_clip := String(info.get("clip", clip))
 	var glb := base_dir.path_join(rel.get_basename() + ".glb").simplify_path()
 	var blend := base_dir.path_join(rel).simplify_path()
 	var anim: Animation = null
 	for lib_path in [glb, blend]:
-		anim = _foreign_clip(lib_path, collection, clip)
+		anim = _foreign_clip(lib_path, collection, lib_clip)
 		if anim != null:
 			break
 	if anim == null:
-		push_warning("minigltf: cannot resolve foreign clip '%s' from %s" % [clip, glb])
+		push_warning("minigltf: cannot resolve foreign clip '%s' from %s" % [lib_clip, glb])
 		return
 	var proot: Node = player.get_node_or_null(player.root_node)
 	if proot != null:
-		_rebase_to_skeleton(proot, anim)
+		_rebase_to_skeleton(proot, anim, actor)
 	if not player.has_animation_library(""):
 		player.add_animation_library("", AnimationLibrary.new())
-	player.get_animation_library("").add_animation(clip, anim)
+	var lib := player.get_animation_library("")
+	if lib.has_animation(clip):
+		lib.remove_animation(clip)
+	lib.add_animation(clip, anim)
 
 
 # Load clip from the library's collection player (cached per library).
@@ -500,7 +643,7 @@ func _build_cutscene(scene: Node, base_path: String = "") -> void:
 		return
 
 	var anim := Animation.new()
-	var anim_length := float(cutscene_data.get("length", 0.0))
+	var anim_length := _sched_sec(cutscene_data, cutscene_data.get("end_frame", 0))
 
 	# Camera cuts: one boolean value track per camera toggling its `current`
 	# at every cut time. CONTINUOUS + NEAREST holds the value between keys.
@@ -516,7 +659,7 @@ func _build_cutscene(scene: Node, base_path: String = "") -> void:
 		anim.value_track_set_update_mode(t, Animation.UPDATE_CONTINUOUS)
 		anim.track_set_interpolation_type(t, Animation.INTERPOLATION_NEAREST)
 		for cut in cutscene_data.get("cuts", []):
-			anim.track_insert_key(t, float(cut["time"]),
+			anim.track_insert_key(t, _sched_sec(cutscene_data, cut["frame"]),
 					String(cut["camera"]).validate_node_name() == cam)
 
 	# Per-actor playback tracks driving the per-node AnimationPlayers that
@@ -535,7 +678,7 @@ func _build_cutscene(scene: Node, base_path: String = "") -> void:
 				else NodePath(String(scene.get_path_to(actor_node)) + "/AnimationPlayer")
 		anim.track_set_path(t, player_path)
 		for key in keys:
-			anim.animation_track_insert_key(t, float(key[0]), String(key[1]))
+			anim.animation_track_insert_key(t, _sched_sec(cutscene_data, key[0]), String(key[1]))
 
 	# Audio: spatial emitters (Speaker to AudioStreamPlayer3D) and non-spatial
 	# VSE tracks (AudioStreamPlayer). Both are driven from this Cutscene player.

@@ -40,13 +40,62 @@ GODOT = os.environ.get('GODOT', 'godot')
 GODOT_TEMPLATE = Path(__file__).parent / 'godot'
 
 
-def _ensure_godot_blender_path():
+# Environment for Godot subprocesses (set in main): makes the Blender that Godot
+# spawns for .blend imports route bpy.ops.export_scene.gltf through minigltf.
+GODOT_ENV = None
+
+# Blender startup script mirroring godot_minigltf_override/__init__.py, but
+# importing the repo's minigltf.py directly. Startup scripts run before add-ons
+# are enabled (io_scene_gltf2 is not importable yet), so the patch is applied
+# from a load_post handler: Godot's script always opens the .blend first.
+_OVERRIDE_STARTUP = """\
+import sys
+import bpy
+
+
+def _patched_execute(self, context):
+    if {repo!r} not in sys.path:
+        sys.path.insert(0, {repo!r})
+    import minigltf
+    minigltf.mini_export(self.filepath)
+    return {{'FINISHED'}}
+
+
+@bpy.app.handlers.persistent
+def _patch_gltf_export(*_args):
+    from io_scene_gltf2 import ExportGLTF2
+    ExportGLTF2.execute = _patched_execute
+
+
+def register():
+    bpy.app.handlers.load_post.append(_patch_gltf_export)
+"""
+
+
+def _minigltf_override_env(output_base):
+    """Per-run BLENDER_USER_SCRIPTS whose startup/ script patches the glTF
+    exporter, so Godot's .blend import pipeline exports with minigltf."""
+    startup = Path(output_base) / '_blender_scripts' / 'startup'
+    startup.mkdir(parents=True, exist_ok=True)
+    (startup / 'minigltf_override.py').write_text(_OVERRIDE_STARTUP.format(repo=REPO_DIR))
+    return dict(os.environ, BLENDER_USER_SCRIPTS=str(startup.parent))
+
+
+def _godot_version(godot):
+    """'<major>.<minor>' of the Godot binary, as used in its settings file name."""
+    out = subprocess.run([godot, '--headless', '--version'],
+                         capture_output=True, text=True, timeout=60).stdout
+    major, minor = out.strip().splitlines()[-1].split('.')[:2]
+    return f'{major}.{minor}'
+
+
+def _ensure_godot_blender_path(godot):
     """Make sure Godot's editor settings point at a Blender executable, so the
     editor can import .blend files."""
     blender = shutil.which(BLENDER) or BLENDER
     cfg_dir = Path(os.environ.get('XDG_CONFIG_HOME',
                                   Path.home() / '.config')) / 'godot'
-    cfg = cfg_dir / 'editor_settings-4.6.tres'
+    cfg = cfg_dir / f'editor_settings-{_godot_version(godot)}.tres'
     key = 'filesystem/import/blender/blender_path'
     if cfg.is_file():
         text = cfg.read_text()
@@ -66,7 +115,7 @@ def _setup_godot_project(out_dir, project_name):
     godot = shutil.which(GODOT) or (GODOT if os.path.isfile(GODOT) else None)
     if godot is None:
         return None, f"(godot '{GODOT}' not found, skipping)"
-    _ensure_godot_blender_path()
+    _ensure_godot_blender_path(godot)
     for f in GODOT_TEMPLATE.iterdir():
         if f.is_file():
             shutil.copy(f, os.path.join(out_dir, f.name))
@@ -81,7 +130,7 @@ def _setup_godot_project(out_dir, project_name):
                 '[rendering]\nrenderer/rendering_method="gl_compatibility"\n')
     imp = subprocess.run(
         [godot, '--headless', '--path', out_dir, '--import'],
-        capture_output=True, text=True, timeout=300,
+        capture_output=True, text=True, timeout=300, env=GODOT_ENV,
     )
     if imp.returncode != 0:
         out = imp.stdout + imp.stderr
@@ -92,7 +141,7 @@ def _setup_godot_project(out_dir, project_name):
 def _run_godot_script(godot, out_dir, script, label):
     result = subprocess.run(
         [godot, '--headless', '--path', out_dir, '--script', f'res://{script}'],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=120, env=GODOT_ENV,
     )
     out = result.stdout + result.stderr
     if 'RESULT: PASS' in out:
@@ -181,6 +230,16 @@ def _cutscene_data(gltf):
         "CutsceneData node must be a scene root node"
     data = node.get('extras', {}).get('minigltf_cutscene')
     assert data is not None, "CutsceneData node has no minigltf_cutscene extras"
+    # Frame-based format: every time is a Blender frame, `fps` converts.
+    assert data.get('version') == 1 and data.get('fps', 0) > 0, data
+    assert 'end_frame' in data and 'length' not in data, sorted(data)
+    for c in data.get('cuts', []):
+        assert set(c) == {'frame', 'camera'}, c
+    for lane in data.get('playback', []):
+        for k in lane['keys']:
+            assert len(k) == 3 and isinstance(k[1], str) \
+                and all(isinstance(x, (int, float)) for x in (k[0], k[2])), \
+                f"playback key must be [strip frame, clip, action start frame]: {k}"
     return data
 
 
@@ -1221,8 +1280,8 @@ def validate_cutscene(gltf, bin_data, out_dir):
     cut_cams = [c['camera'] for c in data['cuts']]
     assert cut_cams == ['CamEstablish', 'CamAlpha', 'CamBeta', 'CamEstablish'], \
         f"unexpected camera-cut order: {cut_cams}"
-    times = [c['time'] for c in data['cuts']]
-    assert times == sorted(times), f"cut times not sorted: {times}"
+    frames = [c['frame'] for c in data['cuts']]
+    assert frames == sorted(frames), f"cut frames not sorted: {frames}"
     # The schedule references bare action names; the addon renames each per-actor
     # clip to its bare name (each actor's player is its own namespace), so the
     # reused 'Talking' appears as bare 'Talking' on both characters' lanes.
@@ -1231,7 +1290,7 @@ def validate_cutscene(gltf, bin_data, out_dir):
         f"unexpected AlphaRig lane: {lanes.get('AlphaRig')}"
     assert lanes.get('BetaRig') == ['Talking', 'CrossedHands', 'Angry', 'Talking'], \
         f"unexpected BetaRig lane: {lanes.get('BetaRig')}"
-    assert data['length'] > 0, "schedule length must be positive"
+    assert data['end_frame'] > 0, "schedule end frame must be positive"
 
     # The map renames the per-character 'Talking_*' lanes back to bare 'Talking'.
     cd = next((n for n in gltf['nodes'] if n.get('name') == 'CutsceneData'), None)
@@ -1315,8 +1374,9 @@ def validate_cutscene(gltf, bin_data, out_dir):
     # (~2.57 s) is longer than its 2 s shot, so it must be trimmed to end exactly
     # at the shot-3 cut instead of bleeding into shot 4. LaughTrack is shorter
     # than its shot and so ends naturally before the cut.
-    shot2_cut = data['cuts'][2]['time']  # CamBeta cut: shot 2 -> shot 3
-    shot3_cut = data['cuts'][3]['time']  # CamEstablish cut: shot 3 -> shot 4
+    # (The cutscene schedule is in frames; the audio schedule in seconds.)
+    shot2_cut = data['cuts'][2]['frame'] / data['fps']  # CamBeta cut: shot 2 -> shot 3
+    shot3_cut = data['cuts'][3]['frame'] / data['fps']  # CamEstablish cut: shot 3 -> shot 4
     assert abs(angry['stop'] - shot3_cut) < 0.02, \
         f"AngryTrack should be trimmed to the shot-3 cut ({shot3_cut:.3f}s), got {angry['stop']:.3f}s"
     assert laugh['stop'] <= shot2_cut + 0.02, \
@@ -1465,7 +1525,7 @@ def validate_cutscene_lipsync(gltf, bin_data, out_dir):
     cut_cams = [c['camera'] for c in data['cuts']]
     assert cut_cams == ['CamEstablish', 'CamAlpha', 'CamBeta', 'CamEstablish'], \
         f"unexpected camera-cut order: {cut_cams}"
-    assert data['length'] > 0, "schedule length must be positive"
+    assert data['end_frame'] > 0, "schedule end frame must be positive"
 
 
 @test('robot_cutscene', 'robot_cutscene.py', timeout=300, godot='robot_cutscene_check.gd')
@@ -1488,7 +1548,8 @@ def validate_robot_cutscene(gltf, bin_data, out_dir):
     assert lanes.get('Performer') == ['Dance', 'Death'],         f'Performer lane should play Dance then Death, got {lanes}'
     cuts = [(c['camera']) for c in data['cuts']]
     assert cuts == ['CamWide', 'CamClose'], f'expected camera cuts in order, got {cuts}'
-    sources = data.get('sources', {})
+    assert 'sources' not in data, 'provenance is per lane, not schedule-wide'
+    sources = next(l for l in data['playback'] if l['actor'] == 'Performer').get('sources', {})
     assert set(sources) == {'Dance', 'Death'},         f'schedule must record foreign-clip provenance, got {sources}'
     assert sources['Dance']['collection'] == 'Robot', sources['Dance']
     assert sources['Death']['collection'] == 'Robot', sources['Death']
@@ -1511,6 +1572,258 @@ def validate_robot_cutscene(gltf, bin_data, out_dir):
         assert anims[clip] == 5,             f'{clip} should drive all 5 bones, got {anims[clip]} channels'
         assert len(lgltf.get('skins', [])) == 1, f'{glb_name} should have one skin'
         _assert_skinned_mesh_under_armature(lgltf)
+
+
+_RIG_BONES = ('Root', 'Spine', 'Head', 'ArmL', 'ArmR', 'LegL', 'LegR')
+
+
+def _qmul(a, b):
+    """Hamilton product of (x, y, z, w) quaternions."""
+    x1, y1, z1, w1 = a
+    x2, y2, z2, w2 = b
+    return (w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2)
+
+
+def _qconj(q):
+    return (-q[0], -q[1], -q[2], q[3])
+
+
+def _qrot(q, v):
+    """Rotate vector v by (x, y, z, w) quaternion q."""
+    return _qmul(_qmul(q, (v[0], v[1], v[2], 0.0)), _qconj(q))[:3]
+
+
+def _assert_clip_moves(gltf, bin_data, anim, bones, keys, fps):
+    """`anim` drives exactly the humanoid rig `bones` (rotation on every bone,
+    translation on Root), its key times match the authored keys, its values
+    match the authored ones (exported as-is in the bone-local frame), and it
+    MOVES: at least one bone has >= 3 distinct keyed values. Returns
+    {(bone, path): values} for comparing clips."""
+    nodes = gltf['nodes']
+    name = anim['name']
+    targets = {(nodes[c['target']['node']]['name'], c['target']['path'])
+               for c in anim['channels']}
+    want = {(b, 'rotation') for b in _RIG_BONES} | {('Root', 'translation')}
+    assert targets == want, f'{name} targets {sorted(targets)}, expected {sorted(want)}'
+    assert {c['target']['node'] for c in anim['channels']} == set(bones), \
+        f'{name} drives nodes outside its rig'
+    kind = {'rotation': 'rot', 'translation': 'loc'}
+    values = {}
+    for c in anim['channels']:
+        bone = nodes[c['target']['node']]['name']
+        path = c['target']['path']
+        sampler = anim['samplers'][c['sampler']]
+        assert sampler.get('interpolation', 'LINEAR') == 'LINEAR', (name, bone, sampler)
+        times = read_accessor(gltf, bin_data, sampler['input'])
+        flat = read_accessor(gltf, bin_data, sampler['output'])
+        n = 4 if path == 'rotation' else 3
+        vals = [flat[i:i + n] for i in range(0, len(flat), n)]
+        assert len(vals) == len(times), (name, bone, path)
+        authored = [k for k in keys if k[1] == bone and k[2] == kind[path]]
+        assert [round(t * fps) for t in times] == [round(k[0] * fps) + 1 for k in authored], \
+            (name, bone, path, times)
+        node = nodes[c['target']['node']]
+        rest_q = node.get('rotation', [0.0, 0.0, 0.0, 1.0])
+        rest_t = node.get('translation', [0.0, 0.0, 0.0])
+        for v, k in zip(vals, authored):
+            # The node value is rest * pose-bone transform, in the bone-local
+            # frame converted Z-up -> Y-up: Blender (x, y, z) -> glTF (x, z, -y).
+            if path == 'rotation':
+                # glTF quaternions are (x, y, z, w); Blender's are (w, x, y, z).
+                got = _qmul(_qconj(rest_q), v)
+                w, x, y, z = k[3]
+                exp_v = [x, z, -y, w]
+                if sum(a * b for a, b in zip(got, exp_v)) < 0:
+                    exp_v = [-x for x in exp_v]
+            else:
+                got = v
+                x, y, z = k[3]
+                exp_v = [a + b for a, b in zip(rest_t, _qrot(rest_q, (x, z, -y)))]
+            assert all(abs(a - b) < 1e-4 for a, b in zip(got, exp_v)), \
+                (name, bone, path, round(k[0] * fps) + 1, got, exp_v)
+        values[(bone, path)] = [tuple(round(x, 4) for x in v) for v in vals]
+    assert any(len(set(v)) >= 3 for v in values.values()), \
+        f'{name} holds a pose: no bone has 3 distinct keyed values'
+    return values
+
+
+@test('override_nla_cutscene', 'override_nla_cutscene.py', timeout=300,
+      godot='override_nla_cutscene_check.gd')
+def validate_override_nla_cutscene(gltf, bin_data, out_dir):
+    """Library-override workflow: the cutscene overrides a linked character and
+    its NLA mixes local actions (exported inline) with library actions
+    (scheduled by name, resolved from the library via `sources`)."""
+    with open(os.path.join(out_dir, 'expected.json')) as fh:
+        exp = json.load(fh)
+    fps = exp['fps']
+    nodes = gltf.get('nodes', [])
+    names = [n.get('name') for n in nodes]
+
+    # The override rig and its mesh export as real objects, never as a link.
+    assert not any('link' in n.get('extras', {}) for n in nodes), \
+        'an overridden collection must not export as a link node'
+    for want in ('HeroRig', 'HeroBody') + _RIG_BONES:
+        assert names.count(want) == 1, f'expected exactly one {want!r} node, got {names}'
+    assert len(gltf.get('skins', [])) == 1, 'override rig should export one skin'
+    _assert_skinned_mesh_under_armature(gltf)
+    cnodes = [n['name'] for n in nodes if n.get('extras', {}).get('minigltf_collection')]
+    assert cnodes == ['Hero'], f'expected the Hero override collection node, got {cnodes}'
+
+    # Only the local actions become clips here; the linked ones live in the library glb.
+    anims = {a['name']: a for a in gltf.get('animations', [])}
+    assert set(anims) == {'Jump', 'Bow'}, f'expected local clips only, got {sorted(anims)}'
+    bones = {i for i, n in enumerate(names) if n in _RIG_BONES}
+    for clip in ('Jump', 'Bow'):
+        _assert_clip_moves(gltf, bin_data, anims[clip], bones,
+                           exp['action_keys']['HeroRig'][clip], fps)
+
+    # Schedule in frames: [strip start, lane clip, action start] per strip.
+    data = _cutscene_data(gltf)
+    assert data['fps'] == fps, data['fps']
+    lanes = {l['actor']: l['keys'] for l in data['playback']}
+    assert set(lanes) == {'HeroRig'}, f'expected a single HeroRig lane, got {set(lanes)}'
+    got = [[k[1], k[0], k[2]] for k in lanes['HeroRig']]
+    assert got == exp['schedule'], f"lane schedule {got} != {exp['schedule']}"
+    assert data['end_frame'] == exp['length_frame'], data['end_frame']
+
+    assert 'sources' not in data, 'provenance is per lane, not schedule-wide'
+    lane = next(l for l in data['playback'] if l['actor'] == 'HeroRig')
+    sources = lane.get('sources', {})
+    # The second Wave strip (action start 9) is its own lane clip, still
+    # sourced from the library's 'Wave'.
+    assert set(sources) == {'Idle', 'Wave', 'Wave_f9'}, f'linked clips need provenance, got {sources}'
+    for clip in sources:
+        assert sources[clip]['file'] == 'lib/character.blend', sources[clip]
+        assert sources[clip]['collection'] == 'Hero', sources[clip]
+        assert sources[clip]['clip'] == clip.split('_f')[0], sources[clip]
+    # The second (local) Jump strip, from action frame 13, aliases 'Jump'.
+    assert lane.get('aliases') == {'Jump_f13': 'Jump'}, lane.get('aliases')
+    clip_names = next(n for n in nodes if n.get('name') == 'CutsceneData')['extras'].get(
+        'minigltf_clip_names', {})
+    assert set(clip_names.values()) == {'Jump', 'Bow'}, clip_names
+    _assert_glb_only(out_dir)
+
+    # The library glb carries the rig, the mesh and both library actions.
+    lgltf, lbin = parse_glb(os.path.join(out_dir, 'lib', 'character.glb'))
+    lanims = {a['name']: a for a in lgltf.get('animations', [])}
+    assert set(lanims) == {'Idle', 'Wave'}, f'library clips: {sorted(lanims)}'
+    lbones = {i for i, n in enumerate(lgltf['nodes']) if n.get('name') in _RIG_BONES}
+    for clip in ('Idle', 'Wave'):
+        _assert_clip_moves(lgltf, lbin, lanims[clip], lbones,
+                           exp['action_keys']['HeroRig'][clip], fps)
+    assert len(lgltf.get('skins', [])) == 1
+    assert 'CutsceneData' not in {n.get('name') for n in lgltf['nodes']}, \
+        'library glb must not carry a schedule'
+
+
+def _lane_source(data, actor, clip, field='file'):
+    """`field` of the provenance `actor`'s lane records for `clip` (the library
+    file by default), or None for a clip without a source (local clip)."""
+    lane = next(l for l in data['playback'] if l['actor'] == actor)
+    src = lane.get('sources', {}).get(clip)
+    return src[field] if src else None
+
+
+@test('two_character_cutscene', 'two_character_cutscene.py', timeout=300,
+      godot='two_character_cutscene_check.gd')
+def validate_two_character_cutscene(gltf, bin_data, out_dir):
+    """Two linked characters, each library-overridden, sharing bone names and
+    each playing its own library's 'hello' (plus a local robot 'hello'): both
+    rigs export inline with their own skin, local clips target only their own
+    rig, and every lane's linked clip is traced back to the right library file
+    under a lane name that cannot resolve to the local 'hello'."""
+    with open(os.path.join(out_dir, 'expected.json')) as fh:
+        exp = json.load(fh)
+    fps = exp['fps']
+    nodes = gltf.get('nodes', [])
+    names = [n.get('name') for n in nodes]
+
+    # Both override rigs and their meshes export inline, never as links.
+    assert not any('link' in n.get('extras', {}) for n in nodes), \
+        'an overridden collection must not export as a link node'
+    for want in ('HumanRig', 'HumanBody', 'RobotRig', 'RobotBody'):
+        assert names.count(want) == 1, f'expected exactly one {want!r} node, got {names}'
+    for bone in _RIG_BONES:
+        assert names.count(bone) == 2, f'expected {bone!r} once per rig, got {names}'
+    assert len(gltf.get('skins', [])) == 2, 'each override rig should export its own skin'
+    _assert_skinned_mesh_under_armature(gltf)
+    bodies = {n['name']: n for n in nodes if 'mesh' in n and 'skin' in n}
+    assert set(bodies) == {'HumanBody', 'RobotBody'}, sorted(bodies)
+    assert bodies['HumanBody']['skin'] != bodies['RobotBody']['skin'], \
+        'the two bodies must not share a skin'
+
+    def subtree(i):
+        out = {i}
+        for c in nodes[i].get('children', []):
+            out |= subtree(c)
+        return out
+    rig_nodes = {r: subtree(names.index(r)) for r in ('HumanRig', 'RobotRig')}
+    assert not rig_nodes['HumanRig'] & rig_nodes['RobotRig'], 'rig subtrees overlap'
+    for rig, (x, _y, _z) in exp['placement'].items():
+        t = nodes[names.index(rig)].get('translation', [0, 0, 0])
+        assert abs(t[0] - x) < 1e-4, f'{rig} placed at {t}, expected x={x}'
+
+    # Only the local actions become clips; each drives only its own rig's bones.
+    anims = {a['name']: a for a in gltf.get('animations', [])}
+    assert set(anims) == {'attack', 'run_away', 'hello'}, \
+        f'expected local clips only, got {sorted(anims)}'
+    for clip, rig in (('run_away', 'HumanRig'), ('attack', 'RobotRig'), ('hello', 'RobotRig')):
+        tgt = {c['target']['node'] for c in anims[clip]['channels']}
+        bones = {i for i in rig_nodes[rig] if names[i] in _RIG_BONES}
+        assert tgt == bones, f'{clip} targets {sorted(tgt)}, expected {rig} bones {sorted(bones)}'
+        _assert_clip_moves(gltf, bin_data, anims[clip], bones, exp['action_keys'][rig][clip], fps)
+
+    cams = {n['name'] for n in nodes if 'camera' in n}
+    assert cams == {'CamHuman', 'CamRobot', 'CamWide'}, f'unexpected cameras: {cams}'
+
+    data = _cutscene_data(gltf)
+    # Schedule in frames: cuts on marker frames, lane keys
+    # [strip start, lane clip, action start] (robot's local hello from 5).
+    assert data['fps'] == fps, data['fps']
+    cuts = [(c['camera'], c['frame']) for c in data['cuts']]
+    assert cuts == [tuple(c) for c in exp['cuts']], f'camera cuts {cuts} != {exp["cuts"]}'
+    lanes = {l['actor']: l['keys'] for l in data['playback']}
+    assert set(lanes) == {'HumanRig', 'RobotRig'}, f'expected two rig lanes, got {set(lanes)}'
+    for actor, want in exp['schedule'].items():
+        got = [[k[1], k[0], k[2]] for k in lanes[actor]]
+        assert got == want, f'{actor} lane {got} != {want}'
+    assert ['hello', 75, 5] in exp['schedule']['RobotRig'], 'sub-range strip missing'
+    assert not any('aliases' in l for l in data['playback']), 'no lane repeats a clip'
+    assert data['end_frame'] == exp['length_frame'], data['end_frame']
+    clip_names = next(n for n in nodes if n.get('name') == 'CutsceneData')['extras'].get(
+        'minigltf_clip_names', {})
+    assert set(clip_names.values()) == {'attack', 'run_away', 'hello'}, clip_names
+    _assert_glb_only(out_dir)
+
+    # Each library glb carries its own rig and its own 'hello' clip.
+    lib_hello = {}
+    for lib, rig in (('human', 'HumanRig'), ('robot', 'RobotRig')):
+        lgltf, lbin = parse_glb(os.path.join(out_dir, 'lib', lib + '.glb'))
+        lanims = {a['name']: a for a in lgltf.get('animations', [])}
+        assert set(lanims) == {'hello'}, f'{lib}.glb clips: {sorted(lanims)}'
+        lbones = {i for i, n in enumerate(lgltf['nodes']) if n.get('name') in _RIG_BONES}
+        lib_hello[lib] = _assert_clip_moves(lgltf, lbin, lanims['hello'], lbones,
+                                            exp['action_keys'][rig]['hello_' + lib], fps)
+        assert len(lgltf.get('skins', [])) == 1, f'{lib}.glb should have one skin'
+        assert rig in {n.get('name') for n in lgltf['nodes']}, f'{lib}.glb lacks {rig}'
+        assert 'CutsceneData' not in {n.get('name') for n in lgltf['nodes']}, \
+            'library glb must not carry a schedule'
+    assert lib_hello['human'] != lib_hello['robot'], \
+        "the two libraries' 'hello' clips must not carry the same motion"
+
+    # Provenance: each lane's linked 'hello' must trace to its own library and
+    # collection, under its lane name; local clips (incl. 'hello') have none.
+    assert 'sources' not in data, 'provenance is per lane, not schedule-wide'
+    for actor, (lib, lane_clip, col) in exp['libraries'].items():
+        got = _lane_source(data, actor, lane_clip)
+        assert got == lib, f"{actor}'s {lane_clip!r} should come from {lib!r}, schedule says {got!r}"
+        assert _lane_source(data, actor, lane_clip, 'collection') == col, (actor, col)
+        assert _lane_source(data, actor, lane_clip, 'clip') == 'hello', actor
+    for actor, clip in (('HumanRig', 'run_away'), ('RobotRig', 'attack'), ('RobotRig', 'hello')):
+        assert _lane_source(data, actor, clip) is None, f'local {clip} must have no source'
 
 
 @test('nested_collections', 'nested_collections.py', godot='nested_collections_check.gd')
@@ -1746,6 +2059,8 @@ def main():
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         output_base = os.path.join(REPO_DIR, '_test_runs', ts)
     os.makedirs(output_base, exist_ok=True)
+    global GODOT_ENV
+    GODOT_ENV = _minigltf_override_env(output_base)
 
     selected = [t for t in _TESTS if (not args.tests or t[0] in args.tests)]
     if not selected:
