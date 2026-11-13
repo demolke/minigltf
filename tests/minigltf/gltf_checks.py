@@ -80,3 +80,76 @@ def assert_glb_only(out_dir):
     for leftover in ('scene.tscn', 'output.glb.import', 'minigltf_post_import.gd'):
         assert not os.path.exists(os.path.join(out_dir, leftover)), \
             f"{leftover} must no longer be written (the addon replaces it)"
+
+def _matmul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def node_local_matrix(node):
+    """4x4 row-major local matrix of a glTF node (TRS or matrix)."""
+    if 'matrix' in node:
+        m = node['matrix']  # column-major
+        return [[m[c * 4 + r] for c in range(4)] for r in range(4)]
+    tx, ty, tz = node.get('translation', (0.0, 0.0, 0.0))
+    x, y, z, w = node.get('rotation', (0.0, 0.0, 0.0, 1.0))
+    sx, sy, sz = node.get('scale', (1.0, 1.0, 1.0))
+    r = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+    return [[r[i][0] * sx, r[i][1] * sy, r[i][2] * sz, t] for i, t in
+            enumerate((tx, ty, tz))] + [[0.0, 0.0, 0.0, 1.0]]
+
+
+def node_parents(gltf):
+    """{child node index: parent node index}; asserts no node has two parents."""
+    parents = {}
+    for i, n in enumerate(gltf.get('nodes', [])):
+        for c in n.get('children', []):
+            assert c not in parents, f"node {c} has two parents ({parents[c]} and {i})"
+            parents[c] = i
+    return parents
+
+
+def node_world_matrix(gltf, idx):
+    parents = node_parents(gltf)
+    m = node_local_matrix(gltf['nodes'][idx])
+    while idx in parents:
+        idx = parents[idx]
+        m = _matmul(node_local_matrix(gltf['nodes'][idx]), m)
+    return m
+
+
+def node_index(gltf, name):
+    matches = [i for i, n in enumerate(gltf.get('nodes', [])) if n.get('name') == name]
+    assert len(matches) == 1, f"expected exactly one node named {name!r}, got {matches}"
+    return matches[0]
+
+
+def reachable_nodes(gltf):
+    """Node indices reachable from scenes[0].nodes through children lists."""
+    seen, stack = set(), list(gltf['scenes'][0].get('nodes', []))
+    while stack:
+        i = stack.pop()
+        if i not in seen:
+            seen.add(i)
+            stack.extend(gltf['nodes'][i].get('children', []))
+    return seen
+
+
+def assert_all_nodes_reachable(gltf):
+    """Godot only builds scenes[0].nodes and their children: every node that
+    is not reachable from there silently vanishes on import."""
+    node_parents(gltf)  # also checks the hierarchy is a forest
+    unreachable = sorted(set(range(len(gltf.get('nodes', [])))) - reachable_nodes(gltf))
+    assert not unreachable, \
+        f"nodes unreachable from scenes[0].nodes: " \
+        f"{[(i, gltf['nodes'][i].get('name')) for i in unreachable]}"
+
+
+def assert_world_matches(gltf, expected, names, tol=1e-4):
+    """Composed world matrix of each named node equals expected[name]."""
+    for name in names:
+        got = node_world_matrix(gltf, node_index(gltf, name))
+        want = expected[name]
+        err = max(abs(got[r][c] - want[r][c]) for r in range(4) for c in range(4))
+        assert err < tol, f"world transform of {name!r} off by {err:g}:\n got  {got}\n want {want}"

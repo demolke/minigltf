@@ -787,6 +787,7 @@ def mini_export(output_file: str) -> None:
         (0.0, -1.0, 0.0, 0.0),
         (0.0, 0.0, 0.0, 1.0)))
     _basis_inv = axis_basis_change.inverted_safe()
+    _identity = mathutils.Matrix.Identity(4)
 
     _t = time.perf_counter()
 
@@ -847,6 +848,20 @@ def mini_export(output_file: str) -> None:
         _collection_instances.append(_o)
     objs += _collection_instances
 
+    # Plain empties that parent exported objects become transform-only nodes,
+    # otherwise their children would lose the hierarchy (and the scene root).
+    _objs_set = set(objs)
+    for _o in list(objs):
+        _p = _o.parent
+        while _p is not None and _p not in _objs_set:
+            if (_p.type == 'EMPTY' and _p not in _overridden_originals
+                    and not (_non_linked_only and _p.library is not None)
+                    and not (getattr(_p, 'instance_type', None) == 'COLLECTION'
+                             and getattr(_p.instance_collection, 'library', None) is not None)):
+                objs.append(_p)
+                _objs_set.add(_p)
+            _p = _p.parent
+
     # Add bones only from armatures that passed the filter above.
     _scene_armatures = set()
     for _o in list(objs):
@@ -865,6 +880,16 @@ def mini_export(output_file: str) -> None:
         objs.append(_ao)
         _anchors.append((_ao, _ame))
 
+    def _chain_world(_o):
+        _m = _o.matrix_parent_inverse @ _o.matrix_basis
+        return _chain_world(_o.parent) @ _m if _o.parent is not None else _o.matrix_basis
+
+    # Objects whose parent was not exported keep their world transform and
+    # become roots, so they are still reachable from the scene.
+    _objs_set = set(objs)
+    _orphans = {x for x in objs if isinstance(x, bpy.types.Object)
+                and x.parent is not None and x.parent not in _objs_set}
+
     # Collection nodes mirror the collection hierarchy (nested included); each
     # parentless object goes to its deepest direct home. Appended after real nodes.
     _coll_pre = []   # [(collection, depth)] in pre-order
@@ -878,7 +903,7 @@ def mini_export(output_file: str) -> None:
     # Deepest directly-containing collection wins each parentless object.
     _owner_of = {}   # id(obj) -> collection
     for _o in objs:
-        if not (isinstance(_o, bpy.types.Object) and _o.parent is None):
+        if not (isinstance(_o, bpy.types.Object) and (_o.parent is None or _o in _orphans)):
             continue
         _best_c, _best_d = None, -1
         for _c, _d in _coll_pre:
@@ -1018,6 +1043,14 @@ def mini_export(output_file: str) -> None:
             if o.rotation_mode != 'QUATERNION':
                 quaternion = o.rotation_euler.to_quaternion()
             scale = o.scale
+            _local = None
+            if o in _orphans:
+                _local = _chain_world(o)   # matrix_world can be stale for hidden objects
+            elif o.parent is not None and o.parent_type == 'OBJECT' \
+                    and o.matrix_parent_inverse != _identity:
+                _local = o.matrix_parent_inverse @ o.matrix_basis
+            if _local is not None:
+                translation, quaternion, scale = _local.decompose()
             if o.type in ('CAMERA', 'LIGHT'):
                 # Cameras and lights aim down local -Z in both Blender and glTF,
                 # so their node rotation converts as C @ R (same as the animated
@@ -2237,7 +2270,7 @@ def mini_export(output_file: str) -> None:
     jsn.write(b'"scene":0,\n')
     jsn.write(b'"scenes":[{"name":"Scene","nodes":[')
 
-    root_objs = [o for o in objs if isinstance(o, bpy.types.Object) and o.parent is None
+    root_objs = [o for o in objs if isinstance(o, bpy.types.Object) and (o.parent is None or o in _orphans)
                  and o not in _claimed]
     _root_ids = [objs.index(o) for o in root_objs]
     # Only top-level collection nodes are scene roots; nested ones are

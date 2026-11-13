@@ -180,3 +180,20 @@ def export_scene(args, glb_name='output.glb', **export_kwargs):
     save_textures(args.output_dir)
 
     bpy.ops.wm.save_as_mainfile(filepath=os.path.join(args.output_dir, 'scene.blend'))
+
+
+def dump_expected_world(args, objs, filename='expected_world.json'):
+    """Write each object's Blender world matrix, converted to glTF's Y-up
+    frame (C @ M @ C^-1), as {name: 4x4 row-major} for the test to compare
+    against the composed node transforms of the exported GLB."""
+    import json
+    import mathutils
+    c = mathutils.Matrix(((1, 0, 0, 0), (0, 0, 1, 0), (0, -1, 0, 0), (0, 0, 0, 1)))
+    bpy.context.view_layer.update()
+    out = {}
+    for o in objs:
+        m = c @ o.matrix_world @ c.inverted()
+        out[o.name] = [list(r) for r in m]
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, filename), 'w') as f:
+        json.dump(out, f)
