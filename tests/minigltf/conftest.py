@@ -112,7 +112,7 @@ def _find_godot():
     return shutil.which(GODOT) or (GODOT if os.path.isfile(GODOT) else None)
 
 
-def _setup_godot_project(out_dir, project_name, godot_env):
+def _setup_godot_project(out_dir, project_name, godot_env, settings=None):
     """Populate out_dir with the Godot template files + addon and write project.godot."""
     godot = _find_godot()
     if godot is None:
@@ -130,11 +130,18 @@ def _setup_godot_project(out_dir, project_name, godot_env):
                 '[editor_plugins]\n'
                 'enabled=PackedStringArray("res://addons/minigltf/plugin.cfg")\n\n'
                 '[rendering]\nrenderer/rendering_method="gl_compatibility"\n')
+        # Extra project settings: {"section/key": value} written as GDScript literals.
+        sections = {}
+        for key, value in (settings or {}).items():
+            section, _, name = key.partition('/')
+            sections.setdefault(section, []).append(f'{name}={json.dumps(value)}')
+        for section, lines in sections.items():
+            f.write(f'\n[{section}]\n' + '\n'.join(lines) + '\n')
     imp = subprocess.run(
         [godot, '--headless', '--path', out_dir, '--import'],
         capture_output=True, text=True, timeout=300, env=godot_env,
     )
-    if imp.returncode != 0:
+    if imp.returncode != 0 or 'SCRIPT ERROR' in imp.stdout + imp.stderr:
         out = imp.stdout + imp.stderr
         return None, "godot --import failed:\n" + '\n'.join(out.splitlines()[-25:])
     return godot, "OK"
@@ -152,9 +159,9 @@ def _run_godot_script(godot, out_dir, script, label, godot_env):
     return False, f"{label} failed:\n" + '\n'.join(lines or out.splitlines())
 
 
-def run_godot_check(out_dir, script, godot_env):
+def run_godot_check(out_dir, script, godot_env, settings=None):
     """Create a Godot project, import it (runs the addon), then run `script` in it."""
-    godot, msg = _setup_godot_project(out_dir, "minigltf check", godot_env)
+    godot, msg = _setup_godot_project(out_dir, "minigltf check", godot_env, settings)
     if godot is None:
         # A failed import is a failure; a missing binary only skips this phase.
         return _find_godot() is None, msg
@@ -219,9 +226,10 @@ def run_blender(scene_script, output_dir, timeout=120):
 def pytest_configure(config):
     config.addinivalue_line(
         'markers',
-        "scene(script, timeout=120, godot=None): Blender scene script from "
-        "tests/minigltf/scenes/ to export, its Blender timeout in seconds, and "
-        "an optional tests/minigltf/godot/ script to check the import in Godot")
+        "scene(script, timeout=120, godot=None, settings=None): Blender scene script "
+        "from tests/minigltf/scenes/ to export, its Blender timeout in seconds, "
+        "an optional tests/minigltf/godot/ script to check the import in Godot, and "
+        "project settings ({'section/key': value}) for that Godot project")
 
 
 @pytest.fixture(scope='session')
@@ -286,7 +294,8 @@ def pytest_pyfunc_call(pyfuncitem):
     godot_script = marker.kwargs.get('godot')
     if godot_script:
         checks.append(lambda: run_godot_check(out_dir, godot_script,
-                                              pyfuncitem.funcargs['godot_env']))
+                                              pyfuncitem.funcargs['godot_env'],
+                                              marker.kwargs.get('settings')))
     for check in checks:
         ok, msg = check()
         if not ok:

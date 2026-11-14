@@ -104,6 +104,15 @@ Godot's `.blend` importer calls `bpy.ops.export_scene.gltf(...)` internally. The
 2. In Blender: *Edit → Preferences → Add-ons → Install from Disk*
 3. Select the zip and enable the extension
 
+**Levels (MultiMap) and cutscenes**
+
+The editor plugin (`addons/minigltf`) decides per imported scene how linked collections are brought in:
+
+- *cutscene* (the scene has an `AnimationPlayer`, a `Skeleton3D` or the `CutsceneData` schedule): every link becomes a live `<lib>.blend@subroot=<Collection>` instance, as before.
+- *level* (everything else): every link whose collection is a plain mesh collection becomes one `MultiMap` item per mesh node of that collection's hierarchy (parented objects and nested collections included; transform = instance transform * the mesh node's transform inside the collection) (a Godot fork node, `ClassDB.class_exists("MultiMap")`; engines without it always use cutscene mode). The project setting `minigltf/level_items` selects the item granularity: `merged` (default) bakes every collection's meshes into one library item with generated LODs (a surface per material); `flat` keeps one item per imported mesh (importer LODs as imported, per-part culling). One `MeshLibrary` per library file holds one item per distinct imported mesh, used as-is so importer LODs are kept (the collection -> items table is in the library's `minigltf_collections` meta). The libraries are written to `res://.godot/imported/<file>-<hash>.meshlib.res` whenever a library scene is imported, so they follow the library's own reimports. Item ids are derived from the mesh name, so scenes importing a library stay valid when it changes. Links whose collection has lights, cameras, skins or animations, or whose transform (or a part's) is mirrored, stay `@subroot=` instances. Only uniform scale is supported by `MultiMap`: a non-uniform instance scale is replaced by the mean of its axes.
+
+Override with the project setting `minigltf/import_mode` (`auto`, `level`, `cutscene`).
+
 **Uninstall / disable**
 
 Disable or remove the extension from *Edit → Preferences → Extensions*. The original glTF exporter is restored immediately.

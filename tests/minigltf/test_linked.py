@@ -98,10 +98,13 @@ def test_linked_collection_instance(gltf, bin_data, out_dir):
     assert abs(t[2] - (-3.0)) < 0.001, f"Z(-Y) expected -3, got {t[2]}"
 
 
-@pytest.mark.scene('nested_collections.py', godot='nested_collections_check.gd')
+@pytest.mark.scene('nested_collections.py', godot='nested_collections_check.gd',
+                   settings={'minigltf/import_mode': 'cutscene'})
 def test_nested_collections(gltf, bin_data, out_dir):
     """Nested assets stay addressable: hierarchy mirrored as collection nodes,
-    level links the nested collections for live sub-tree instances."""
+    level links the nested collections for live sub-tree instances. The scene
+    has no animation (a level, MultiMap in auto mode), so the sub-tree instancing
+    is requested with import_mode=cutscene; see test_nested_collections_level."""
     link_nodes = {n['name']: n['extras']['link'] for n in gltf.get('nodes', [])
                   if 'extras' in n and 'link' in n['extras']}
     assert set(link_nodes) == {'TableInstance', 'HeroInstance'},         f'expected Table/Hero link nodes, got {set(link_nodes)}'
@@ -128,3 +131,13 @@ def test_nested_collections(gltf, bin_data, out_dir):
     assert _kids('Characters') == [all_nodes['Hero']], _kids('Characters')
     assert lgltf['scenes'][0]['nodes'] == [all_nodes['Props'], all_nodes['Characters']],         lgltf['scenes'][0]['nodes']
     assert_glb_only(out_dir)
+
+
+@pytest.mark.scene('nested_collections.py', godot='nested_collections_level_check.gd',
+                   settings={'minigltf/level_items': 'flat'})
+def test_nested_collections_level(gltf, bin_data, out_dir):
+    """The same nested assets in level mode: Table (Props/Table) and Hero
+    (Characters/Hero) expand to one MultiMap item per mesh."""
+    link_nodes = {n['name'] for n in gltf.get('nodes', [])
+                  if 'extras' in n and 'link' in n['extras']}
+    assert link_nodes == {'TableInstance', 'HeroInstance'}, link_nodes

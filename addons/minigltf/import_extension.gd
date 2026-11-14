@@ -2,6 +2,8 @@
 @tool
 extends GLTFDocumentExtension
 
+const Levels := preload("multimap_levels.gd")
+
 # Flag for per-collection nodes.
 const COLLECTION_KEY := "minigltf_collection"
 
@@ -15,7 +17,14 @@ func _import_post(state: GLTFState, root: Node) -> Error:
 	if _grafting:
 		return OK
 	_clip_cache.clear()
-	_resolve_links(root, root, state.base_path)
+	var src := Levels.source_path(state)
+	# Only scenes without links are libraries.
+	if src != "" and Engine.is_editor_hint() and not _has_links(root):
+		root.set_meta(Levels.SOURCE_META, src)
+	var level := {} if Levels.decide_mode(root) == "level" else null
+	_resolve_links(root, root, state.base_path, level)
+	if level != null:
+		_finish_level(root, level)
 	_split_master_player(root, _read_clip_names(root))
 	_merge_foreign_clips(root, state.base_path)
 	_apply_lane_offsets(root)
@@ -35,13 +44,16 @@ func _read_clip_names(scene: Node) -> Dictionary:
 
 
 # --- pass 1: linked collections ---
-func _resolve_links(scene: Node, node: Node, base_dir: String) -> void:
+# level: null for cutscenes, else the MultiMap collector (see _try_multimap_item).
+func _resolve_links(scene: Node, node: Node, base_dir: String, level = null) -> void:
 	for child in node.get_children():
-		_resolve_links(scene, child, base_dir)
+		_resolve_links(scene, child, base_dir, level)
 	var link := _link_meta(node)
 	if node == scene or link == "":
 		return
 	var parts := _split_link(link)
+	if level != null and _try_multimap_item(scene, node, base_dir, parts, level):
+		return
 	var glb := base_dir.path_join(parts[0].get_basename() + ".glb").simplify_path()
 	if _instance_subtree(scene, node, glb, parts[1]):
 		return
@@ -52,6 +64,87 @@ func _resolve_links(scene: Node, node: Node, base_dir: String) -> void:
 	# No sub-tree yet: embed a copy.
 	push_warning("minigltf: no importable sub-tree '%s' in %s; embedding a copy of the library scene (re-import after the library is imported to get a live reference)" % [parts[1], glb])
 	_graft_library(scene, node, glb, blend)
+
+
+# Level mode: turn the link node into a MultiMap item when its collection is
+# a merged item of a library. False (nothing changed) keeps the instancing path.
+func _try_multimap_item(scene: Node, node: Node, base_dir: String, parts: PackedStringArray, level: Dictionary) -> bool:
+	if not (node is Node3D) or parts[1] == "":
+		return false
+	var xf := Transform3D()
+	var n: Node = node
+	while n != scene and n != null:
+		if n is Node3D:
+			xf = (n as Node3D).transform * xf
+		n = n.get_parent()
+	if xf.basis.determinant() <= 0.0:
+		# MultiMesh does not flip culling per instance.
+		level["mirrored"] = int(level.get("mirrored", 0)) + 1
+		return false
+	var item_name := String(parts[1]).validate_node_name()
+	var glb := base_dir.path_join(parts[0].get_basename() + ".glb").simplify_path()
+	var blend := base_dir.path_join(parts[0]).simplify_path()
+	var libs: Dictionary = level.get_or_add("libs", {})
+	for src in [glb, blend]:
+		if not libs.has(src):
+			libs[src] = Levels.get_library(src) if ResourceLoader.exists(src) else null
+		var lib: MeshLibrary = libs[src]
+		if lib == null:
+			continue
+		var col_parts: Array = (lib.get_meta("minigltf_collections", {}) as Dictionary).get(item_name, [])
+		if col_parts.is_empty():
+			continue
+		var order: Array = level.get_or_add("order", [])
+		if not order.has(src):
+			order.append(src)
+		var skew := false
+		for part in col_parts:
+			# Instance transform * the mesh node's transform inside the collection.
+			var pxf: Transform3D = xf * (part[1] as Transform3D)
+			level.get_or_add("lib_idx", PackedInt32Array()).append(order.find(src))
+			level.get_or_add("ids", PackedInt32Array()).append(int(part[0]))
+			level.get_or_add("xforms", []).append(pxf)
+			level.get_or_add("paths", PackedStringArray()).append(String(scene.get_path_to(node)))
+			var ps := pxf.basis.get_scale()
+			var hi := maxf(ps.x, maxf(ps.y, ps.z))
+			skew = skew or (hi - minf(ps.x, minf(ps.y, ps.z))) > hi * 1e-3
+		if skew:
+			level["averaged"] = int(level.get("averaged", 0)) + 1
+		var per: Dictionary = level.get_or_add("per_lib", {})
+		per[src] = int(per.get(src, 0)) + col_parts.size()
+		# Children (props parented to the instance) keep following a placeholder.
+		if node.get_child_count() == 0:
+			node.get_parent().remove_child(node)
+			node.free()
+		return true
+	return false
+
+
+# Create the single MultiMap of a level from the collected items.
+func _finish_level(scene: Node, level: Dictionary) -> void:
+	var mirrored := int(level.get("mirrored", 0))
+	if not level.has("ids"):
+		if mirrored > 0:
+			print("minigltf: %d mirrored instances kept as sub-tree instances" % mirrored)
+		return
+	var mm: Node3D = ClassDB.instantiate(&"MultiMap")
+	mm.name = "MultiMap"
+	scene.add_child(mm)
+	mm.owner = scene
+	var libs: Array[MeshLibrary] = []
+	for src in level["order"]:
+		libs.append(level["libs"][src])
+	mm.set_mesh_libraries(libs)
+	var xforms: Array[Transform3D] = []
+	xforms.assign(level["xforms"])
+	mm.set_items(level["lib_idx"], level["ids"], xforms)
+	# Source link node of every item (debugging, per-item filtering).
+	mm.set_meta("minigltf_item_paths", level["paths"])
+	var per := []
+	for src in level["order"]:
+		per.append("%s=%d" % [src.get_file(), level["per_lib"][src]])
+	print("minigltf: level: %d MultiMap items (%s), %d had non-uniform scale averaged, %d mirrored kept as instances"
+			% [level["ids"].size(), ", ".join(per), int(level.get("averaged", 0)), mirrored])
 
 
 # Split "<path>.blend:<Collection>"; ".blend:" keeps Windows drive letters.
@@ -172,6 +265,15 @@ static func _load_linked_scene(glb: String) -> Node:
 			if doc.append_from_file(glb, state) == OK else null
 	_grafting = false
 	return inst
+
+
+func _has_links(node: Node) -> bool:
+	if _link_meta(node) != "":
+		return true
+	for child in node.get_children():
+		if _has_links(child):
+			return true
+	return false
 
 
 func _link_meta(node: Node) -> String:

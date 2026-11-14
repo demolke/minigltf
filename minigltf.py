@@ -2268,7 +2268,17 @@ def mini_export(output_file: str) -> None:
 
     # Scene section
     jsn.write(b'"scene":0,\n')
-    jsn.write(b'"scenes":[{"name":"Scene","nodes":[')
+    jsn.write(b'"scenes":[{"name":"Scene"')
+    if bpy.data.filepath:
+        # Source .blend, relative to the output file like extras.link paths.
+        try:
+            _src = os.path.relpath(bpy.data.filepath, os.path.dirname(os.path.abspath(output_file)))
+        except ValueError:
+            _src = bpy.data.filepath
+        jsn.write(b',"extras":{"minigltf_source":')
+        jsn.write(_je(_src.replace('\\', '/')))
+        jsn.write(b'}')
+    jsn.write(b',"nodes":[')
 
     root_objs = [o for o in objs if isinstance(o, bpy.types.Object) and (o.parent is None or o in _orphans)
                  and o not in _claimed]
